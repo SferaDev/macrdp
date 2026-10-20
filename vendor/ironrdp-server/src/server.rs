@@ -3478,6 +3478,15 @@ impl RdpServer {
             }
         }
 
+        // (vendored, divergence (25)) A reactivation repeats the connect-time
+        // Core Data, which a live monitor layout may have superseded since.
+        if !result.reactivation {
+            self.display
+                .lock()
+                .await
+                .set_client_desktop_scale_factor(result.desktop_scale_factor);
+        }
+
         if !result.input_events.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");
             self.handle_input_backlog(
