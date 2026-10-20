@@ -2037,6 +2037,16 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     reactivation, never for a losing candidate. Off by default (`None`), so the
     upstream-shaped path is byte-identical unless macrdp installs the handle.
 
+(25) `RdpServerDisplay::set_client_desktop_scale_factor` (NOT upstreamed; added
+    2026-10-20). A defaulted no-op trait method the server calls once per served
+    connection in `client_accepted`, before the Confirm Active capset reaches
+    `request_initial_size`, with the acceptor's divergence (5) scale factor.
+    Skipped on reactivations: they repeat the connect-time Core Data, and a live
+    MS-RDPEDISP monitor layout carries its own scale that may have superseded it
+    (moving a Windows App window from a Retina panel to a standard monitor).
+    macrdp uses it to pick a HiDPI virtual display for Retina clients. Off unless
+    the display implements it, so the upstream-shaped path is unchanged.
+
 (26) Client input is read off the `Self` lock (NOT upstreamed; added 2026-10-26).
     `client_loop` reads the socket in its own `read_pdus` arm: fast-path input
     goes straight to the input handler, X224 PDUs go through a bounded queue
