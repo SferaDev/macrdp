@@ -255,6 +255,7 @@ pub(super) fn create(
     refresh_hz: u32,
     name: &str,
     serial: u32,
+    hidpi: bool,
 ) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
@@ -304,7 +305,7 @@ pub(super) fn create(
         //      the applySettings: call is what actually registers the display
         //      with the WindowServer so it appears in Displays. Shared with
         //      the live-resize path (`Handle::apply_mode`).
-        if let Err(e) = apply_single_mode(display, width, height, refresh_hz, false) {
+        if let Err(e) = apply_single_mode(display, width, height, refresh_hz, hidpi) {
             let _: () = msg_send![display, release];
             return Err(e);
         }

@@ -99,6 +99,14 @@ mod macos {
     // online-but-currently-disabled displays — which is exactly the set we
     // need to look at when recovering from a prior install/drop that left a
     // physical display stuck disabled.
+    /// Whether a display serves the session: the virtual display, or another
+    /// monitor's display in a multi-monitor session. The headless modes blank
+    /// every other display and leave these alone.
+    fn is_session_display(id: CGDirectDisplayID, virtual_display_id: u32) -> bool {
+        id == virtual_display_id
+            || super::session_monitors().is_some_and(|s| s.display_ids.contains(&id))
+    }
+
     fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         extern "C" {
             fn CGGetOnlineDisplayList(
@@ -146,19 +154,24 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            Self::create(width, height, refresh_hz, "macrdp", std::process::id())
+            Self::create(width, height, refresh_hz, "macrdp", std::process::id(), 1)
         }
 
         /// Another display for a multi-monitor session, at `width`×`height`
         /// pixels. Each needs its own serial: the WindowServer rejects a second
-        /// descriptor with the same vendor, product and serial.
+        /// descriptor with the same vendor, product and serial. A 2x display is
+        /// created in its HiDPI mode, since re-moding a fresh 1x display to 2x
+        /// doesn't take.
         pub fn new_secondary(width: u32, height: u32, scale: u32, index: u32) -> Result<Self> {
             let serial = std::process::id() ^ (index << 24);
-            let mut vd = Self::create(width, height, 60, &format!("macrdp {}", index + 1), serial)?;
-            if scale != 1 {
-                vd.resize(width, height, scale)?;
-            }
-            Ok(vd)
+            Self::create(
+                width,
+                height,
+                60,
+                &format!("macrdp {}", index + 1),
+                serial,
+                scale,
+            )
         }
 
         fn create(
@@ -167,9 +180,17 @@ mod macos {
             refresh_hz: u32,
             name: &str,
             serial: u32,
+            scale: u32,
         ) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, name, serial)
-                .context("creating virtual display")?;
+            let handle = private_api::create(
+                width / scale,
+                height / scale,
+                refresh_hz,
+                name,
+                serial,
+                scale == 2,
+            )
+            .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
             // and the point-space size. macOS auto-arranges new displays
@@ -186,13 +207,77 @@ mod macos {
                 ));
             }
 
-            Ok(Self {
+            let mut vd = Self {
                 _handle: handle,
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
-                scale: 1,
-            })
+                scale,
+            };
+            if scale == 2 {
+                vd.select_hidpi_mode(width / 2, height / 2)?;
+            }
+            Ok(vd)
+        }
+
+        /// Makes the 2x mode at `width`×`height` points current. macOS derives
+        /// it from the HiDPI mode setting but leaves a new display at 1x.
+        fn select_hidpi_mode(&mut self, width: u32, height: u32) -> Result<()> {
+            use core_foundation::base::TCFType;
+            use core_foundation::boolean::CFBoolean;
+            use core_foundation::dictionary::CFDictionary;
+            use core_foundation::string::CFString;
+            use core_graphics::display::{
+                kCGDisplayShowDuplicateLowResolutionModes, CGDisplayMode,
+            };
+
+            let key =
+                unsafe { CFString::wrap_under_get_rule(kCGDisplayShowDuplicateLowResolutionModes) };
+            let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
+            let mode =
+                CGDisplayMode::all_display_modes(self.display_id, options.as_concrete_TypeRef())
+                    .into_iter()
+                    .flatten()
+                    .find(|m| {
+                        m.width() == u64::from(width)
+                            && m.height() == u64::from(height)
+                            && m.pixel_width() == u64::from(width) * 2
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "display {} has no {width}x{height} 2x mode",
+                            self.display_id
+                        )
+                    })?;
+            let display = CGDisplay::new(self.display_id);
+            let config = display
+                .begin_configuration()
+                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (2x mode): CGError {e}"))?;
+            display
+                .configure_display_with_display_mode(&config, &mode)
+                .map_err(|e| anyhow!("CGConfigureDisplayWithDisplayMode: CGError {e}"))?;
+            display
+                .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (2x mode): CGError {e}"))?;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let b = display.bounds();
+                if b.size.width as u32 == width && b.size.height as u32 == height {
+                    self.origin_pts = (b.origin.x, b.origin.y);
+                    self.size_pts = (b.size.width, b.size.height);
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "display {} still {}x{} points after selecting its {width}x{height} 2x mode",
+                        self.display_id,
+                        b.size.width,
+                        b.size.height
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         pub fn display_id(&self) -> u32 {
@@ -492,7 +577,7 @@ mod macos {
             let mut detached: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -503,7 +588,9 @@ mod macos {
                     .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
                 let stuck: Vec<u32> = online
                     .into_iter()
-                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .filter(|id| {
+                        !is_session_display(*id, virtual_display_id) && !actives.contains(id)
+                    })
                     .collect();
                 if !stuck.is_empty() {
                     tracing::warn!(
@@ -783,7 +870,7 @@ mod macos {
             let targets: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -1147,7 +1234,7 @@ mod macos {
             let mut targets: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -1172,7 +1259,9 @@ mod macos {
                     .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
                 let mirrored: Vec<u32> = online
                     .into_iter()
-                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .filter(|id| {
+                        !is_session_display(*id, virtual_display_id) && !actives.contains(id)
+                    })
                     .collect();
                 if !mirrored.is_empty() {
                     tracing::warn!(
