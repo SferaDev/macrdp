@@ -416,6 +416,9 @@ pub struct CaptureDisplay {
     pub monitor_layout: Option<crate::monitor_layout::MonitorLayout>,
     /// One virtual display per non-primary monitor of a multi-monitor session.
     pub secondary_displays: Vec<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// Retries for monitors whose display didn't come up; see
+    /// `retry_missing_displays`.
+    pub display_retries: Arc<AtomicU32>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -496,6 +499,19 @@ fn adopt_client_size(
     } else {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn builtin_panel_active() -> bool {
+    use core_graphics::display::CGDisplay;
+    CGDisplay::active_displays()
+        .map(|ids| ids.into_iter().any(|id| CGDisplay::new(id).is_builtin()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn builtin_panel_active() -> bool {
+    false
 }
 
 /// Backing pixels per point for a virtual display serving a `width`×`height`
@@ -934,17 +950,46 @@ impl CaptureDisplay {
             Ok(false) => {}
             Err(e) => tracing::warn!(error = ?e, "arranging the session's virtual displays failed"),
         }
-        let complete = placements.len() == layout.monitors.len();
+        // A monitor without a display yet keeps the primary's id: input lands
+        // on the primary there, and no capture starts for it.
+        let missing = placements.len() < layout.monitors.len();
         let mut display_ids = vec![primary_id; layout.monitors.len()];
         for (&(id, _, _), &i) in placements[1..].iter().zip(&others) {
             display_ids[i] = id;
         }
-        crate::virtual_display::set_session_monitors(complete.then_some(
+        crate::virtual_display::set_session_monitors(Some(
             crate::virtual_display::SessionMonitors {
                 layout,
                 display_ids,
             },
         ));
+        if missing {
+            self.retry_missing_displays();
+        } else {
+            self.display_retries.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A display can fail to come up while the Mac's own panel takes the last
+    /// display the hardware drives; the headless mode turns the panel off once
+    /// the client connects. Waits for that, then reactivates the session, which
+    /// runs the display sync again. At most twice per layout.
+    fn retry_missing_displays(&self) {
+        let Some(gfx) = self.gfx.clone() else {
+            return;
+        };
+        if self.display_retries.fetch_add(1, Ordering::Relaxed) >= 2 {
+            return;
+        }
+        let (width, height) = self.desktop_size.get();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && builtin_panel_active() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            tracing::info!("retrying the session's missing virtual displays");
+            gfx.request_reactivation(width, height);
+        });
     }
 
     /// Starts a capture per non-primary monitor of a multi-monitor session,
@@ -962,6 +1007,9 @@ impl CaptureDisplay {
             .filter(|&i| i != primary)
             .enumerate()
         {
+            if session.display_ids[i] == session.display_ids[primary] {
+                continue;
+            }
             let m = session.layout.monitors[i];
             match macos::SecondaryCapture::start(
                 output,

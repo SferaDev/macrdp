@@ -2720,7 +2720,6 @@ impl Gfx {
     /// headless virtual-display path it cascades into a session re-cycle (see
     /// [`force_keyframe`]). Kept for the surface-retention case; not wired to the
     /// hotkey by default.
-    #[allow(dead_code)]
     pub(crate) fn request_reactivation(&self, width: u16, height: u16) {
         let packed = (u32::from(width) << 16) | u32::from(height);
         self.reactivate_request.store(packed, Ordering::Relaxed);

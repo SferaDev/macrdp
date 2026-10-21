@@ -198,7 +198,16 @@ mod macos {
             // is what we add to mouse coords so CGEventPost lands events
             // on the vdisplay, not on the user's main screen.
             let id = handle.display_id();
-            let bounds = CGDisplay::new(id).bounds();
+            // A display created right after another can take a moment to
+            // activate.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut bounds = CGDisplay::new(id).bounds();
+            while (bounds.size.width <= 0.0 || bounds.size.height <= 0.0)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(50));
+                bounds = CGDisplay::new(id).bounds();
+            }
             if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
                 return Err(anyhow!(
                     "virtual display registered (id={id}) but CGDisplayBounds \
@@ -223,42 +232,69 @@ mod macos {
         /// Makes the 2x mode at `width`×`height` points current. macOS derives
         /// it from the HiDPI mode setting but leaves a new display at 1x.
         fn select_hidpi_mode(&mut self, width: u32, height: u32) -> Result<()> {
+            use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+            use core_foundation::base::CFRelease;
             use core_foundation::base::TCFType;
             use core_foundation::boolean::CFBoolean;
             use core_foundation::dictionary::CFDictionary;
+            use core_foundation::dictionary::CFDictionaryRef;
             use core_foundation::string::CFString;
-            use core_graphics::display::{
-                kCGDisplayShowDuplicateLowResolutionModes, CGDisplayMode,
-            };
+            use core_graphics::display::kCGDisplayShowDuplicateLowResolutionModes;
+            use std::ffi::c_void;
+
+            unsafe extern "C" {
+                fn CGDisplayCopyAllDisplayModes(
+                    display: u32,
+                    options: CFDictionaryRef,
+                ) -> CFArrayRef;
+                fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+                fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+                fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+                fn CGDisplaySetDisplayMode(
+                    display: u32,
+                    mode: *const c_void,
+                    options: CFDictionaryRef,
+                ) -> i32;
+            }
 
             let key =
                 unsafe { CFString::wrap_under_get_rule(kCGDisplayShowDuplicateLowResolutionModes) };
             let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
-            let mode =
-                CGDisplayMode::all_display_modes(self.display_id, options.as_concrete_TypeRef())
-                    .into_iter()
-                    .flatten()
-                    .find(|m| {
-                        m.width() == u64::from(width)
-                            && m.height() == u64::from(height)
-                            && m.pixel_width() == u64::from(width) * 2
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "display {} has no {width}x{height} 2x mode",
-                            self.display_id
-                        )
-                    })?;
+            // core-graphics' all_display_modes returns modes it never retained,
+            // which are freed with the list, so switch while the list is alive.
+            let (w, h) = (width as usize, height as usize);
+            let result = unsafe {
+                let modes =
+                    CGDisplayCopyAllDisplayModes(self.display_id, options.as_concrete_TypeRef());
+                if modes.is_null() {
+                    return Err(anyhow!(
+                        "CGDisplayCopyAllDisplayModes failed for display {}",
+                        self.display_id
+                    ));
+                }
+                let found = (0..CFArrayGetCount(modes))
+                    .map(|i| CFArrayGetValueAtIndex(modes, i))
+                    .find(|&m| {
+                        CGDisplayModeGetWidth(m) == w
+                            && CGDisplayModeGetHeight(m) == h
+                            && CGDisplayModeGetPixelWidth(m) == w * 2
+                    });
+                let result =
+                    found.map(|m| CGDisplaySetDisplayMode(self.display_id, m, std::ptr::null()));
+                CFRelease(modes.cast());
+                result
+            };
+            match result {
+                None => {
+                    return Err(anyhow!(
+                        "display {} has no {width}x{height} 2x mode",
+                        self.display_id
+                    ))
+                }
+                Some(0) => {}
+                Some(e) => return Err(anyhow!("CGDisplaySetDisplayMode: CGError {e}")),
+            }
             let display = CGDisplay::new(self.display_id);
-            let config = display
-                .begin_configuration()
-                .map_err(|e| anyhow!("CGBeginDisplayConfiguration (2x mode): CGError {e}"))?;
-            display
-                .configure_display_with_display_mode(&config, &mode)
-                .map_err(|e| anyhow!("CGConfigureDisplayWithDisplayMode: CGError {e}"))?;
-            display
-                .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
-                .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (2x mode): CGError {e}"))?;
 
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
