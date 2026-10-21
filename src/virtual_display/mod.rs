@@ -331,6 +331,13 @@ mod macos {
                     return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
+                    // An existing 1x display can miss a re-mode to 2x the same
+                    // way a new one does.
+                    if scale == 2 {
+                        self.select_hidpi_mode(width, height)?;
+                        self.scale = scale;
+                        return Ok(());
+                    }
                     return Err(anyhow!(
                         "virtual display mode applied but CGDisplayBounds still reports \
                          {}x{} (expected {width}x{height}) after 3s — WindowServer hasn't \
