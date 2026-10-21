@@ -411,6 +411,9 @@ pub struct CaptureDisplay {
     /// connect and then from each live monitor layout. Picks the virtual
     /// display's scale in `sync_virtual_display`.
     pub client_scale_percent: u32,
+    /// The client's monitors as one desktop, for a multi-monitor session
+    /// (`--multi-monitor`); `None` serves one monitor.
+    pub monitor_layout: Option<crate::monitor_layout::MonitorLayout>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -496,7 +499,7 @@ fn adopt_client_size(
 /// Backing pixels per point for a virtual display serving a `width`×`height`
 /// session: 2 for a Retina client (200% or more), as long as the session
 /// halves into a mode inside the protocol-legal band, otherwise 1.
-fn virtual_display_scale(width: u16, height: u16, client_scale_percent: u32) -> u32 {
+pub(crate) fn virtual_display_scale(width: u16, height: u16, client_scale_percent: u32) -> u32 {
     let halves =
         width.is_multiple_of(2) && height.is_multiple_of(2) && width >= 400 && height >= 400;
     if client_scale_percent >= 200 && halves {
@@ -558,6 +561,18 @@ impl RdpServerDisplay for CaptureDisplay {
 
     fn set_client_desktop_scale_factor(&mut self, desktop_scale_factor: Option<u32>) {
         self.client_scale_percent = desktop_scale_factor.unwrap_or(100);
+    }
+
+    fn set_client_monitor_layout(&mut self, monitors: &[ironrdp_acceptor::ClientMonitor]) {
+        self.monitor_layout = crate::monitor_layout::MonitorLayout::from_client(monitors);
+        if let Some(layout) = &self.monitor_layout {
+            tracing::info!(
+                width = layout.width,
+                height = layout.height,
+                monitors = ?layout.monitors,
+                "multi-monitor session"
+            );
+        }
     }
 
     /// Handle a client-driven live resize (MS-RDPEDISP monitor layout — the
