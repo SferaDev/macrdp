@@ -304,6 +304,13 @@ pub trait RdpServerDisplay: Send {
         let _ = desktop_scale_factor;
     }
 
+    /// (vendored) The client's monitors when the acceptor adopted a
+    /// multi-monitor layout, empty for a single monitor. Called right after
+    /// `set_client_desktop_scale_factor`, under the same rules.
+    fn set_client_monitor_layout(&mut self, monitors: &[ironrdp_acceptor::ClientMonitor]) {
+        let _ = monitors;
+    }
+
     /// Return a display updates receiver
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>>;
 

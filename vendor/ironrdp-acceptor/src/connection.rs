@@ -51,6 +51,10 @@ pub struct Acceptor {
     // (vendored) The client's desktop scale factor in percent, from the
     // optional part of the Client Core Data. `None` when not announced.
     desktop_scale_factor: Option<u32>,
+    // (vendored) Adopt a multi-monitor layout from the Client Monitor Data, and
+    // the layout adopted for this session (empty for a single monitor).
+    honor_client_monitors: bool,
+    monitor_layout: Vec<ClientMonitor>,
     // (vendored) The UDP multitransport (MS-RDPEMT) offer to send, if any. When
     // set, the acceptor advertises SC_MULTITRANSPORT and emits a Server Initiate
     // Multitransport Request after licensing (before Demand Active) on the message
@@ -84,6 +88,30 @@ const MAX_DESKTOP_DIM: u16 = 8192;
 
 /// Returns the client-requested desktop size if both dimensions are within the
 /// protocol-legal range, otherwise `None`.
+/// (vendored) A monitor from the client's GCC Client Monitor Data, in client
+/// coordinates (relative to the primary at 0,0, right and bottom inclusive),
+/// with its desktop scale factor from Client Monitor Extended Data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientMonitor {
+    pub monitor: gcc::Monitor,
+    pub desktop_scale_factor: Option<u32>,
+}
+
+/// (vendored) The desktop size covering a multi-monitor layout, or `None` for a
+/// single monitor or a bounding box outside the protocol band.
+fn monitors_bounding_size(monitors: &[gcc::Monitor]) -> Option<DesktopSize> {
+    if monitors.len() < 2 {
+        return None;
+    }
+    let left = monitors.iter().map(|m| m.left).min()?;
+    let top = monitors.iter().map(|m| m.top).min()?;
+    let right = monitors.iter().map(|m| m.right).max()?;
+    let bottom = monitors.iter().map(|m| m.bottom).max()?;
+    let width = u16::try_from(right.checked_sub(left)?.checked_add(1)?).ok()?;
+    let height = u16::try_from(bottom.checked_sub(top)?.checked_add(1)?).ok()?;
+    validate_desktop_size(width, height)
+}
+
 fn validate_desktop_size(width: u16, height: u16) -> Option<DesktopSize> {
     if (MIN_DESKTOP_DIM..=MAX_DESKTOP_DIM).contains(&width) && (MIN_DESKTOP_DIM..=MAX_DESKTOP_DIM).contains(&height) {
         Some(DesktopSize { width, height })
@@ -143,6 +171,9 @@ pub struct AcceptorResult {
     /// (vendored) Desktop scale factor in percent announced in the Client Core
     /// Data (for example 200 on a Retina Mac client). `None` when absent.
     pub desktop_scale_factor: Option<u32>,
+    /// (vendored) The client's monitors when the acceptor adopted a
+    /// multi-monitor layout (see `set_honor_client_monitors`); empty otherwise.
+    pub monitor_layout: Vec<ClientMonitor>,
     /// (vendored) The UDP multitransport offer the acceptor actually emitted
     /// (offer set AND client advertised the transport); `None` if nothing sent.
     pub multitransport_offered: Option<MultitransportOffer>,
@@ -192,6 +223,8 @@ impl Acceptor {
             client_version: 0,
             client_build: 0,
             desktop_scale_factor: None,
+            honor_client_monitors: false,
+            monitor_layout: Vec::new(),
             multitransport_offer: None,
             multitransport_offered: None,
         }
@@ -239,6 +272,14 @@ impl Acceptor {
     /// [`RdpServerDisplay`]: <https://docs.rs/ironrdp-server/latest/ironrdp_server/trait.RdpServerDisplay.html>
     pub fn set_honor_client_desktop_size(&mut self, max: Option<DesktopSize>) {
         self.honor_client_desktop_size = max;
+    }
+
+    /// (vendored) When the client announces two or more monitors, serve their
+    /// bounding box as the desktop and echo them in the Monitor Layout PDU.
+    /// Takes effect only with `set_honor_client_desktop_size`; the operator
+    /// maximum given there applies per monitor, which the caller checks.
+    pub fn set_honor_client_monitors(&mut self, honor: bool) {
+        self.honor_client_monitors = honor;
     }
 
     /// (vendored) Offer an auxiliary UDP multitransport (MS-RDPEMT) transport.
@@ -294,6 +335,8 @@ impl Acceptor {
             client_version: consumed.client_version,
             client_build: consumed.client_build,
             desktop_scale_factor: consumed.desktop_scale_factor,
+            honor_client_monitors: consumed.honor_client_monitors,
+            monitor_layout: consumed.monitor_layout,
             multitransport_offer: consumed.multitransport_offer,
             multitransport_offered: consumed.multitransport_offered,
         })
@@ -386,6 +429,7 @@ impl Acceptor {
                 client_version: self.client_version,
                 client_build: self.client_build,
                 desktop_scale_factor: self.desktop_scale_factor,
+                monitor_layout: self.monitor_layout.clone(),
                 multitransport_offered: self.multitransport_offered,
                 reactivation: self.reactivation,
                 credentials: self.received_credentials.take(),
@@ -688,6 +732,27 @@ impl Sequence for Acceptor {
                             max = ?max,
                             "Client-requested desktop size is out of protocol range after clamping to the operator maximum; keeping the server-provided size"
                         );
+                    }
+                }
+
+                // (vendored, divergence (6)) Adopt a multi-monitor layout.
+                if self.honor_client_monitors && self.honor_client_desktop_size.is_some() {
+                    let monitors = gcc_blocks.monitor.map(|m| m.monitors).unwrap_or_default();
+                    if let Some(size) = monitors_bounding_size(&monitors) {
+                        let scales = gcc_blocks
+                            .monitor_extended
+                            .map(|m| m.extended_monitors_info)
+                            .unwrap_or_default();
+                        self.monitor_layout = monitors
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, monitor)| ClientMonitor {
+                                monitor,
+                                desktop_scale_factor: scales.get(i).map(|info| info.desktop_scale_factor),
+                            })
+                            .collect();
+                        self.desktop_size = size;
+                        set_bitmap_desktop_size(&mut self.server_capabilities, size);
                     }
                 }
 
@@ -1007,13 +1072,17 @@ impl Sequence for Acceptor {
             AcceptorState::MonitorLayoutSend { channels } => {
                 let monitor_layout =
                     rdp::headers::ShareDataPdu::MonitorLayout(rdp::finalization_messages::MonitorLayoutPdu {
-                        monitors: vec![gcc::Monitor {
-                            left: 0,
-                            top: 0,
-                            right: i32::from(self.desktop_size.width),
-                            bottom: i32::from(self.desktop_size.height),
-                            flags: gcc::MonitorFlags::PRIMARY,
-                        }],
+                        monitors: if self.monitor_layout.is_empty() {
+                            vec![gcc::Monitor {
+                                left: 0,
+                                top: 0,
+                                right: i32::from(self.desktop_size.width),
+                                bottom: i32::from(self.desktop_size.height),
+                                flags: gcc::MonitorFlags::PRIMARY,
+                            }]
+                        } else {
+                            self.monitor_layout.iter().map(|m| m.monitor.clone()).collect()
+                        },
                     });
 
                 debug!(message = ?monitor_layout, "Send");

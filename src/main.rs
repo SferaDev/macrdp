@@ -33,6 +33,7 @@ mod input;
 mod keyboard_layout;
 mod lock_activity;
 mod logging;
+mod monitor_layout;
 mod multitransport;
 mod rdpdr;
 mod reaper;
@@ -427,6 +428,12 @@ struct Args {
     /// writes. macOS-only concern but cross-platform code.
     #[arg(long)]
     stats_endpoint: bool,
+
+    /// Serve every monitor of a multi-monitor client (Windows App's "Use all
+    /// monitors"), each on its own virtual display. Needs --virtual-display
+    /// and --enable-h264. Default off.
+    #[arg(long)]
+    multi_monitor: bool,
 
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
@@ -2502,6 +2509,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
     if on("STATS_ENDPOINT", false) {
         argv.push("--stats-endpoint".into());
     }
+    if on("MULTI_MONITOR", false) {
+        argv.push("--multi-monitor".into());
+    }
     if on("MAP_CTRL_TO_CMD", false) {
         argv.push("--map-ctrl-to-cmd".into());
     }
@@ -3488,6 +3498,9 @@ async fn async_main() -> Result<()> {
         // the mirror-primary path (no virtual display to re-mode).
         virtual_display: virtual_display.clone(),
         client_scale_percent: 100,
+        monitor_layout: None,
+        secondary_displays: Vec::new(),
+        display_retries: Arc::default(),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
@@ -3656,6 +3669,16 @@ async fn async_main() -> Result<()> {
     // shared `desktop_size` that capture, input scaling, and the H.264
     // pipeline all read.
     server.set_honor_client_desktop_size(auto_size);
+    // A monitor per virtual display and an EGFX surface per monitor, so only
+    // on the virtual-display H.264 path.
+    let multi_monitor = args.multi_monitor && args.virtual_display && args.enable_h264 && auto_size;
+    if args.multi_monitor && !multi_monitor {
+        warn!(
+            "--multi-monitor needs --virtual-display and --enable-h264 with client-resolution \
+             auto-adopt; serving one monitor"
+        );
+    }
+    server.set_honor_client_monitors(multi_monitor);
     // Optional operator ceiling for the adopted size (--max-client-size,
     // defense-in-depth): a request above the cap is clamped per-dimension in
     // the acceptor. Meaningless off the auto-adopt path (nothing is adopted),

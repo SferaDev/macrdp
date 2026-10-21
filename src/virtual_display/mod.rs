@@ -14,15 +14,37 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange, screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed,
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    arrange, screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
     PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
+
+/// The virtual displays serving a multi-monitor session, by monitor index.
+/// Input routes pointer events by it, and gathering windows onto one display
+/// leaves windows on the others alone.
+#[derive(Debug, Clone)]
+pub struct SessionMonitors {
+    pub layout: crate::monitor_layout::MonitorLayout,
+    pub display_ids: Vec<u32>,
+}
+
+static SESSION_MONITORS: std::sync::Mutex<Option<SessionMonitors>> = std::sync::Mutex::new(None);
+
+pub fn set_session_monitors(monitors: Option<SessionMonitors>) {
+    *SESSION_MONITORS.lock().unwrap_or_else(|e| e.into_inner()) = monitors;
+}
+
+pub fn session_monitors() -> Option<SessionMonitors> {
+    SESSION_MONITORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -77,6 +99,41 @@ mod macos {
     // online-but-currently-disabled displays — which is exactly the set we
     // need to look at when recovering from a prior install/drop that left a
     // physical display stuck disabled.
+    /// Every online display with its state, for errors about display setup.
+    fn describe_displays() -> String {
+        let active = CGDisplay::active_displays().unwrap_or_default();
+        online_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| {
+                let d = CGDisplay::new(id);
+                let b = d.bounds();
+                format!(
+                    "{id}{}{} {}x{}@{},{}",
+                    if active.contains(&id) {
+                        ""
+                    } else {
+                        " inactive"
+                    },
+                    if d.is_builtin() { " builtin" } else { "" },
+                    b.size.width,
+                    b.size.height,
+                    b.origin.x,
+                    b.origin.y
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Whether a display serves the session: the virtual display, or another
+    /// monitor's display in a multi-monitor session. The headless modes blank
+    /// every other display and leave these alone.
+    fn is_session_display(id: CGDirectDisplayID, virtual_display_id: u32) -> bool {
+        id == virtual_display_id
+            || super::session_monitors().is_some_and(|s| s.display_ids.contains(&id))
+    }
+
     fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         extern "C" {
             fn CGGetOnlineDisplayList(
@@ -124,8 +181,43 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, "macrdp")
-                .context("creating virtual display")?;
+            Self::create(width, height, refresh_hz, "macrdp", std::process::id(), 1)
+        }
+
+        /// Another display for a multi-monitor session, at `width`×`height`
+        /// pixels. Each needs its own serial: the WindowServer rejects a second
+        /// descriptor with the same vendor, product and serial. A 2x display is
+        /// created in its HiDPI mode, since re-moding a fresh 1x display to 2x
+        /// doesn't take.
+        pub fn new_secondary(width: u32, height: u32, scale: u32, index: u32) -> Result<Self> {
+            let serial = std::process::id() ^ (index << 24);
+            Self::create(
+                width,
+                height,
+                60,
+                &format!("macrdp {}", index + 1),
+                serial,
+                scale,
+            )
+        }
+
+        fn create(
+            width: u32,
+            height: u32,
+            refresh_hz: u32,
+            name: &str,
+            serial: u32,
+            scale: u32,
+        ) -> Result<Self> {
+            let handle = private_api::create(
+                width / scale,
+                height / scale,
+                refresh_hz,
+                name,
+                serial,
+                scale == 2,
+            )
+            .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
             // and the point-space size. macOS auto-arranges new displays
@@ -133,22 +225,123 @@ mod macos {
             // is what we add to mouse coords so CGEventPost lands events
             // on the vdisplay, not on the user's main screen.
             let id = handle.display_id();
-            let bounds = CGDisplay::new(id).bounds();
+            // A display created right after another can take a moment to
+            // activate.
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut bounds = CGDisplay::new(id).bounds();
+            while (bounds.size.width <= 0.0 || bounds.size.height <= 0.0)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(50));
+                bounds = CGDisplay::new(id).bounds();
+            }
             if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
                 return Err(anyhow!(
                     "virtual display registered (id={id}) but CGDisplayBounds \
                      returned a zero-size rect — the system hasn't finished \
-                     activating it yet"
+                     activating it yet; displays: {}",
+                    describe_displays()
                 ));
             }
 
-            Ok(Self {
+            let mut vd = Self {
                 _handle: handle,
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
-                scale: 1,
-            })
+                scale,
+            };
+            if scale == 2 && vd.size_pts != (f64::from(width / 2), f64::from(height / 2)) {
+                vd.select_hidpi_mode(width / 2, height / 2)?;
+            }
+            Ok(vd)
+        }
+
+        /// Makes the 2x mode at `width`×`height` points current. macOS derives
+        /// it from the HiDPI mode setting but leaves a new display at 1x.
+        fn select_hidpi_mode(&mut self, width: u32, height: u32) -> Result<()> {
+            use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+            use core_foundation::base::CFRelease;
+            use core_foundation::base::TCFType;
+            use core_foundation::boolean::CFBoolean;
+            use core_foundation::dictionary::CFDictionary;
+            use core_foundation::dictionary::CFDictionaryRef;
+            use core_foundation::string::CFString;
+            use core_graphics::display::kCGDisplayShowDuplicateLowResolutionModes;
+            use std::ffi::c_void;
+
+            unsafe extern "C" {
+                fn CGDisplayCopyAllDisplayModes(
+                    display: u32,
+                    options: CFDictionaryRef,
+                ) -> CFArrayRef;
+                fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+                fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+                fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+                fn CGDisplaySetDisplayMode(
+                    display: u32,
+                    mode: *const c_void,
+                    options: CFDictionaryRef,
+                ) -> i32;
+            }
+
+            let key =
+                unsafe { CFString::wrap_under_get_rule(kCGDisplayShowDuplicateLowResolutionModes) };
+            let options = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
+            // core-graphics' all_display_modes returns modes it never retained,
+            // which are freed with the list, so switch while the list is alive.
+            let (w, h) = (width as usize, height as usize);
+            let result = unsafe {
+                let modes =
+                    CGDisplayCopyAllDisplayModes(self.display_id, options.as_concrete_TypeRef());
+                if modes.is_null() {
+                    return Err(anyhow!(
+                        "CGDisplayCopyAllDisplayModes failed for display {}",
+                        self.display_id
+                    ));
+                }
+                let found = (0..CFArrayGetCount(modes))
+                    .map(|i| CFArrayGetValueAtIndex(modes, i))
+                    .find(|&m| {
+                        CGDisplayModeGetWidth(m) == w
+                            && CGDisplayModeGetHeight(m) == h
+                            && CGDisplayModeGetPixelWidth(m) == w * 2
+                    });
+                let result =
+                    found.map(|m| CGDisplaySetDisplayMode(self.display_id, m, std::ptr::null()));
+                CFRelease(modes.cast());
+                result
+            };
+            match result {
+                None => {
+                    return Err(anyhow!(
+                        "display {} has no {width}x{height} 2x mode",
+                        self.display_id
+                    ))
+                }
+                Some(0) => {}
+                Some(e) => return Err(anyhow!("CGDisplaySetDisplayMode: CGError {e}")),
+            }
+            let display = CGDisplay::new(self.display_id);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let b = display.bounds();
+                if b.size.width as u32 == width && b.size.height as u32 == height {
+                    self.origin_pts = (b.origin.x, b.origin.y);
+                    self.size_pts = (b.size.width, b.size.height);
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "display {} still {}x{} points after selecting its {width}x{height} 2x mode",
+                        self.display_id,
+                        b.size.width,
+                        b.size.height
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         pub fn display_id(&self) -> u32 {
@@ -202,6 +395,13 @@ mod macos {
                     return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
+                    // An existing 1x display can miss a re-mode to 2x the same
+                    // way a new one does.
+                    if scale == 2 {
+                        self.select_hidpi_mode(width, height)?;
+                        self.scale = scale;
+                        return Ok(());
+                    }
                     return Err(anyhow!(
                         "virtual display mode applied but CGDisplayBounds still reports \
                          {}x{} (expected {width}x{height}) after 3s — WindowServer hasn't \
@@ -254,6 +454,37 @@ mod macos {
             self.origin_pts = (0.0, 0.0);
             Ok(true)
         }
+    }
+
+    /// Moves displays to the given global origins, in points, in one
+    /// configuration that reverts when macrdp exits. Displays already in place
+    /// are left out, so an unchanged layout costs no relayout. Returns whether
+    /// anything moved.
+    pub fn arrange(placements: &[(u32, i32, i32)]) -> Result<bool> {
+        let moves: Vec<_> = placements
+            .iter()
+            .copied()
+            .filter(|&(id, x, y)| {
+                let o = CGDisplay::new(id).bounds().origin;
+                (o.x.round() as i32, o.y.round() as i32) != (x, y)
+            })
+            .collect();
+        let Some(&(first, _, _)) = moves.first() else {
+            return Ok(false);
+        };
+        let display = CGDisplay::new(first);
+        let config = display
+            .begin_configuration()
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (arrange): CGError {e}"))?;
+        for &(id, x, y) in &moves {
+            CGDisplay::new(id)
+                .configure_display_origin(&config, x, y)
+                .map_err(|e| anyhow!("CGConfigureDisplayOrigin({id}, {x}, {y}): CGError {e}"))?;
+        }
+        display
+            .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (arrange): CGError {e}"))?;
+        Ok(true)
     }
 
     /// Promotes a virtual (or any other secondary) display to be the
@@ -417,7 +648,7 @@ mod macos {
             let mut detached: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -428,7 +659,9 @@ mod macos {
                     .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
                 let stuck: Vec<u32> = online
                     .into_iter()
-                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .filter(|id| {
+                        !is_session_display(*id, virtual_display_id) && !actives.contains(id)
+                    })
                     .collect();
                 if !stuck.is_empty() {
                     tracing::warn!(
@@ -497,6 +730,33 @@ mod macos {
                 detached_count = detached.len(),
                 "physical displays detached"
             );
+
+            // Parking the panel beside the virtual display can overlap a
+            // multi-monitor session's other displays, which macOS then shoves
+            // aside; put them back where the client has them.
+            if let Some(session) = super::session_monitors() {
+                std::thread::sleep(TX_SETTLE);
+                let origins = session.layout.origins_pts();
+                let placements: Vec<_> = session
+                    .display_ids
+                    .iter()
+                    .zip(origins)
+                    .filter(|&(&id, _)| id != virtual_display_id)
+                    .map(|(&id, (x, y))| (id, x, y))
+                    .chain(std::iter::once((virtual_display_id, 0, 0)))
+                    .collect();
+                match arrange(&placements) {
+                    Ok(true) => tracing::info!(
+                        ?placements,
+                        "re-arranged the session's virtual displays after detaching"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        "re-arranging the session's virtual displays after detaching failed"
+                    ),
+                }
+            }
 
             Ok(Self {
                 virtual_id: virtual_display_id,
@@ -708,7 +968,7 @@ mod macos {
             let targets: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -1072,7 +1332,7 @@ mod macos {
             let mut targets: Vec<(u32, (i32, i32))> = actives
                 .iter()
                 .copied()
-                .filter(|id| *id != virtual_display_id)
+                .filter(|id| !is_session_display(*id, virtual_display_id))
                 .map(|id| {
                     let b = CGDisplay::new(id).bounds();
                     (id, (b.origin.x.round() as i32, b.origin.y.round() as i32))
@@ -1097,7 +1357,9 @@ mod macos {
                     .map_err(|e| anyhow!("CGGetOnlineDisplayList: CGError {e}"))?;
                 let mirrored: Vec<u32> = online
                     .into_iter()
-                    .filter(|id| *id != virtual_display_id && !actives.contains(id))
+                    .filter(|id| {
+                        !is_session_display(*id, virtual_display_id) && !actives.contains(id)
+                    })
                     .collect();
                 if !mirrored.is_empty() {
                     tracing::warn!(
@@ -1668,9 +1930,16 @@ mod stub {
         pub fn resize(&mut self, _width: u32, _height: u32, _scale: u32) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+        pub fn new_secondary(_width: u32, _height: u32, _scale: u32, _index: u32) -> Result<Self> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn reanchor_as_main(&mut self) -> Result<bool> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+    }
+
+    pub fn arrange(_placements: &[(u32, i32, i32)]) -> Result<bool> {
+        Err(anyhow!("virtual display is macOS-only"))
     }
 
     pub struct PrimaryOverride;
