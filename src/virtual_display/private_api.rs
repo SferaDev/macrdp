@@ -280,8 +280,22 @@ pub(super) fn create(
         // protocol-legal mode, including ones larger than the first.
         let _: () = msg_send![desc, setMaxPixelsWide: 8192u32];
         let _: () = msg_send![desc, setMaxPixelsHigh: 8192u32];
-        // 600x338 mm ≈ a 27-inch 16:9 panel. Just a label.
-        let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
+        // 600x338 mm ≈ a 27-inch 16:9 panel. A HiDPI display is sized at a
+        // MacBook panel's 254 ppi instead: macOS derives a new display's 2x
+        // modes from its pixel density, and at 27 inches leaves it at 1x.
+        let size_mm = if hidpi {
+            let mm = |points: u32| f64::from(points * 2) * 25.4 / 254.0;
+            CGSize {
+                width: mm(width),
+                height: mm(height),
+            }
+        } else {
+            CGSize {
+                width: 600.0,
+                height: 338.0,
+            }
+        };
+        let _: () = msg_send![desc, setSizeInMillimeters: size_mm];
         let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
         let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
         // Was hardcoded to 1: a second macrdp process (e.g. two concurrent

@@ -99,6 +99,33 @@ mod macos {
     // online-but-currently-disabled displays — which is exactly the set we
     // need to look at when recovering from a prior install/drop that left a
     // physical display stuck disabled.
+    /// Every online display with its state, for errors about display setup.
+    fn describe_displays() -> String {
+        let active = CGDisplay::active_displays().unwrap_or_default();
+        online_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| {
+                let d = CGDisplay::new(id);
+                let b = d.bounds();
+                format!(
+                    "{id}{}{} {}x{}@{},{}",
+                    if active.contains(&id) {
+                        ""
+                    } else {
+                        " inactive"
+                    },
+                    if d.is_builtin() { " builtin" } else { "" },
+                    b.size.width,
+                    b.size.height,
+                    b.origin.x,
+                    b.origin.y
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Whether a display serves the session: the virtual display, or another
     /// monitor's display in a multi-monitor session. The headless modes blank
     /// every other display and leave these alone.
@@ -212,7 +239,8 @@ mod macos {
                 return Err(anyhow!(
                     "virtual display registered (id={id}) but CGDisplayBounds \
                      returned a zero-size rect — the system hasn't finished \
-                     activating it yet"
+                     activating it yet; displays: {}",
+                    describe_displays()
                 ));
             }
 
@@ -223,7 +251,7 @@ mod macos {
                 size_pts: (bounds.size.width, bounds.size.height),
                 scale,
             };
-            if scale == 2 {
+            if scale == 2 && vd.size_pts != (f64::from(width / 2), f64::from(height / 2)) {
                 vd.select_hidpi_mode(width / 2, height / 2)?;
             }
             Ok(vd)
