@@ -2779,7 +2779,7 @@ impl Gfx {
     }
 
     fn ship_frames(&self, frames: &[EncodedFrame], output: Option<usize>) -> Result<()> {
-        let (dvc_messages, egfx_channel_id) = {
+        {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
             // (`GfxDvcBridge::process` → `GraphicsPipelineServer::process` →
@@ -2892,29 +2892,30 @@ impl Gfx {
                     ),
                 }
             }
-            (server.drain_output(), egfx_channel_id)
-        };
-
-        if dvc_messages.is_empty() {
-            return Ok(());
+            let dvc_messages = server.drain_output();
+            if dvc_messages.is_empty() {
+                return Ok(());
+            }
+            // Still under `server_handle`: frame ids are assigned under it, and a
+            // multi-monitor session's ship threads must not reorder frames.
+            // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
+            // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
+            let svc_messages =
+                encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+            let sender = self
+                .sender
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+            sender
+                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                    messages: svc_messages,
+                }))
+                .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+            Ok(())
         }
-        // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
-        // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
-        let svc_messages =
-            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
-        let sender = self
-            .sender
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
-        sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            }))
-            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
-        Ok(())
     }
 
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
