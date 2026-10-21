@@ -1560,6 +1560,24 @@ mod macos {
         }
 
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
+            if let Some(session) = crate::virtual_display::session_monitors() {
+                // A multi-monitor desktop spans every monitor: land on the
+                // display serving the monitor under the pointer.
+                let i = session.layout.monitor_at(x, y);
+                let m = session.layout.monitors[i];
+                let b = CGDisplay::new(session.display_ids[i]).bounds();
+                let (mx, my) = super::map_client_to_display(
+                    x.saturating_sub(m.x).min(m.width - 1),
+                    y.saturating_sub(m.y).min(m.height - 1),
+                    m.width,
+                    m.height,
+                    b.size.width,
+                    b.size.height,
+                    false,
+                );
+                self.post_move(b.origin.x + mx, b.origin.y + my);
+                return;
+            }
             // Scale desktop coords → screen points, then translate into the
             // target display's slot in the global coord space. The origin
             // offset is what makes CGEventPost route events to a non-primary
@@ -2958,7 +2976,9 @@ mod macos {
         // grabbable.
         let (nx, ny) = (tx + 40.0, ty + 40.0);
         // A window on another of the session's displays is where the user put it.
-        let others: Vec<(f64, f64, f64, f64)> = crate::virtual_display::session_displays()
+        let others: Vec<(f64, f64, f64, f64)> = crate::virtual_display::session_monitors()
+            .map(|s| s.display_ids)
+            .unwrap_or_default()
             .into_iter()
             .filter(|&id| id != display_id)
             .map(|id| {
