@@ -2950,6 +2950,15 @@ mod macos {
         // Land stranded windows a little inside the top-left so the title bar is
         // grabbable.
         let (nx, ny) = (tx + 40.0, ty + 40.0);
+        // A window on another of the session's displays is where the user put it.
+        let others: Vec<(f64, f64, f64, f64)> = crate::virtual_display::session_displays()
+            .into_iter()
+            .filter(|&id| id != display_id)
+            .map(|id| {
+                let b = CGDisplay::new(id).bounds();
+                (b.origin.x, b.origin.y, b.size.width, b.size.height)
+            })
+            .collect();
 
         // Read an AXValue-typed attribute (AXPosition/AXSize) as a coordinate pair.
         let read_pair = |win: *const c_void, attr: &CFString, tag: u32| -> Option<(f64, f64)> {
@@ -3021,9 +3030,16 @@ mod macos {
                         // is still swept, instead of being left half-cut. A window
                         // fully off the target overlaps by 0 and is always moved; a
                         // window fully on it overlaps 100% and is always left.
-                        let ix = (px + sw).min(tx + tw) - px.max(tx);
-                        let iy = (py + sh).min(ty + th) - py.max(ty);
-                        let on_target = ix.max(0.0) * iy.max(0.0);
+                        let overlap = |(x, y, w, h): (f64, f64, f64, f64)| {
+                            let ix = (px + sw).min(x + w) - px.max(x);
+                            let iy = (py + sh).min(y + h) - py.max(y);
+                            ix.max(0.0) * iy.max(0.0)
+                        };
+                        let on_target = others
+                            .iter()
+                            .copied()
+                            .map(overlap)
+                            .fold(overlap((tx, ty, tw, th)), f64::max);
                         let win_area = (sw * sh).max(1.0);
                         if on_target >= win_area * 0.5 {
                             // Mostly (or fully) visible on the target — leave it be.

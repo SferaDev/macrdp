@@ -66,6 +66,35 @@ impl MonitorLayout {
         })
     }
 
+    pub fn primary(&self) -> usize {
+        self.monitors.iter().position(|m| m.primary).unwrap_or(0)
+    }
+
+    /// Where each monitor's virtual display goes in macOS's global
+    /// coordinates, in points: the primary at 0,0 and the others edge to edge
+    /// around it, as the client arranges its monitors.
+    pub fn origins_pts(&self) -> Vec<(i32, i32)> {
+        let p = self.monitors[self.primary()];
+        let primary_scale = p.scale as i32;
+        self.monitors
+            .iter()
+            .map(|m| {
+                let axis = |pos: u16, len: u16, primary_pos: u16| {
+                    let (pos, len, primary_pos) =
+                        (i32::from(pos), i32::from(len), i32::from(primary_pos));
+                    if pos + len <= primary_pos {
+                        // Before the primary: keep the far edge against it,
+                        // since this monitor's own scale sets its size in points.
+                        (pos + len - primary_pos) / primary_scale - len / m.scale as i32
+                    } else {
+                        (pos - primary_pos) / primary_scale
+                    }
+                };
+                (axis(m.x, m.width, p.x), axis(m.y, m.height, p.y))
+            })
+            .collect()
+    }
+
     /// The monitor containing a point on the session desktop, falling back to
     /// the nearest one for a point in a gap between monitors.
     pub fn monitor_at(&self, x: u16, y: u16) -> usize {
@@ -141,6 +170,14 @@ mod tests {
                 (4520, 1027, 3024, 1898, 2, false),
                 (0, 0, 1080, 1920, 1, false)
             ]
+        );
+    }
+
+    #[test]
+    fn arranges_the_displays_edge_to_edge_around_the_primary() {
+        assert_eq!(
+            three_monitors().origins_pts(),
+            [(0, 0), (3440, 800), (-1080, -227)]
         );
     }
 

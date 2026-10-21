@@ -3328,6 +3328,7 @@ async fn async_main() -> Result<()> {
         virtual_display: virtual_display.clone(),
         client_scale_percent: 100,
         monitor_layout: None,
+        secondary_displays: Vec::new(),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {

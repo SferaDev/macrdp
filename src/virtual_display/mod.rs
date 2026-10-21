@@ -14,15 +14,30 @@ mod private_api;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed, CapturedPrimary,
-    DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
+    arrange, screen_is_locked, shield_keeps_physical_main, take_detach_reenable_failed,
+    CapturedPrimary, DetachedPrimary, PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
 #[cfg(not(target_os = "macos"))]
 pub use stub::{
-    screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
+    arrange, screen_is_locked, take_detach_reenable_failed, CapturedPrimary, DetachedPrimary,
     PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
+
+static SESSION_DISPLAYS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// The virtual displays serving the session's monitors. Gathering windows onto
+/// one of them leaves windows on the others alone.
+pub fn set_session_displays(ids: Vec<u32>) {
+    *SESSION_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+}
+
+pub fn session_displays() -> Vec<u32> {
+    SESSION_DISPLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -124,7 +139,29 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            let handle = private_api::create(width, height, refresh_hz, "macrdp")
+            Self::create(width, height, refresh_hz, "macrdp", std::process::id())
+        }
+
+        /// Another display for a multi-monitor session, at `width`×`height`
+        /// pixels. Each needs its own serial: the WindowServer rejects a second
+        /// descriptor with the same vendor, product and serial.
+        pub fn new_secondary(width: u32, height: u32, scale: u32, index: u32) -> Result<Self> {
+            let serial = std::process::id() ^ (index << 24);
+            let mut vd = Self::create(width, height, 60, &format!("macrdp {}", index + 1), serial)?;
+            if scale != 1 {
+                vd.resize(width, height, scale)?;
+            }
+            Ok(vd)
+        }
+
+        fn create(
+            width: u32,
+            height: u32,
+            refresh_hz: u32,
+            name: &str,
+            serial: u32,
+        ) -> Result<Self> {
+            let handle = private_api::create(width, height, refresh_hz, name, serial)
                 .context("creating virtual display")?;
 
             // CGDisplayBounds gives both the origin (in global point space)
@@ -254,6 +291,37 @@ mod macos {
             self.origin_pts = (0.0, 0.0);
             Ok(true)
         }
+    }
+
+    /// Moves displays to the given global origins, in points, in one
+    /// configuration that reverts when macrdp exits. Displays already in place
+    /// are left out, so an unchanged layout costs no relayout. Returns whether
+    /// anything moved.
+    pub fn arrange(placements: &[(u32, i32, i32)]) -> Result<bool> {
+        let moves: Vec<_> = placements
+            .iter()
+            .copied()
+            .filter(|&(id, x, y)| {
+                let o = CGDisplay::new(id).bounds().origin;
+                (o.x.round() as i32, o.y.round() as i32) != (x, y)
+            })
+            .collect();
+        let Some(&(first, _, _)) = moves.first() else {
+            return Ok(false);
+        };
+        let display = CGDisplay::new(first);
+        let config = display
+            .begin_configuration()
+            .map_err(|e| anyhow!("CGBeginDisplayConfiguration (arrange): CGError {e}"))?;
+        for &(id, x, y) in &moves {
+            CGDisplay::new(id)
+                .configure_display_origin(&config, x, y)
+                .map_err(|e| anyhow!("CGConfigureDisplayOrigin({id}, {x}, {y}): CGError {e}"))?;
+        }
+        display
+            .complete_configuration(&config, CGConfigureOption::ConfigureForAppOnly)
+            .map_err(|e| anyhow!("CGCompleteDisplayConfiguration (arrange): CGError {e}"))?;
+        Ok(true)
     }
 
     /// Promotes a virtual (or any other secondary) display to be the
@@ -1668,9 +1736,16 @@ mod stub {
         pub fn resize(&mut self, _width: u32, _height: u32, _scale: u32) -> Result<()> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+        pub fn new_secondary(_width: u32, _height: u32, _scale: u32, _index: u32) -> Result<Self> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn reanchor_as_main(&mut self) -> Result<bool> {
             Err(anyhow!("virtual display is macOS-only"))
         }
+    }
+
+    pub fn arrange(_placements: &[(u32, i32, i32)]) -> Result<bool> {
+        Err(anyhow!("virtual display is macOS-only"))
     }
 
     pub struct PrimaryOverride;
