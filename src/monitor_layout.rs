@@ -95,6 +95,30 @@ impl MonitorLayout {
             .collect()
     }
 
+    /// The monitors in the client's coordinates, relative to the primary at
+    /// 0,0, as EGFX ResetGraphics lists them.
+    pub fn client_monitors(&self) -> Vec<ironrdp_pdu::gcc::Monitor> {
+        let p = self.monitors[self.primary()];
+        self.monitors
+            .iter()
+            .map(|m| {
+                let left = i32::from(m.x) - i32::from(p.x);
+                let top = i32::from(m.y) - i32::from(p.y);
+                ironrdp_pdu::gcc::Monitor {
+                    left,
+                    top,
+                    right: left + i32::from(m.width) - 1,
+                    bottom: top + i32::from(m.height) - 1,
+                    flags: if m.primary {
+                        ironrdp_pdu::gcc::MonitorFlags::PRIMARY
+                    } else {
+                        ironrdp_pdu::gcc::MonitorFlags::empty()
+                    },
+                }
+            })
+            .collect()
+    }
+
     /// The monitor containing a point on the session desktop, falling back to
     /// the nearest one for a point in a gap between monitors.
     pub fn monitor_at(&self, x: u16, y: u16) -> usize {
@@ -178,6 +202,23 @@ mod tests {
         assert_eq!(
             three_monitors().origins_pts(),
             [(0, 0), (3440, 800), (-1080, -227)]
+        );
+    }
+
+    #[test]
+    fn client_monitors_round_trip_the_client_layout() {
+        let monitors: Vec<_> = three_monitors()
+            .client_monitors()
+            .iter()
+            .map(|m| (m.left, m.top, m.right, m.bottom))
+            .collect();
+        assert_eq!(
+            monitors,
+            [
+                (0, 0, 3439, 1439),
+                (3440, 800, 6463, 2697),
+                (-1080, -227, -1, 1692)
+            ]
         );
     }
 

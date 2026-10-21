@@ -24,16 +24,23 @@ pub use stub::{
     PrimaryOverride, ShieldedPrimary, VirtualDisplay,
 };
 
-static SESSION_DISPLAYS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-
-/// The virtual displays serving the session's monitors. Gathering windows onto
-/// one of them leaves windows on the others alone.
-pub fn set_session_displays(ids: Vec<u32>) {
-    *SESSION_DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()) = ids;
+/// The virtual displays serving a multi-monitor session, by monitor index.
+/// Input routes pointer events by it, and gathering windows onto one display
+/// leaves windows on the others alone.
+#[derive(Debug, Clone)]
+pub struct SessionMonitors {
+    pub layout: crate::monitor_layout::MonitorLayout,
+    pub display_ids: Vec<u32>,
 }
 
-pub fn session_displays() -> Vec<u32> {
-    SESSION_DISPLAYS
+static SESSION_MONITORS: std::sync::Mutex<Option<SessionMonitors>> = std::sync::Mutex::new(None);
+
+pub fn set_session_monitors(monitors: Option<SessionMonitors>) {
+    *SESSION_MONITORS.lock().unwrap_or_else(|e| e.into_inner()) = monitors;
+}
+
+pub fn session_monitors() -> Option<SessionMonitors> {
+    SESSION_MONITORS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
