@@ -166,6 +166,17 @@ impl WireFormat {
 
 /// Per-connection state, shared between the `Gfx` factory/handle (capture
 /// side) and the `GfxHandler` callbacks (protocol side) via `Arc<Mutex<>>`.
+/// A non-primary monitor's surface and encoder in a multi-monitor session.
+/// The connection's adaptive, recovery and ack logic stays with the primary.
+struct Output {
+    surface_id: u16,
+    dims: (u16, u16),
+    encoder: Encoder,
+    need_keyframe: bool,
+    submitted: Arc<AtomicU64>,
+    shipped: Arc<AtomicU64>,
+}
+
 struct ConnectionContext {
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
@@ -212,6 +223,9 @@ struct ConnectionContext {
     /// `SharedDesktopSize` read — so a size adoption between setup and ship
     /// can't tear the region away from the surface.
     dims: (u16, u16),
+    /// The other monitors of a multi-monitor session; the fields above serve
+    /// the primary monitor.
+    outputs: Vec<Output>,
     /// Ack-driven IDR recovery state (EGFX-on-lossy). Wall-clock; per-connection
     /// (reset on reconnect), all init to `now` so warmup doesn't false-trigger.
     /// `last_ack_at` + `acks_suspended` set in `on_frame_ack`; `last_ship_at` set
@@ -1179,6 +1193,9 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
 pub struct Gfx {
     sender: Arc<Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>>,
     ctx: Arc<Mutex<Option<ConnectionContext>>>,
+    /// The client's monitors in a multi-monitor session, set by the display
+    /// before EGFX setup.
+    monitor_layout: Arc<Mutex<Option<crate::monitor_layout::MonitorLayout>>>,
     /// Live session desktop size, shared with `CaptureDisplay` /
     /// `MacInputHandler`. Read in `setup_locked` when the per-connection
     /// surface + encoder are created, so the H.264 pipeline tracks the
@@ -1542,6 +1559,7 @@ impl Gfx {
         Self {
             sender: Arc::new(Mutex::new(None)),
             ctx: Arc::new(Mutex::new(None)),
+            monitor_layout: Arc::new(Mutex::new(None)),
             desktop_size,
             fps,
             bitrate_bps,
@@ -2296,7 +2314,12 @@ impl Gfx {
     /// capture tick. Bumps `shipped` per frame so the capture thread's
     /// drop-to-latest throttle can bound the pipeline depth. Exits when the
     /// channel closes (encoder dropped on connection teardown).
-    fn ship_loop(&self, rx: std::sync::mpsc::Receiver<EncodedFrame>, shipped: Arc<AtomicU64>) {
+    fn ship_loop(
+        &self,
+        rx: std::sync::mpsc::Receiver<EncodedFrame>,
+        shipped: Arc<AtomicU64>,
+        output: Option<usize>,
+    ) {
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
             let mut frames = vec![frame];
@@ -2304,7 +2327,7 @@ impl Gfx {
                 frames.push(f);
             }
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames) {
+            if let Err(e) = self.ship_frames(&frames, output) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -2317,8 +2340,37 @@ impl Gfx {
         // Read the live session size once and pin it for this connection's
         // surface + encoder + ship-side regions.
         let (width, height) = self.desktop_size.get();
+        let layout = self.monitor_layout.lock().unwrap().clone();
+        let mut new_outputs = Vec::new();
         if ctx.surface_id.is_none() {
-            ctx.dims = (width, height);
+            // A multi-monitor desktop spans every monitor, and the primary
+            // monitor's surface sits at its place on it.
+            let (surface_w, surface_h, origin_x, origin_y, monitors) = match &layout {
+                Some(l) => {
+                    let p = l.monitors[l.primary()];
+                    (
+                        p.width,
+                        p.height,
+                        u32::from(p.x),
+                        u32::from(p.y),
+                        l.client_monitors(),
+                    )
+                }
+                None => (
+                    width,
+                    height,
+                    0,
+                    0,
+                    vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: i32::from(width).saturating_sub(1),
+                        bottom: i32::from(height).saturating_sub(1),
+                        flags: MonitorFlags::PRIMARY,
+                    }],
+                ),
+            };
+            ctx.dims = (surface_w, surface_h);
             let mut server = ctx.server_handle.lock().unwrap();
             server.set_output_dimensions(width, height);
             // Emit RESET_GRAPHICS with an explicit single-monitor layout
@@ -2330,14 +2382,7 @@ impl Gfx {
             // + acked surface has nowhere to composite and the screen stays
             // blank. resize_with_monitors sets reset_graphics_sent=true so the
             // empty-monitor reset never fires. (reconnect-blank fix 2026-05-20.)
-            let monitor = Monitor {
-                left: 0,
-                top: 0,
-                right: i32::from(width).saturating_sub(1),
-                bottom: i32::from(height).saturating_sub(1),
-                flags: MonitorFlags::PRIMARY,
-            };
-            server.resize_with_monitors(width, height, vec![monitor]);
+            server.resize_with_monitors(width, height, monitors);
             // Create the surface with upstream's auto-allocated id. mstsc retains
             // EGFX surfaces by id for its whole process lifetime and no-ops a
             // CreateSurface for an id it already holds, so a reconnect to the
@@ -2349,18 +2394,53 @@ impl Gfx {
             // (close + reopen mstsc, which clears its surface cache), we use the
             // stock API and document the quirk instead. See [[h264-reconnect-blank]].
             let sid = server
-                .create_surface_with_format(width, height, PixelFormat::XRgb)
+                .create_surface_with_format(surface_w, surface_h, PixelFormat::XRgb)
                 .ok_or_else(|| anyhow!("EGFX: create_surface failed (not ready?)"))?;
-            if !server.map_surface_to_output(sid, 0, 0) {
+            if !server.map_surface_to_output(sid, origin_x, origin_y) {
                 return Err(anyhow!("EGFX: map_surface_to_output failed"));
             }
             ctx.surface_id = Some(sid);
             info!(
                 surface_id = sid,
-                w = width,
-                h = height,
+                w = surface_w,
+                h = surface_h,
                 "EGFX surface created + mapped"
             );
+            if let Some(l) = &layout {
+                for (i, m) in l
+                    .monitors
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != l.primary())
+                {
+                    let sid = server
+                        .create_surface_with_format(m.width, m.height, PixelFormat::XRgb)
+                        .ok_or_else(|| anyhow!("EGFX: create_surface failed for monitor {i}"))?;
+                    if !server.map_surface_to_output(sid, u32::from(m.x), u32::from(m.y)) {
+                        return Err(anyhow!(
+                            "EGFX: map_surface_to_output failed for monitor {i}"
+                        ));
+                    }
+                    info!(
+                        surface_id = sid,
+                        monitor = i,
+                        w = m.width,
+                        h = m.height,
+                        x = m.x,
+                        y = m.y,
+                        "EGFX monitor surface created + mapped"
+                    );
+                    new_outputs.push((sid, (m.width, m.height)));
+                }
+            }
+        }
+        if !new_outputs.is_empty() {
+            ctx.outputs.clear();
+        }
+        for (sid, dims) in new_outputs {
+            let output =
+                self.start_output(ctx.outputs.len(), sid, dims, ctx.adaptive_target_bps)?;
+            ctx.outputs.push(output);
         }
         // Encoder dims always follow the surface's creation dims, so an
         // encoder (re)build can never disagree with an existing surface.
@@ -2395,7 +2475,7 @@ impl Gfx {
             let shipped = ctx.shipped.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped))
+                .spawn(move || gfx.ship_loop(rx, shipped, None))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -2448,7 +2528,8 @@ impl Gfx {
             let sid = server
                 .create_surface_with_format(width, height, PixelFormat::XRgb)
                 .ok_or_else(|| anyhow!("EGFX blank remap: create_surface failed"))?;
-            if !server.map_surface_to_output(sid, 0, 0) {
+            let (origin_x, origin_y) = self.primary_origin();
+            if !server.map_surface_to_output(sid, origin_x, origin_y) {
                 return Err(anyhow!("EGFX blank remap: map_surface_to_output failed"));
             }
             (server.drain_output(), egfx_channel_id, sid)
@@ -2517,6 +2598,72 @@ impl Gfx {
     /// client-requested resize/reactivation window where the client expects
     /// a graphics reset — the same position it occupies on every fresh
     /// connection.
+    pub(crate) fn set_monitor_layout(&self, layout: Option<crate::monitor_layout::MonitorLayout>) {
+        *self.monitor_layout.lock().unwrap() = layout;
+    }
+
+    /// Where the primary monitor's surface sits on the desktop: its place in a
+    /// multi-monitor session, otherwise the origin.
+    fn primary_origin(&self) -> (u32, u32) {
+        self.monitor_layout
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or((0, 0), |l| {
+                let p = l.monitors[l.primary()];
+                (u32::from(p.x), u32::from(p.y))
+            })
+    }
+
+    /// Starts the encoder and ship thread of a non-primary monitor's surface.
+    fn start_output(
+        &self,
+        index: usize,
+        surface_id: u16,
+        dims: (u16, u16),
+        bitrate_bps: u32,
+    ) -> Result<Output> {
+        let mut encoder = Encoder::new(dims.0, dims.1, self.fps, bitrate_bps, self.keyframe_secs)?;
+        let rx = encoder
+            .take_receiver()
+            .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
+        let shipped = Arc::new(AtomicU64::new(0));
+        let gfx = self.clone();
+        let ship_count = shipped.clone();
+        std::thread::Builder::new()
+            .name(format!("egfx-ship-{}", index + 1))
+            .spawn(move || gfx.ship_loop(rx, ship_count, Some(index)))
+            .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
+        Ok(Output {
+            surface_id,
+            dims,
+            encoder,
+            need_keyframe: true,
+            submitted: Arc::new(AtomicU64::new(0)),
+            shipped,
+        })
+    }
+
+    /// Encodes a frame of a non-primary monitor. `Ok(false)` until the
+    /// primary's EGFX setup has created that monitor's output.
+    pub fn submit_output_bgra(&self, output: usize, bgra: &[u8], stride: usize) -> Result<bool> {
+        let mut guard = self.ctx.lock().unwrap();
+        let Some(o) = guard.as_mut().and_then(|ctx| ctx.outputs.get_mut(output)) else {
+            return Ok(false);
+        };
+        let outstanding = o
+            .submitted
+            .load(Ordering::Relaxed)
+            .saturating_sub(o.shipped.load(Ordering::Relaxed));
+        if outstanding >= u64::from(self.max_in_flight) {
+            return Ok(true);
+        }
+        let keyframe = std::mem::replace(&mut o.need_keyframe, false);
+        o.encoder.encode_bgra(bgra, stride, keyframe)?;
+        o.submitted.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     pub(crate) fn reset_for_live_resize(&self) {
         let mut guard = self.ctx.lock().unwrap();
         if let Some(ctx) = guard.as_mut() {
@@ -2527,6 +2674,7 @@ impl Gfx {
             // encoder and resets the throttle counters).
             ctx.encoder = None;
             ctx.surface_id = None;
+            ctx.outputs.clear();
             ctx.need_keyframe = true;
             info!("EGFX live resize: connection surface/encoder state reset — the post-reactivation setup will rebuild at the new size");
         }
@@ -2568,6 +2716,9 @@ impl Gfx {
         if let Ok(mut guard) = self.ctx.lock() {
             if let Some(ctx) = guard.as_mut() {
                 ctx.need_keyframe = true;
+                for o in &mut ctx.outputs {
+                    o.need_keyframe = true;
+                }
             }
         }
         info!("manual A/V resync (Ctrl+Alt+Shift+R): forcing an IDR keyframe");
@@ -2579,7 +2730,6 @@ impl Gfx {
     /// headless virtual-display path it cascades into a session re-cycle (see
     /// [`force_keyframe`]). Kept for the surface-retention case; not wired to the
     /// hotkey by default.
-    #[allow(dead_code)]
     pub(crate) fn request_reactivation(&self, width: u16, height: u16) {
         let packed = (u32::from(width) << 16) | u32::from(height);
         self.reactivate_request.store(packed, Ordering::Relaxed);
@@ -2638,8 +2788,8 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame]) -> Result<()> {
-        let (dvc_messages, egfx_channel_id) = {
+    fn ship_frames(&self, frames: &[EncodedFrame], output: Option<usize>) -> Result<()> {
+        {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
             // (`GfxDvcBridge::process` → `GraphicsPipelineServer::process` →
@@ -2657,10 +2807,20 @@ impl Gfx {
                 let ctx = guard
                     .as_mut()
                     .ok_or_else(|| anyhow!("EGFX: ctx vanished mid-submit"))?;
-                let surface_id = ctx
-                    .surface_id
-                    .ok_or_else(|| anyhow!("EGFX: no surface_id"))?;
-                let (width, height) = ctx.dims;
+                let (surface_id, (width, height)) = match output {
+                    None => (
+                        ctx.surface_id
+                            .ok_or_else(|| anyhow!("EGFX: no surface_id"))?,
+                        ctx.dims,
+                    ),
+                    Some(i) => {
+                        let o = ctx
+                            .outputs
+                            .get(i)
+                            .ok_or_else(|| anyhow!("EGFX: no output {i}"))?;
+                        (o.surface_id, o.dims)
+                    }
+                };
                 let epoch = ctx.epoch;
                 // Liveness for ack-driven IDR recovery: we're actively shipping.
                 ctx.last_ship_at = Instant::now();
@@ -2746,29 +2906,30 @@ impl Gfx {
                     ),
                 }
             }
-            (server.drain_output(), egfx_channel_id)
-        };
-
-        if dvc_messages.is_empty() {
-            return Ok(());
+            let dvc_messages = server.drain_output();
+            if dvc_messages.is_empty() {
+                return Ok(());
+            }
+            // Still under `server_handle`: frame ids are assigned under it, and a
+            // multi-monitor session's ship threads must not reorder frames.
+            // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
+            // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
+            let svc_messages =
+                encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+                    .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+            let sender = self
+                .sender
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
+            sender
+                .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                    messages: svc_messages,
+                }))
+                .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+            Ok(())
         }
-        // DRDYNVC framing, addressed to the EGFX dynamic channel. SHOW_PROTOCOL
-        // matches what upstream's Echo handler uses for DRDYNVC-wrapped data.
-        let svc_messages =
-            encode_dvc_messages(egfx_channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
-        let sender = self
-            .sender
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?;
-        sender
-            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            }))
-            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
-        Ok(())
     }
 
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
@@ -2866,6 +3027,7 @@ impl GfxServerFactory for Gfx {
             server_handle: handle.clone(),
             encoder: None,
             surface_id: None,
+            outputs: Vec::new(),
             is_ready: false,
             epoch: Instant::now(),
             need_keyframe: true,

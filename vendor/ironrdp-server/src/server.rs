@@ -555,6 +555,9 @@ pub struct RdpServer {
     /// forwarded to each connection's `Acceptor` and clamped per-dimension
     /// there. See [`Self::set_honor_client_desktop_size_max`].
     honor_client_desktop_size_max: Option<DesktopSize>,
+    /// (vendored, divergence (26)) Forwarded to each connection's `Acceptor`.
+    /// See [`Self::set_honor_client_monitors`].
+    honor_client_monitors: bool,
     /// (vendored) Optional shared cell the server writes with the client's
     /// announced keyboard-layout identifier (KLID, from the acceptor result)
     /// when a client connects. The input backend (e.g. `macrdp`'s
@@ -954,6 +957,7 @@ struct NegotiationContext {
     creds: Option<Credentials>,
     honor_client_desktop_size: bool,
     honor_client_desktop_size_max: Option<DesktopSize>,
+    honor_client_monitors: bool,
     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
     echo_handle: EchoServerHandle,
@@ -1056,6 +1060,7 @@ async fn negotiate_candidate(
             height: 8192,
         })
     }));
+    acceptor.set_honor_client_monitors(ctx.honor_client_monitors);
 
     #[allow(
         clippy::let_unit_value,
@@ -1257,6 +1262,7 @@ impl RdpServer {
             read_ahead: Vec::new(),
             honor_client_desktop_size: false,
             honor_client_desktop_size_max: None,
+            honor_client_monitors: false,
             #[cfg(feature = "multitransport")]
             multitransport: None,
             #[cfg(feature = "multitransport")]
@@ -1352,6 +1358,16 @@ impl RdpServer {
     /// swap to that API on the pin bump past it.
     pub fn set_honor_client_desktop_size_max(&mut self, max: Option<DesktopSize>) {
         self.honor_client_desktop_size_max = max;
+    }
+
+    /// (vendored, divergence (26)) Serve a client's monitors as one desktop:
+    /// the acceptor adopts the bounding box of two or more client monitors and
+    /// the display handler gets the layout through
+    /// `RdpServerDisplay::set_client_monitor_layout`. Needs
+    /// [`Self::set_honor_client_desktop_size`]. Must be called before any
+    /// client connects.
+    pub fn set_honor_client_monitors(&mut self, honor: bool) {
+        self.honor_client_monitors = honor;
     }
 
     /// (vendored, divergence 13) Provision the Server Auto-Reconnect Cookie
@@ -1579,6 +1595,7 @@ impl RdpServer {
             creds: self.creds.clone(),
             honor_client_desktop_size: self.honor_client_desktop_size,
             honor_client_desktop_size_max: self.honor_client_desktop_size_max,
+            honor_client_monitors: self.honor_client_monitors,
             display: Arc::clone(&self.display),
             handler: Arc::clone(&self.handler),
             echo_handle: self.echo_handle.clone(),
@@ -1661,6 +1678,7 @@ impl RdpServer {
                 height: 8192,
             })
         }));
+        acceptor.set_honor_client_monitors(self.honor_client_monitors);
 
         // (vendored, feature=multitransport) When offering UDP multitransport:
         // (1) advertise EXTENDED_CLIENT_DATA_SUPPORTED so the client actually
@@ -3516,10 +3534,9 @@ impl RdpServer {
         // (vendored, divergence (25)) A reactivation repeats the connect-time
         // Core Data, which a live monitor layout may have superseded since.
         if !result.reactivation {
-            self.display
-                .lock()
-                .await
-                .set_client_desktop_scale_factor(result.desktop_scale_factor);
+            let mut display = self.display.lock().await;
+            display.set_client_desktop_scale_factor(result.desktop_scale_factor);
+            display.set_client_monitor_layout(&result.monitor_layout);
         }
 
         let mut backlog = core::mem::take(&mut self.read_ahead);
