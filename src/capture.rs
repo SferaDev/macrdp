@@ -411,6 +411,14 @@ pub struct CaptureDisplay {
     /// connect and then from each live monitor layout. Picks the virtual
     /// display's scale in `sync_virtual_display`.
     pub client_scale_percent: u32,
+    /// The client's monitors as one desktop, for a multi-monitor session
+    /// (`--multi-monitor`); `None` serves one monitor.
+    pub monitor_layout: Option<crate::monitor_layout::MonitorLayout>,
+    /// One virtual display per non-primary monitor of a multi-monitor session.
+    pub secondary_displays: Vec<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    /// Retries for monitors whose display didn't come up; see
+    /// `retry_missing_displays`.
+    pub display_retries: Arc<AtomicU32>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -493,10 +501,23 @@ fn adopt_client_size(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn builtin_panel_active() -> bool {
+    use core_graphics::display::CGDisplay;
+    CGDisplay::active_displays()
+        .map(|ids| ids.into_iter().any(|id| CGDisplay::new(id).is_builtin()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn builtin_panel_active() -> bool {
+    false
+}
+
 /// Backing pixels per point for a virtual display serving a `width`×`height`
 /// session: 2 for a Retina client (200% or more), as long as the session
 /// halves into a mode inside the protocol-legal band, otherwise 1.
-fn virtual_display_scale(width: u16, height: u16, client_scale_percent: u32) -> u32 {
+pub(crate) fn virtual_display_scale(width: u16, height: u16, client_scale_percent: u32) -> u32 {
     let halves =
         width.is_multiple_of(2) && height.is_multiple_of(2) && width >= 400 && height >= 400;
     if client_scale_percent >= 200 && halves {
@@ -560,6 +581,21 @@ impl RdpServerDisplay for CaptureDisplay {
         self.client_scale_percent = desktop_scale_factor.unwrap_or(100);
     }
 
+    fn set_client_monitor_layout(&mut self, monitors: &[ironrdp_acceptor::ClientMonitor]) {
+        self.monitor_layout = crate::monitor_layout::MonitorLayout::from_client(monitors);
+        if let Some(gfx) = &self.gfx {
+            gfx.set_monitor_layout(self.monitor_layout.clone());
+        }
+        if let Some(layout) = &self.monitor_layout {
+            tracing::info!(
+                width = layout.width,
+                height = layout.height,
+                monitors = ?layout.monitors,
+                "multi-monitor session"
+            );
+        }
+    }
+
     /// Handle a client-driven live resize (MS-RDPEDISP monitor layout — the
     /// client resized its window). The connect-time auto-adopt path only
     /// negotiates a size once, in `request_initial_size`; this is the
@@ -583,6 +619,10 @@ impl RdpServerDisplay for CaptureDisplay {
     /// surface swap without the core reactivation was tried first and was
     /// visually broken on a real client).
     fn request_layout(&mut self, layout: ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout) {
+        if self.monitor_layout.is_some() {
+            tracing::debug!("multi-monitor session: ignoring a live monitor layout change");
+            return;
+        }
         let resizable = self.auto_size || self.virtual_display.is_some();
         if !resizable {
             tracing::debug!(
@@ -658,23 +698,42 @@ impl CaptureDisplay {
     /// back to serving the display's actual current size. No-op without a
     /// virtual display (mirror-primary).
     fn sync_virtual_display(&mut self) -> (u16, u16) {
+        let size = self.sync_primary_display();
+        self.sync_secondary_displays();
+        size
+    }
+
+    /// Re-modes the primary virtual display to the session size, or in a
+    /// multi-monitor session, whose desktop spans every monitor, to the
+    /// primary monitor's size.
+    fn sync_primary_display(&mut self) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let scale = virtual_display_scale(width, height, self.client_scale_percent);
+        let (vd_w, vd_h, scale) = match &self.monitor_layout {
+            Some(layout) => {
+                let p = layout.monitors[layout.primary()];
+                (p.width, p.height, p.scale)
+            }
+            None => (
+                width,
+                height,
+                virtual_display_scale(width, height, self.client_scale_percent),
+            ),
+        };
         let (cur_w, cur_h) = vd.size_px();
-        if (cur_w as u16, cur_h as u16) == (width, height) && vd.scale() == scale {
+        if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height), scale) {
+        match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
-                    width,
-                    height,
+                    width = vd_w,
+                    height = vd_h,
                     scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
@@ -819,10 +878,156 @@ impl CaptureDisplay {
                     "virtual display live resize failed — keeping the current \
                      display mode and serving its size"
                 );
+                if self.monitor_layout.is_some() {
+                    return (width, height);
+                }
                 self.desktop_size.set(w, h);
                 (w, h)
             }
         }
+    }
+
+    /// Keeps a virtual display per non-primary monitor of a multi-monitor
+    /// session, arranged around the primary display as the client arranges its
+    /// monitors. A single-monitor session drops them.
+    fn sync_secondary_displays(&mut self) {
+        let Some(primary) = self.virtual_display.clone() else {
+            return;
+        };
+        let primary_id = primary
+            .lock()
+            .expect("virtual display mutex poisoned")
+            .display_id();
+        let Some(layout) = self.monitor_layout.clone() else {
+            if !self.secondary_displays.is_empty() {
+                self.secondary_displays.clear();
+                crate::virtual_display::set_session_monitors(None);
+            }
+            return;
+        };
+        let others: Vec<usize> = (0..layout.monitors.len())
+            .filter(|&i| i != layout.primary())
+            .collect();
+        self.secondary_displays.truncate(others.len());
+        for (n, &i) in others.iter().enumerate() {
+            let m = layout.monitors[i];
+            let (w, h) = (u32::from(m.width), u32::from(m.height));
+            if let Some(vd) = self.secondary_displays.get(n) {
+                let mut vd = vd.lock().expect("virtual display mutex poisoned");
+                if vd.size_px() != (w, h) || vd.scale() != m.scale {
+                    if let Err(e) = vd.resize(w, h, m.scale) {
+                        tracing::warn!(error = ?e, monitor = i, "re-moding a secondary virtual display failed");
+                    }
+                }
+            } else {
+                match crate::virtual_display::VirtualDisplay::new_secondary(
+                    w,
+                    h,
+                    m.scale,
+                    n as u32 + 1,
+                ) {
+                    Ok(vd) => self
+                        .secondary_displays
+                        .push(Arc::new(std::sync::Mutex::new(vd))),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, monitor = i, "creating a secondary virtual display failed");
+                        break;
+                    }
+                }
+            }
+        }
+        let origins = layout.origins_pts();
+        let mut placements = vec![(primary_id, 0, 0)];
+        for (vd, &i) in self.secondary_displays.iter().zip(&others) {
+            let id = vd
+                .lock()
+                .expect("virtual display mutex poisoned")
+                .display_id();
+            placements.push((id, origins[i].0, origins[i].1));
+        }
+        match crate::virtual_display::arrange(&placements) {
+            Ok(true) => tracing::info!(?placements, "arranged the session's virtual displays"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = ?e, "arranging the session's virtual displays failed"),
+        }
+        // A monitor without a display yet keeps the primary's id: input lands
+        // on the primary there, and no capture starts for it.
+        let missing = placements.len() < layout.monitors.len();
+        let mut display_ids = vec![primary_id; layout.monitors.len()];
+        for (&(id, _, _), &i) in placements[1..].iter().zip(&others) {
+            display_ids[i] = id;
+        }
+        crate::virtual_display::set_session_monitors(Some(
+            crate::virtual_display::SessionMonitors {
+                layout,
+                display_ids,
+            },
+        ));
+        if missing {
+            self.retry_missing_displays();
+        } else {
+            self.display_retries.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// A display can fail to come up while the Mac's own panel takes the last
+    /// display the hardware drives; the headless mode turns the panel off once
+    /// the client connects. Waits for that, then reactivates the session, which
+    /// runs the display sync again. At most twice per layout.
+    fn retry_missing_displays(&self) {
+        let Some(gfx) = self.gfx.clone() else {
+            return;
+        };
+        if self.display_retries.fetch_add(1, Ordering::Relaxed) >= 2 {
+            return;
+        }
+        let (width, height) = self.desktop_size.get();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline && builtin_panel_active() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            tracing::info!("retrying the session's missing virtual displays");
+            gfx.request_reactivation(width, height);
+        });
+    }
+
+    /// Starts a capture per non-primary monitor of a multi-monitor session,
+    /// feeding that monitor's EGFX output.
+    #[cfg(target_os = "macos")]
+    async fn start_secondary_captures(&self) -> Vec<macos::SecondaryCapture> {
+        let (Some(gfx), Some(session)) =
+            (self.gfx.clone(), crate::virtual_display::session_monitors())
+        else {
+            return Vec::new();
+        };
+        let primary = session.layout.primary();
+        let mut captures = Vec::new();
+        for (output, i) in (0..session.layout.monitors.len())
+            .filter(|&i| i != primary)
+            .enumerate()
+        {
+            if session.display_ids[i] == session.display_ids[primary] {
+                continue;
+            }
+            let m = session.layout.monitors[i];
+            match macos::SecondaryCapture::start(
+                output,
+                session.display_ids[i],
+                m.width,
+                m.height,
+                self.fps,
+                gfx.clone(),
+            )
+            .await
+            {
+                Ok(capture) => captures.push(capture),
+                Err(e) => {
+                    tracing::warn!(error = ?e, monitor = i, "capturing a secondary monitor failed")
+                }
+            }
+        }
+        captures
     }
 
     /// The body of [`RdpServerDisplay::updates`], parameterized on the final
@@ -832,11 +1037,21 @@ impl CaptureDisplay {
         width: u16,
         height: u16,
     ) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        // A multi-monitor session captures the primary monitor here and each
+        // other monitor in a capture of its own.
+        #[cfg(target_os = "macos")]
+        let (capture_w, capture_h) = match &self.monitor_layout {
+            Some(l) => {
+                let p = l.monitors[l.primary()];
+                (p.width, p.height)
+            }
+            None => (width, height),
+        };
         #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
             macos::ScreenCaptureUpdates::start(
-                width,
-                height,
+                capture_w,
+                capture_h,
                 self.fps,
                 self.display_id,
                 self.screen_size_pts,
@@ -853,7 +1068,8 @@ impl CaptureDisplay {
                 self.pending_resize.clone(),
                 self.suppress_next_adopt.clone(),
             )
-            .await?,
+            .await?
+            .with_secondaries(self.start_secondary_captures().await),
         );
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
@@ -941,8 +1157,100 @@ mod macos {
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 
+    /// Captures a non-primary monitor's display into its EGFX output. The
+    /// primary monitor's `ScreenCaptureUpdates` keeps the session's cursor,
+    /// resizes and fallbacks; this only feeds video, and stops when dropped.
+    pub struct SecondaryCapture {
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for SecondaryCapture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl SecondaryCapture {
+        pub async fn start(
+            output: usize,
+            display_id: u32,
+            width: u16,
+            height: u16,
+            fps: u32,
+            gfx: crate::h264::Gfx,
+        ) -> Result<Self> {
+            let content = AsyncSCShareableContent::get()
+                .await
+                .map_err(|e| anyhow!("AsyncSCShareableContent::get failed: {e:?}"))?;
+            let displays = content.displays();
+            let display = displays
+                .iter()
+                .find(|d| d.display_id() == display_id)
+                .with_context(|| format!("SCK enumeration has no display with id={display_id}"))?;
+            let filter = SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_windows(&[])
+                .build();
+            let config = SCStreamConfiguration::new()
+                .with_width(u32::from(width))
+                .with_height(u32::from(height))
+                .with_pixel_format(SckPixelFormat::BGRA)
+                .with_fps(fps)
+                .with_shows_cursor(false)
+                .with_scales_to_fit(true)
+                .with_preserves_aspect_ratio(false);
+            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+            stream
+                .start_capture()
+                .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let task = tokio::spawn(async move {
+                // SCK sends a frame only when the screen changes, so hold the
+                // latest one until the output takes it: the output appears with
+                // the primary's EGFX setup, and a static screen would otherwise
+                // stay blank.
+                let mut held: Option<(Vec<u8>, usize)> = None;
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+                        .await
+                    {
+                        Ok(Some(sample)) => {
+                            if sample.frame_status().is_some_and(|s| !s.has_content()) {
+                                continue;
+                            }
+                            let Some(pixel_buffer) = sample.image_buffer() else {
+                                continue;
+                            };
+                            let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY)
+                            else {
+                                continue;
+                            };
+                            let (src, stride) = (guard.as_slice(), guard.bytes_per_row());
+                            match gfx.submit_output_bgra(output, src, stride) {
+                                Ok(true) => held = None,
+                                Ok(false) => held = Some((src.to_vec(), stride)),
+                                Err(e) => {
+                                    tracing::warn!(error = ?e, output, "EGFX submit for a secondary monitor failed")
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            if let Some((frame, stride)) = &held {
+                                if let Ok(true) = gfx.submit_output_bgra(output, frame, *stride) {
+                                    held = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Self { task })
+        }
+    }
+
     pub struct ScreenCaptureUpdates {
         stream: AsyncSCStream,
+        secondaries: Vec<SecondaryCapture>,
         pending: std::collections::VecDeque<DisplayUpdate>,
         // Force a full-frame seed on the first sample so the client's
         // bitmap cache starts in a known-good state; SCK's dirty rects
@@ -1064,6 +1372,11 @@ mod macos {
     }
 
     impl ScreenCaptureUpdates {
+        pub fn with_secondaries(mut self, secondaries: Vec<SecondaryCapture>) -> Self {
+            self.secondaries = secondaries;
+            self
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub async fn start(
             width: u16,
@@ -1239,6 +1552,7 @@ mod macos {
 
             Ok(Self {
                 stream,
+                secondaries: Vec::new(),
                 pending: std::collections::VecDeque::new(),
                 seeded: false,
                 force_full_frame,

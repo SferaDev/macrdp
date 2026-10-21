@@ -249,7 +249,14 @@ impl Drop for Handle {
 /// are intentionally leaked — they're tiny, only allocated once per
 /// process, and avoiding manual `release` calls keeps the code
 /// obviously free of double-free hazards.
-pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Result<Handle> {
+pub(super) fn create(
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    name: &str,
+    serial: u32,
+    hidpi: bool,
+) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
 
@@ -273,8 +280,22 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         // protocol-legal mode, including ones larger than the first.
         let _: () = msg_send![desc, setMaxPixelsWide: 8192u32];
         let _: () = msg_send![desc, setMaxPixelsHigh: 8192u32];
-        // 600x338 mm ≈ a 27-inch 16:9 panel. Just a label.
-        let _: () = msg_send![desc, setSizeInMillimeters: CGSize { width: 600.0, height: 338.0 }];
+        // 600x338 mm ≈ a 27-inch 16:9 panel. A HiDPI display is sized at a
+        // MacBook panel's 254 ppi instead: macOS derives a new display's 2x
+        // modes from its pixel density, and at 27 inches leaves it at 1x.
+        let size_mm = if hidpi {
+            let mm = |points: u32| f64::from(points * 2) * 25.4 / 254.0;
+            CGSize {
+                width: mm(width),
+                height: mm(height),
+            }
+        } else {
+            CGSize {
+                width: 600.0,
+                height: 338.0,
+            }
+        };
+        let _: () = msg_send![desc, setSizeInMillimeters: size_mm];
         let _: () = msg_send![desc, setProductID: 0x6D616372u32]; // "macr"
         let _: () = msg_send![desc, setVendorID: 0x6D616372u32];
         // Was hardcoded to 1: a second macrdp process (e.g. two concurrent
@@ -282,7 +303,7 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         // display with an identical vendor/product/serial triple gets its
         // descriptor rejected by CGVirtualDisplay initWithDescriptor: outright
         // (returns nil). Per-process id keeps concurrent instances from colliding.
-        let _: () = msg_send![desc, setSerialNum: std::process::id()];
+        let _: () = msg_send![desc, setSerialNum: serial];
 
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];
@@ -298,7 +319,7 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         //      the applySettings: call is what actually registers the display
         //      with the WindowServer so it appears in Displays. Shared with
         //      the live-resize path (`Handle::apply_mode`).
-        if let Err(e) = apply_single_mode(display, width, height, refresh_hz, false) {
+        if let Err(e) = apply_single_mode(display, width, height, refresh_hz, hidpi) {
             let _: () = msg_send![display, release];
             return Err(e);
         }
