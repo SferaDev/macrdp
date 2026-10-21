@@ -414,6 +414,8 @@ pub struct CaptureDisplay {
     /// The client's monitors as one desktop, for a multi-monitor session
     /// (`--multi-monitor`); `None` serves one monitor.
     pub monitor_layout: Option<crate::monitor_layout::MonitorLayout>,
+    /// One virtual display per non-primary monitor of a multi-monitor session.
+    pub secondary_displays: Vec<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
 
     /// The `--capture-primary` blanking guard (shared with main.rs), so a live
     /// re-mode can **re-assert the gamma-black** after it: a display
@@ -673,23 +675,42 @@ impl CaptureDisplay {
     /// back to serving the display's actual current size. No-op without a
     /// virtual display (mirror-primary).
     fn sync_virtual_display(&mut self) -> (u16, u16) {
+        let size = self.sync_primary_display();
+        self.sync_secondary_displays();
+        size
+    }
+
+    /// Re-modes the primary virtual display to the session size, or in a
+    /// multi-monitor session, whose desktop spans every monitor, to the
+    /// primary monitor's size.
+    fn sync_primary_display(&mut self) -> (u16, u16) {
         let (width, height) = self.desktop_size.get();
         let Some(vd) = self.virtual_display.clone() else {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        let scale = virtual_display_scale(width, height, self.client_scale_percent);
+        let (vd_w, vd_h, scale) = match &self.monitor_layout {
+            Some(layout) => {
+                let p = layout.monitors[layout.primary()];
+                (p.width, p.height, p.scale)
+            }
+            None => (
+                width,
+                height,
+                virtual_display_scale(width, height, self.client_scale_percent),
+            ),
+        };
         let (cur_w, cur_h) = vd.size_px();
-        if (cur_w as u16, cur_h as u16) == (width, height) && vd.scale() == scale {
+        if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
             return (width, height);
         }
-        match vd.resize(u32::from(width), u32::from(height), scale) {
+        match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
             Ok(()) => {
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
-                    width,
-                    height,
+                    width = vd_w,
+                    height = vd_h,
                     scale,
                     display_id = vd_id,
                     "virtual display re-moded to the client-requested session size"
@@ -834,10 +855,81 @@ impl CaptureDisplay {
                     "virtual display live resize failed — keeping the current \
                      display mode and serving its size"
                 );
+                if self.monitor_layout.is_some() {
+                    return (width, height);
+                }
                 self.desktop_size.set(w, h);
                 (w, h)
             }
         }
+    }
+
+    /// Keeps a virtual display per non-primary monitor of a multi-monitor
+    /// session, arranged around the primary display as the client arranges its
+    /// monitors. A single-monitor session drops them.
+    fn sync_secondary_displays(&mut self) {
+        let Some(primary) = self.virtual_display.clone() else {
+            return;
+        };
+        let primary_id = primary
+            .lock()
+            .expect("virtual display mutex poisoned")
+            .display_id();
+        let Some(layout) = self.monitor_layout.clone() else {
+            if !self.secondary_displays.is_empty() {
+                self.secondary_displays.clear();
+                crate::virtual_display::set_session_displays(vec![primary_id]);
+            }
+            return;
+        };
+        let others: Vec<usize> = (0..layout.monitors.len())
+            .filter(|&i| i != layout.primary())
+            .collect();
+        self.secondary_displays.truncate(others.len());
+        for (n, &i) in others.iter().enumerate() {
+            let m = layout.monitors[i];
+            let (w, h) = (u32::from(m.width), u32::from(m.height));
+            if let Some(vd) = self.secondary_displays.get(n) {
+                let mut vd = vd.lock().expect("virtual display mutex poisoned");
+                if vd.size_px() != (w, h) || vd.scale() != m.scale {
+                    if let Err(e) = vd.resize(w, h, m.scale) {
+                        tracing::warn!(error = ?e, monitor = i, "re-moding a secondary virtual display failed");
+                    }
+                }
+            } else {
+                match crate::virtual_display::VirtualDisplay::new_secondary(
+                    w,
+                    h,
+                    m.scale,
+                    n as u32 + 1,
+                ) {
+                    Ok(vd) => self
+                        .secondary_displays
+                        .push(Arc::new(std::sync::Mutex::new(vd))),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, monitor = i, "creating a secondary virtual display failed");
+                        break;
+                    }
+                }
+            }
+        }
+        let origins = layout.origins_pts();
+        let mut placements = vec![(primary_id, 0, 0)];
+        for (vd, &i) in self.secondary_displays.iter().zip(&others) {
+            let id = vd
+                .lock()
+                .expect("virtual display mutex poisoned")
+                .display_id();
+            placements.push((id, origins[i].0, origins[i].1));
+        }
+        match crate::virtual_display::arrange(&placements) {
+            Ok(true) => tracing::info!(?placements, "arranged the session's virtual displays"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = ?e, "arranging the session's virtual displays failed"),
+        }
+        crate::virtual_display::set_session_displays(
+            placements.iter().map(|&(id, _, _)| id).collect(),
+        );
     }
 
     /// The body of [`RdpServerDisplay::updates`], parameterized on the final

@@ -249,7 +249,13 @@ impl Drop for Handle {
 /// are intentionally leaked — they're tiny, only allocated once per
 /// process, and avoiding manual `release` calls keeps the code
 /// obviously free of double-free hazards.
-pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Result<Handle> {
+pub(super) fn create(
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    name: &str,
+    serial: u32,
+) -> Result<Handle> {
     let desc_class = class_required("CGVirtualDisplayDescriptor")?;
     let display_class = class_required("CGVirtualDisplay")?;
 
@@ -282,7 +288,7 @@ pub(super) fn create(width: u32, height: u32, refresh_hz: u32, name: &str) -> Re
         // display with an identical vendor/product/serial triple gets its
         // descriptor rejected by CGVirtualDisplay initWithDescriptor: outright
         // (returns nil). Per-process id keeps concurrent instances from colliding.
-        let _: () = msg_send![desc, setSerialNum: std::process::id()];
+        let _: () = msg_send![desc, setSerialNum: serial];
 
         // 2. CGVirtualDisplay instance from the descriptor.
         let display: *mut AnyObject = msg_send![display_class, alloc];
