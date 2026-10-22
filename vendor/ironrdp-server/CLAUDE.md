@@ -2045,3 +2045,13 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (moving a Windows App window from a Retina panel to a standard monitor).
     macrdp uses it to pick a HiDPI virtual display for Retina clients. Off unless
     the display implements it, so the upstream-shaped path is unchanged.
+
+(27) Client input read off the `Self` lock (NOT upstreamed; added 2026-10-22).
+    `client_loop` reads the socket in its own `read_pdus` arm: fast-path input
+    goes straight to the input handler, X224 PDUs queue for `dispatch_pdu`,
+    which still takes the lock. `dispatch_events` holds the lock across its
+    socket writes, so a write blocked on a client slow to drain (a multi-monitor
+    session's EGFX streams) used to stop the server reading at all; input froze,
+    and a client that sends input from its UI thread then blocked on its own full
+    socket. X224 PDUs still queued when a reactivation ends the loop go into
+    `read_ahead` and replay ahead of the reactivation's input backlog.
