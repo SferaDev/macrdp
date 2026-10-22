@@ -38,6 +38,7 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+mod sck_stream;
 mod scroll;
 mod shield;
 mod stats;
