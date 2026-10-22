@@ -1,11 +1,17 @@
 //! Forward the macOS system cursor to RDP clients.
 //!
-//! Primary path: `private_api::copy_current_system_cursor` (SkyLight
+//! Primary path: `private_api::global_cursor` (SkyLight
 //! `SLSGetGlobalCursorData`) — reads the WindowServer's actually-
 //! composited cursor, so I-beams in other apps, crosshairs during
 //! `screencapture -i`, hand pointers over links, etc. all forward
-//! correctly. Returns raw RGBA bytes + hotspot directly, no CGImage
+//! correctly. Returns raw bytes + hotspot directly, no CGImage
 //! round-trip.
+//!
+//! The stock arrow goes out as the client's default pointer and a cursor
+//! macOS hides goes out as the hidden pointer (MS-RDPBCGR system pointer
+//! updates), so a client draws its own crisp arrow and hides its cursor
+//! while the Mac does. `MACRDP_SYSTEM_POINTERS=0` sends every shape as a
+//! bitmap instead.
 //!
 //! Fallback path: `NSCursor.currentSystemCursor` rendered via
 //! `NSBitmapImageRep` — process-local cursor stack, only sees cursors
@@ -57,7 +63,7 @@ impl CursorState {
     }
 
     /// Return any cursor-related DisplayUpdates that the client should see.
-    /// Cheap to call: the cost is one CGEvent::new + one NSCursor read.
+    /// Cheap to call: a shared-memory visibility read and one SkyLight read.
     pub fn poll(&mut self) -> Vec<DisplayUpdate> {
         #[cfg(target_os = "macos")]
         return self.inner.poll();
@@ -87,11 +93,54 @@ mod macos {
 
     use super::private_api;
 
+    /// What the client was last told to draw.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Shown {
+        Nothing,
+        Hidden,
+        Default,
+        /// A bitmap, by the hash of the cursor it came from.
+        Shape(u64),
+    }
+
+    /// The pointer update for one sample of the Mac's cursor.
+    fn pointer_for(
+        visible: bool,
+        transparent: bool,
+        is_arrow: bool,
+        hash: u64,
+        system_pointers: bool,
+    ) -> Shown {
+        if system_pointers {
+            if !visible || transparent {
+                return Shown::Hidden;
+            }
+            if is_arrow {
+                return Shown::Default;
+            }
+        }
+        Shown::Shape(hash)
+    }
+
+    /// `MACRDP_SYSTEM_POINTERS=0` sends the arrow and hidden cursors as bitmaps.
+    fn system_pointers_enabled() -> bool {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            !std::env::var("MACRDP_SYSTEM_POINTERS")
+                .is_ok_and(|v| matches!(v.trim(), "0" | "false" | "off"))
+        })
+    }
+
     #[allow(dead_code)] // last_pos / desktop+screen fields are kept warm for
                         // re-enabling position polling in non-RDP-driven cases
     pub struct Inner {
         source: CGEventSource,
-        last_hash: u64,
+        shown: Shown,
+        /// The last SkyLight cursor's hash and the update it called for, so an
+        /// unchanged cursor costs one read and a hash, not an arrow comparison.
+        last_raw: Option<(u64, Shown)>,
+        system_pointers: bool,
         last_pos: Option<(u16, u16)>,
         desktop_w: u16,
         desktop_h: u16,
@@ -125,7 +174,9 @@ mod macos {
             };
             Ok(Self {
                 source,
-                last_hash: 0,
+                shown: Shown::Nothing,
+                last_raw: None,
+                system_pointers: system_pointers_enabled(),
                 last_pos: None,
                 desktop_w,
                 desktop_h,
@@ -175,24 +226,62 @@ mod macos {
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
-            let bytes_and_hot = unsafe { read_cursor_bitmap() };
-            let Some((data, w, h, hot_x, hot_y)) = bytes_and_hot else {
-                return;
+            let visible = !self.system_pointers || private_api::cursor_visible();
+            let (next, image) = if !visible {
+                (Shown::Hidden, None)
+            } else if let Some(raw) = private_api::global_cursor() {
+                let hash = raw.content_hash();
+                let cached = self.last_raw.filter(|&(h, _)| h == hash).map(|(_, s)| s);
+                if cached == Some(self.shown) {
+                    return;
+                }
+                let image = raw.to_rgba();
+                let next = cached.unwrap_or_else(|| {
+                    let is_arrow = self.system_pointers
+                        && private_api::system_arrow().is_some_and(|a| raw.same_as(&a));
+                    let transparent = image.as_ref().is_some_and(|i| fully_transparent(&i.0));
+                    pointer_for(true, transparent, is_arrow, hash, self.system_pointers)
+                });
+                self.last_raw = Some((hash, next));
+                (next, image)
+            } else {
+                // SkyLight unavailable: the process-local NSCursor, bitmap only.
+                let Some(image) = (unsafe { read_nscursor_bitmap() }) else {
+                    return;
+                };
+                let mut hasher = DefaultHasher::new();
+                image.hash(&mut hasher);
+                (Shown::Shape(hasher.finish()), Some(image))
             };
-
-            let mut hasher = DefaultHasher::new();
-            data.hash(&mut hasher);
-            // Mix size/hot into hash so identical pixel patterns at different
-            // dimensions still register as a shape change.
-            w.hash(&mut hasher);
-            h.hash(&mut hasher);
-            hot_x.hash(&mut hasher);
-            hot_y.hash(&mut hasher);
-            let hash = hasher.finish();
-            if hash == self.last_hash {
+            if next == self.shown {
                 return;
             }
-            self.last_hash = hash;
+            let update = match next {
+                Shown::Nothing => return,
+                Shown::Hidden => DisplayUpdate::HidePointer,
+                Shown::Default => DisplayUpdate::DefaultPointer,
+                Shown::Shape(_) => {
+                    let Some((data, w, h, hot_x, hot_y)) = image else {
+                        return;
+                    };
+                    DisplayUpdate::RGBAPointer(self.bitmap_pointer(data, w, h, hot_x, hot_y))
+                }
+            };
+            trace!(?next, "cursor changed");
+            self.shown = next;
+            out.push(update);
+        }
+
+        /// Scale and clamp a straight-RGBA, top-down cursor and encode it as the
+        /// 32 bpp XOR mask `RGBAPointer` carries to the wire unchanged.
+        fn bitmap_pointer(
+            &mut self,
+            data: Vec<u8>,
+            w: u16,
+            h: u16,
+            hot_x: u16,
+            hot_y: u16,
+        ) -> RGBAPointer {
             let (raw_w, raw_h) = (w, h);
             // Default (`cursor_scale == 1.0`): pass the SkyLight cursor through
             // at its native size — correct on 1× panels, Retina, and `--hidpi`
@@ -242,7 +331,7 @@ mod macos {
                 scale = self.cursor_scale,
                 "cursor shape changed"
             );
-            out.push(DisplayUpdate::RGBAPointer(RGBAPointer {
+            RGBAPointer {
                 // macrdp doesn't maintain a client-side pointer cache; every
                 // shape change re-sends the full bitmap to slot 0 (the encoder
                 // always emits NewPointer for RGBAPointer, never CachedPointer),
@@ -251,35 +340,38 @@ mod macos {
                 cache_index: 0,
                 width: w,
                 height: h,
-                hot_x,
-                hot_y,
-                data,
-            }));
+                hot_x: hot_x.min(w.saturating_sub(1)),
+                hot_y: hot_y.min(h.saturating_sub(1)),
+                data: xor_mask_32bpp(&data, usize::from(w), usize::from(h)),
+            }
         }
     }
 
-    /// Snapshot the current system cursor into a tightly-packed RGBA buffer.
-    /// Returns `(data, width, height, hot_x, hot_y)` or `None` if anything
-    /// went wrong (no cursor available, weird image size, draw failed).
-    ///
-    /// Two-tier lookup:
-    ///   1. SkyLight `SLSGetGlobalCursorData` → the actually-rendered
-    ///      system cursor (any process's I-beam, crosshair, hand, etc.).
-    ///      Returns bitmap + hotspot directly.
-    ///   2. Fallback to `NSCursor.currentSystemCursor` for the (rare)
-    ///      case where SkyLight refuses the call or the symbols vanish
-    ///      in a future macOS.
-    unsafe fn read_cursor_bitmap() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
-        // Try SkyLight first — this sees cursors set by other processes
-        // (Safari's I-beam, `screencapture -i`'s crosshair, web link hand
-        // pointers, etc.) and gives us the real hotspot in one call.
-        if let Some(t) = private_api::copy_current_system_cursor() {
-            return Some(t);
-        }
+    fn fully_transparent(rgba: &[u8]) -> bool {
+        rgba.chunks_exact(4).all(|px| px[3] == 0)
+    }
 
-        // Fallback: NSCursor only sees cursors set in macrdp's process,
-        // but works as a last resort if the private SkyLight symbols are
-        // ever removed.
+    /// Straight RGBA, top row first → a 32 bpp `TS_POINTERATTRIBUTE` XOR mask:
+    /// B,G,R,A per pixel and the bottom row first, as MS-RDPBCGR lays out
+    /// colour pointer bitmaps and mstsc, FreeRDP and IronRDP decode them.
+    /// The vendored encoder writes `RGBAPointer::data` to the wire verbatim.
+    fn xor_mask_32bpp(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h * 4);
+        for row in rgba.chunks_exact(w * 4).take(h).rev() {
+            for px in row.chunks_exact(4) {
+                out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        out
+    }
+
+    /// Snapshot `NSCursor.currentSystemCursor` into a tightly-packed,
+    /// top-down RGBA buffer: `(data, width, height, hot_x, hot_y)`.
+    ///
+    /// The fallback for when SkyLight refuses the call or its symbols vanish
+    /// in a future macOS. NSCursor only sees cursors set in macrdp's own
+    /// process, so in practice this is the arrow.
+    unsafe fn read_nscursor_bitmap() -> Option<(Vec<u8>, u16, u16, u16, u16)> {
         let cursor: Retained<NSCursor> = match NSCursor::currentSystemCursor() {
             Some(c) => c,
             None => NSCursor::currentCursor(),
@@ -492,7 +584,47 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{clamp_pointer_size, resample_rgba, scale_cursor};
+        use super::{
+            clamp_pointer_size, pointer_for, resample_rgba, scale_cursor, xor_mask_32bpp, Shown,
+        };
+
+        #[test]
+        fn xor_mask_is_bgra_bottom_up() {
+            // 1x2: a red pixel on top, a translucent blue one below.
+            let rgba = [255, 0, 0, 255, 0, 0, 255, 128];
+            let mask = xor_mask_32bpp(&rgba, 1, 2);
+            assert_eq!(mask, vec![255, 0, 0, 128, 0, 0, 255, 255]);
+        }
+
+        #[test]
+        fn xor_mask_round_trips_through_the_spec_decoding() {
+            // Decode the way mstsc/FreeRDP/IronRDP do (rows bottom-up, BGRA)
+            // and get the original image back.
+            let (w, h) = (3usize, 2usize);
+            let rgba: Vec<u8> = (0..(w * h * 4) as u8).collect();
+            let mask = xor_mask_32bpp(&rgba, w, h);
+            let mut decoded = Vec::new();
+            for row in (0..h).rev() {
+                for px in mask[row * w * 4..(row + 1) * w * 4].chunks_exact(4) {
+                    decoded.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                }
+            }
+            assert_eq!(decoded, rgba);
+        }
+
+        #[test]
+        fn system_pointers_cover_hidden_and_arrow() {
+            assert_eq!(pointer_for(false, false, true, 7, true), Shown::Hidden);
+            assert_eq!(pointer_for(true, true, false, 7, true), Shown::Hidden);
+            assert_eq!(pointer_for(true, false, true, 7, true), Shown::Default);
+            assert_eq!(pointer_for(true, false, false, 7, true), Shown::Shape(7));
+        }
+
+        #[test]
+        fn without_system_pointers_everything_is_a_bitmap() {
+            assert_eq!(pointer_for(true, true, true, 7, false), Shown::Shape(7));
+            assert_eq!(pointer_for(true, false, true, 7, false), Shown::Shape(7));
+        }
 
         #[test]
         fn scale_one_is_passthrough() {

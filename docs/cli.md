@@ -64,6 +64,9 @@ MACRDP_MODS_RESYNC_IDLE_MS=10000  # env-only: after this many ms with no input,
 MACRDP_KEY_REPEAT=client  # env-only: forward the client's key repeats (flagged as
                           #   autorepeat) instead of repeating held keys on the
                           #   server at the Mac's own delay and rate (default).
+MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
+                          #   bitmaps instead of the client's default and hidden
+                          #   system pointers.
 --no-client-resolution    # Don't adopt the resolution the client requests at
                           #   connect (the auto-adopt default). Auto-adopt
                           #   applies on the mirror-primary path when no
