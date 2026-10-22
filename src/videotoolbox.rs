@@ -41,6 +41,10 @@ pub struct EncodedFrame {
     /// SPS / PPS NAL units (raw, no length prefix and no start code).
     /// Populated only on keyframes — empty on non-keyframes.
     pub parameter_sets: Vec<Vec<u8>>,
+    /// `latency_trace::now_ns` at submit and at VT's output callback; 0 when
+    /// tracing is off.
+    pub submitted_ns: u64,
+    pub encoded_ns: u64,
 }
 
 pub struct Encoder {
@@ -97,7 +101,24 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let session = ffi::create_session(width, height, bitrate_bps, keyframe_frames, tx_ptr)?;
+        let low_latency = matches!(
+            std::env::var("MACRDP_VT_LOW_LATENCY").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
+        let session = ffi::create_session(
+            width,
+            height,
+            fps,
+            bitrate_bps,
+            keyframe_frames,
+            tx_ptr,
+            if full_range {
+                ffi::K_CV_PIXEL_FORMAT_TYPE_420F
+            } else {
+                ffi::K_CV_PIXEL_FORMAT_TYPE_32_BGRA
+            },
+            low_latency,
+        )?;
         Ok(Self {
             inner: session,
             rx: Some(rx),
@@ -316,6 +337,20 @@ mod ffi {
         pub(super) static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
         pub(super) static kCFBooleanTrue: CFBooleanRef;
         pub(super) static kCFBooleanFalse: CFBooleanRef;
+        pub(super) static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+        pub(super) static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
+        pub(super) static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+        pub(super) static kCVPixelBufferWidthKey: CFStringRef;
+        pub(super) static kCVPixelBufferHeightKey: CFStringRef;
+        pub(super) static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+        pub(super) fn VTCompressionSessionGetPixelBufferPool(
+            session: VTCompressionSessionRef,
+        ) -> CFTypeRef;
+        pub(super) fn CVPixelBufferPoolCreatePixelBuffer(
+            allocator: CFAllocatorRef,
+            pool: CFTypeRef,
+            pixel_buffer_out: *mut CVPixelBufferRef,
+        ) -> i32;
 
         // CFDictionary creation for VT frame-properties payloads.
         // `CFDictionaryKeyCallBacks` / `CFDictionaryValueCallBacks` are
@@ -453,27 +488,81 @@ mod ffi {
     // The session itself is documented as thread-safe.
     unsafe impl Send for SessionGuard {}
 
+    unsafe fn cf_dict(keys: &[CFTypeRef], values: &[CFTypeRef]) -> CFDictionaryRef {
+        CFDictionaryCreate(
+            ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as isize,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+        )
+    }
+
+    unsafe fn cf_i32(value: i32) -> CFNumberRef {
+        CFNumberCreate(
+            ptr::null(),
+            KCF_NUMBER_INT32_TYPE,
+            &value as *const i32 as *const c_void,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn create_session(
         width: u16,
         height: u16,
+        fps: u32,
         bitrate_bps: u32,
         keyframe_frames: u32,
         tx_ctx: *mut c_void,
+        pixel_format: OSType,
+        low_latency: bool,
     ) -> Result<SessionGuard> {
         let mut session: VTCompressionSessionRef = ptr::null();
         let status = unsafe {
-            VTCompressionSessionCreate(
+            // Source attributes make VT expose an IOSurface-backed pixel buffer
+            // pool in the format we fill, so `encode_frame` hands the hardware
+            // encoder a buffer it can read directly instead of a malloc'd one
+            // it has to copy.
+            let format = cf_i32(pixel_format as i32);
+            let w = cf_i32(i32::from(width));
+            let h = cf_i32(i32::from(height));
+            let iosurface = cf_dict(&[], &[]);
+            let source_attrs = cf_dict(
+                &[
+                    kCVPixelBufferPixelFormatTypeKey,
+                    kCVPixelBufferWidthKey,
+                    kCVPixelBufferHeightKey,
+                    kCVPixelBufferIOSurfacePropertiesKey,
+                ],
+                &[format, w, h, iosurface],
+            );
+            let spec = if low_latency {
+                cf_dict(
+                    &[kVTVideoEncoderSpecification_EnableLowLatencyRateControl],
+                    &[kCFBooleanTrue],
+                )
+            } else {
+                ptr::null()
+            };
+            let status = VTCompressionSessionCreate(
                 ptr::null(),
                 i32::from(width),
                 i32::from(height),
                 K_CM_VIDEO_CODEC_TYPE_H264,
-                ptr::null(),
-                ptr::null(),
+                spec,
+                source_attrs,
                 ptr::null(),
                 Some(output_callback),
                 tx_ctx,
                 &mut session,
-            )
+            );
+            for cf in [format, w, h, iosurface, source_attrs, spec] {
+                if !cf.is_null() {
+                    CFRelease(cf);
+                }
+            }
+            status
         };
         if status != 0 || session.is_null() {
             bail!("VTCompressionSessionCreate failed: OSStatus {status}");
@@ -495,7 +584,16 @@ mod ffi {
             // and only flushes it when the NEXT frame is submitted, so a single
             // change (keystroke / caret) renders "one behind" until you type
             // again. Best-effort: ignore if a VT version rejects the value.
-            let _ = set_i32(session, kVTCompressionPropertyKey_MaxFrameDelayCount, 0);
+            if let Err(e) = set_i32(session, kVTCompressionPropertyKey_MaxFrameDelayCount, 0) {
+                tracing::debug!(error = %e, "VT rejected MaxFrameDelayCount=0");
+            }
+            if let Err(e) = set_i32(
+                session,
+                kVTCompressionPropertyKey_ExpectedFrameRate,
+                fps as i32,
+            ) {
+                tracing::debug!(error = %e, "VT rejected ExpectedFrameRate");
+            }
             set_string(
                 session,
                 kVTCompressionPropertyKey_ProfileLevel,
@@ -585,6 +683,36 @@ mod ffi {
             kVTCompressionPropertyKey_MaxKeyFrameInterval,
             keyframe_frames.max(1) as i32,
         )
+    }
+
+    /// Reads back `MaxFrameDelayCount`, to confirm VT took the zero.
+    #[cfg(test)]
+    pub(super) fn max_frame_delay_count(guard: &SessionGuard) -> Option<i32> {
+        extern "C" {
+            fn VTSessionCopyProperty(
+                session: VTCompressionSessionRef,
+                key: CFStringRef,
+                allocator: CFAllocatorRef,
+                value_out: *mut CFTypeRef,
+            ) -> OSStatus;
+            fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> Boolean;
+        }
+        unsafe {
+            let mut value: CFTypeRef = ptr::null();
+            let st = VTSessionCopyProperty(
+                guard.session,
+                kVTCompressionPropertyKey_MaxFrameDelayCount,
+                ptr::null(),
+                &mut value,
+            );
+            if st != 0 || value.is_null() {
+                return None;
+            }
+            let mut out: i32 = -1;
+            CFNumberGetValue(value, KCF_NUMBER_INT32_TYPE, &mut out as *mut i32 as *mut c_void);
+            CFRelease(value);
+            Some(out)
+        }
     }
 
     unsafe fn set_bool(
@@ -1013,15 +1141,23 @@ mod ffi {
             K_CV_PIXEL_FORMAT_TYPE_32_BGRA
         };
         let mut pbuf: CVPixelBufferRef = ptr::null();
-        let status = unsafe {
-            CVPixelBufferCreate(
-                ptr::null(),
-                width.into(),
-                height.into(),
-                pixel_format,
-                ptr::null(),
-                &mut pbuf,
-            )
+        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(guard.session) };
+        let pooled = !pool.is_null()
+            && unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut pbuf) } == 0
+            && !pbuf.is_null();
+        let status = if pooled {
+            0
+        } else {
+            unsafe {
+                CVPixelBufferCreate(
+                    ptr::null(),
+                    width.into(),
+                    height.into(),
+                    pixel_format,
+                    ptr::null(),
+                    &mut pbuf,
+                )
+            }
         };
         if status != 0 || pbuf.is_null() {
             bail!("CVPixelBufferCreate failed: {status}");
@@ -1119,13 +1255,18 @@ mod ffi {
             };
 
             let mut info_flags: VTEncodeInfoFlags = 0;
+            let submitted_ns = if crate::latency_trace::enabled() {
+                crate::latency_trace::now_ns().max(1)
+            } else {
+                0
+            };
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
                 pbuf,
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                submitted_ns as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
@@ -1166,7 +1307,7 @@ mod ffi {
     /// lifetime is tied to the Encoder, not the callback.
     unsafe extern "C" fn output_callback(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: OSStatus,
         _info_flags: VTEncodeInfoFlags,
         sample_buffer: CMSampleBufferRef,
@@ -1179,9 +1320,13 @@ mod ffi {
             return;
         }
         let tx = &*(output_callback_ref_con as *const mpsc::Sender<EncodedFrame>);
-        let Ok(frame) = extract_frame(sample_buffer) else {
+        let Ok(mut frame) = extract_frame(sample_buffer) else {
             return;
         };
+        frame.submitted_ns = source_frame_ref_con as usize as u64;
+        if frame.submitted_ns != 0 {
+            frame.encoded_ns = crate::latency_trace::now_ns();
+        }
         let _ = tx.send(frame);
     }
 
@@ -1255,6 +1400,8 @@ mod ffi {
             is_keyframe,
             pts,
             parameter_sets,
+            submitted_ns: 0,
+            encoded_ns: 0,
         })
     }
 }
@@ -1606,6 +1753,158 @@ mod tests {
         println!(
             "  parallelism ratio: {ratio:.2}x  (1.0 = VT serializes; 2.0 = perfect parallelism)",
         );
+    }
+
+    #[test]
+    fn session_accepts_low_latency_properties() {
+        for low_latency in [false, true] {
+            let (tx, _rx) = std::sync::mpsc::channel::<EncodedFrame>();
+            let tx = Box::new(tx);
+            let guard = super::ffi::create_session(
+                1280,
+                720,
+                60,
+                8_000_000,
+                120,
+                Box::as_ref(&tx) as *const _ as *mut std::ffi::c_void,
+                super::ffi::K_CV_PIXEL_FORMAT_TYPE_420F,
+                low_latency,
+            );
+            assert!(guard.is_ok(), "low_latency={low_latency}: {:?}", guard.err());
+            let guard = guard.unwrap();
+            // Low-latency rate control has no frame delay and doesn't expose
+            // the property at all.
+            let expected = if low_latency { None } else { Some(0) };
+            assert_eq!(
+                super::ffi::max_frame_delay_count(&guard),
+                expected,
+                "low_latency={low_latency}"
+            );
+        }
+    }
+
+    /// Per-frame encode latency (submit to VT output callback) at real 60 fps
+    /// pacing for the three monitor sizes of a typical multi-monitor session.
+    /// Most frames change a caret-sized block; every 30th scrolls the whole
+    /// frame. Compare runs with and without `MACRDP_VT_LOW_LATENCY=1`:
+    ///   cargo test --release bench_encode_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_encode_latency() {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        const FPS: u32 = 60;
+        const N_FRAMES: usize = 240;
+        let pct = |v: &mut Vec<f64>, q: usize| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[((v.len() - 1) * q) / 100]
+        };
+        println!(
+            "\nVT encode latency, MACRDP_VT_LOW_LATENCY={:?}",
+            std::env::var("MACRDP_VT_LOW_LATENCY").ok()
+        );
+        for (w, h) in [(3440u16, 1440u16), (1080, 1920), (3024, 1898)] {
+            let stride = usize::from(w) * 4;
+            let mut frame = vec![0u8; stride * usize::from(h)];
+            for y in 0..usize::from(h) {
+                for x in 0..usize::from(w) {
+                    let p = &mut frame[y * stride + x * 4..][..4];
+                    p[0] = ((x * 3 + y) & 0xff) as u8;
+                    p[1] = ((x ^ (y * 5)) & 0xff) as u8;
+                    p[2] = ((x.wrapping_mul(7) + y / 3) & 0xff) as u8;
+                    p[3] = 0xff;
+                }
+            }
+            let mut enc = Encoder::new(w, h, FPS, 20_000_000, 2.0).unwrap();
+            let rx = enc.take_receiver().unwrap();
+            let submits: Arc<Mutex<HashMap<i64, Instant>>> = Arc::default();
+            let collector = {
+                let submits = submits.clone();
+                std::thread::spawn(move || {
+                    let mut out = Vec::new();
+                    while let Ok(f) = rx.recv() {
+                        let at = Instant::now();
+                        if let Some(t) = submits.lock().unwrap().remove(&f.pts) {
+                            out.push((at.duration_since(t).as_secs_f64() * 1e3, f.is_keyframe, f.data.len()));
+                        }
+                    }
+                    out
+                })
+            };
+            let interval = Duration::from_secs_f64(1.0 / f64::from(FPS));
+            let mut submit_ms = Vec::new();
+            let start = Instant::now();
+            for i in 0..N_FRAMES {
+                if i % 30 == 29 {
+                    frame.rotate_left(stride * 24);
+                } else {
+                    let (bx, by) = ((i * 37) % (usize::from(w) - 200), (i * 13) % (usize::from(h) - 40));
+                    for y in by..by + 40 {
+                        for b in &mut frame[y * stride + bx * 4..y * stride + (bx + 200) * 4] {
+                            *b = b.wrapping_add(97);
+                        }
+                    }
+                }
+                let t = Instant::now();
+                submits.lock().unwrap().insert(i as i64, t);
+                enc.encode_bgra(&frame, stride, i == 0).unwrap();
+                submit_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                let next = start + interval * (i as u32 + 1);
+                if let Some(d) = next.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(d);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            // Isolated frames: one caret-sized change, wait for it, idle. What a
+            // keystroke costs when nothing else is queued in this session.
+            let mut isolated = Vec::new();
+            for i in 0..30usize {
+                for y in 100..140 {
+                    for b in &mut frame[y * stride + (i * 8) * 4..y * stride + (i * 8 + 200) * 4] {
+                        *b = b.wrapping_add(31);
+                    }
+                }
+                let pts = (N_FRAMES + i) as i64;
+                let t = Instant::now();
+                submits.lock().unwrap().insert(pts, t);
+                enc.encode_bgra(&frame, stride, false).unwrap();
+                while submits.lock().unwrap().contains_key(&pts) {
+                    if t.elapsed() > Duration::from_secs(1) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                isolated.push(t.elapsed().as_secs_f64() * 1e3);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(enc);
+            let mut res = collector.join().unwrap();
+            res.truncate(N_FRAMES);
+            let mut lat: Vec<f64> = res.iter().skip(1).map(|r| r.0).collect();
+            let mut big: Vec<f64> = res
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 30 == 29)
+                .map(|(_, r)| r.0)
+                .collect();
+            let bytes: usize = res.iter().map(|r| r.2).sum();
+            println!(
+                "  {w}x{h}: isolated p50 {:.2} max {:.2} ms | paced {} frames, submit p50 {:.2} p95 {:.2} ms | encode p50 {:.2} p95 {:.2} max {:.2} ms | scroll frames p50 {:.2} max {:.2} ms | {:.1} Mbps",
+                pct(&mut isolated, 50),
+                pct(&mut isolated, 100),
+                res.len(),
+                pct(&mut submit_ms, 50),
+                pct(&mut submit_ms, 95),
+                pct(&mut lat, 50),
+                pct(&mut lat, 95),
+                pct(&mut lat, 100),
+                pct(&mut big, 50),
+                pct(&mut big, 100),
+                bytes as f64 * 8.0 / (N_FRAMES as f64 / f64::from(FPS)) / 1e6,
+            );
+        }
     }
 
     /// Sanity check: vImage YUV444 matrix output must match the scalar
