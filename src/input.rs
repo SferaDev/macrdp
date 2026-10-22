@@ -2014,6 +2014,8 @@ mod macos {
             else {
                 return;
             };
+            // Without it apps read the pixel deltas as lines.
+            ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
             // Carry the held modifiers so Shift+scroll (horizontal in most apps)
             // and Cmd+scroll (zoom) work, same as clicks and drags. Deliberately
             // NO Ctrl→Cmd swap here: the remap's promise is scoped to the
