@@ -27,13 +27,44 @@ pub struct MonitorLayout {
     pub monitors: Vec<Monitor>,
 }
 
+/// Monitor side lengths a virtual display may take, the bounds MS-RDPEDISP
+/// puts on a monitor. A client announcing monitors while its windows are still
+/// coming up can report 64x64 placeholders; re-moding a display to that left
+/// it half-configured and crashed WindowServer.
+const MONITOR_SIDE: std::ops::RangeInclusive<u16> = 200..=8192;
+
 impl MonitorLayout {
-    /// The layout for two or more client monitors, or `None` for one monitor
-    /// or a layout that doesn't fit the protocol's 16-bit desktop.
+    /// The layout for two or more client monitors, or `None` for one monitor,
+    /// a layout that doesn't fit the protocol's 16-bit desktop, or one with a
+    /// monitor outside [`MONITOR_SIDE`], overlapping another, or without
+    /// exactly one primary.
     pub fn from_client(client: &[ClientMonitor]) -> Option<Self> {
         if client.len() < 2 {
             return None;
         }
+        let layout = Self::place(client)?;
+        layout.is_sane().then_some(layout)
+    }
+
+    fn is_sane(&self) -> bool {
+        let sized = self
+            .monitors
+            .iter()
+            .all(|m| MONITOR_SIDE.contains(&m.width) && MONITOR_SIDE.contains(&m.height));
+        let one_primary = self.monitors.iter().filter(|m| m.primary).count() == 1;
+        let disjoint = self.monitors.iter().enumerate().all(|(i, a)| {
+            self.monitors[i + 1..].iter().all(|b| {
+                let apart = |p: u16, l: u16, q: u16, k: u16| {
+                    u32::from(p) + u32::from(l) <= u32::from(q)
+                        || u32::from(q) + u32::from(k) <= u32::from(p)
+                };
+                apart(a.x, a.width, b.x, b.width) || apart(a.y, a.height, b.y, b.height)
+            })
+        });
+        sized && one_primary && disjoint
+    }
+
+    fn place(client: &[ClientMonitor]) -> Option<Self> {
         let left = client.iter().map(|m| m.monitor.left).min()?;
         let top = client.iter().map(|m| m.monitor.top).min()?;
         let right = client.iter().map(|m| m.monitor.right).max()?;
@@ -247,6 +278,38 @@ mod tests {
             ]
         );
         assert_eq!(layout.origins_pts(), [(0, 0), (-1080, -227), (3440, 767)]);
+    }
+
+    /// FreeRDP announcing its monitors before its fullscreen windows exist,
+    /// as logged when WindowServer crashed on the re-mode.
+    #[test]
+    fn rejects_placeholder_sized_monitors() {
+        assert_eq!(
+            MonitorLayout::from_client(&[
+                client(0, 0, 3439, 1439, true, 100),
+                client(-64, -227, -1, -164, false, 100),
+                client(3440, 767, 3567, 894, false, 100),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_monitors_and_a_missing_primary() {
+        assert_eq!(
+            MonitorLayout::from_client(&[
+                client(0, 0, 1919, 1079, true, 100),
+                client(1000, 0, 2919, 1079, false, 100),
+            ]),
+            None
+        );
+        assert_eq!(
+            MonitorLayout::from_client(&[
+                client(0, 0, 1919, 1079, false, 100),
+                client(1920, 0, 3839, 1079, false, 100),
+            ]),
+            None
+        );
     }
 
     #[test]

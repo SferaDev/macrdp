@@ -583,6 +583,15 @@ impl RdpServerDisplay for CaptureDisplay {
 
     fn set_client_monitor_layout(&mut self, monitors: &[ironrdp_acceptor::ClientMonitor]) {
         self.monitor_layout = crate::monitor_layout::MonitorLayout::from_client(monitors);
+        if self.monitor_layout.is_none() && monitors.len() > 1 {
+            tracing::warn!(
+                monitors = ?monitors
+                    .iter()
+                    .map(|m| (m.monitor.left, m.monitor.top, m.monitor.right, m.monitor.bottom))
+                    .collect::<Vec<_>>(),
+                "unusable client monitor layout; serving a single-monitor session"
+            );
+        }
         if let Some(gfx) = &self.gfx {
             gfx.set_monitor_layout(self.monitor_layout.clone());
         }
@@ -916,7 +925,13 @@ impl CaptureDisplay {
                 let mut vd = vd.lock().expect("virtual display mutex poisoned");
                 if vd.size_px() != (w, h) || vd.scale() != m.scale {
                     if let Err(e) = vd.resize(w, h, m.scale) {
-                        tracing::warn!(error = ?e, monitor = i, "re-moding a secondary virtual display failed");
+                        // A display left in a half-applied mode must not be
+                        // arranged or kept: drop it and the ones after it, and
+                        // their monitors fall back to the primary below.
+                        tracing::warn!(error = ?e, monitor = i, "re-moding a secondary virtual display failed; removing it");
+                        drop(vd);
+                        self.secondary_displays.truncate(n);
+                        break;
                     }
                 }
             } else {
@@ -1181,7 +1196,10 @@ mod macos {
         }
         if crate::latency_trace::enabled() {
             crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
-            crate::latency_trace::record_us(&format!("{label}.dirty_px"), dirty_px.unwrap_or(u64::MAX));
+            crate::latency_trace::record_us(
+                &format!("{label}.dirty_px"),
+                dirty_px.unwrap_or(u64::MAX),
+            );
             let pts = sample.presentation_timestamp();
             if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
                 crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
@@ -1274,7 +1292,10 @@ mod macos {
                             // per monitor. A held frame or a pending keyframe
                             // still goes out.
                             if !changed && held.is_none() && !gfx.output_keyframe_pending(output) {
-                                crate::latency_trace::record_us(&format!("{label}.unchanged_skip"), 0);
+                                crate::latency_trace::record_us(
+                                    &format!("{label}.unchanged_skip"),
+                                    0,
+                                );
                                 continue;
                             }
                             let Some(pixel_buffer) = sample.image_buffer() else {
@@ -1288,7 +1309,10 @@ mod macos {
                             let t = Instant::now();
                             match gfx.submit_output_bgra(output, src, stride) {
                                 Ok(crate::h264::OutputSubmit::Encoded) => {
-                                    crate::latency_trace::record_since(&format!("{label}.submit"), t);
+                                    crate::latency_trace::record_since(
+                                        &format!("{label}.submit"),
+                                        t,
+                                    );
                                     held = None;
                                 }
                                 Ok(_) => {
@@ -1307,7 +1331,10 @@ mod macos {
                                 if let Ok(crate::h264::OutputSubmit::Encoded) =
                                     gfx.submit_output_bgra(output, &held_buf, stride)
                                 {
-                                    crate::latency_trace::record_us(&format!("{label}.held_resubmit"), 0);
+                                    crate::latency_trace::record_us(
+                                        &format!("{label}.held_resubmit"),
+                                        0,
+                                    );
                                     held = None;
                                 }
                             }
