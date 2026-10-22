@@ -484,6 +484,15 @@ pub fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
     None
 }
 
+/// (vendored, divergence 28) Every EGFX frame ends in a short segment, which
+/// Nagle holds until the previous one is acked; against the client's delayed
+/// ACK that stalls a frame by up to the delayed-ACK timeout.
+fn set_nodelay(stream: &tokio::net::TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        warn!(%error, "TCP_NODELAY on the RDP socket failed");
+    }
+}
+
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
@@ -579,6 +588,10 @@ pub struct RdpServer {
     /// (vendored, divergence (26)) Forwarded to each connection's `Acceptor`.
     /// See [`Self::set_honor_client_monitors`].
     honor_client_monitors: bool,
+    /// (vendored, divergence (27)) X224 frames `client_loop` read but had not
+    /// dispatched when a reactivation ended it, replayed with the reactivation's
+    /// input backlog.
+    read_ahead: Vec<Vec<u8>>,
     /// (vendored) Optional shared cell the server writes with the client's
     /// announced keyboard-layout identifier (KLID, from the acceptor result)
     /// when a client connects. The input backend (e.g. `macrdp`'s
@@ -1279,6 +1292,7 @@ impl RdpServer {
             honor_client_desktop_size: false,
             honor_client_desktop_size_max: None,
             honor_client_monitors: false,
+            read_ahead: Vec::new(),
             #[cfg(feature = "multitransport")]
             multitransport: None,
             #[cfg(feature = "multitransport")]
@@ -1963,6 +1977,7 @@ impl RdpServer {
                         },
                         Ok((stream, peer)) = listener.accept() => {
                             drop(ev_receiver);
+                            set_nodelay(&stream);
                             (stream, peer)
                         },
                         else => break,
@@ -2113,6 +2128,7 @@ impl RdpServer {
                                 break (res, None);
                             }
                             PreemptRace::Accepted(Ok((next_stream, next_peer))) => {
+                                set_nodelay(&next_stream);
                                 // Gate the candidate through `on_accept`
                                 // (the AuthGuardHandler's per-source-IP
                                 // rate-limit/lockout) BEFORE it's allowed to
@@ -2845,21 +2861,45 @@ impl RdpServer {
         // is moved into the shared Rc; `dispatch_tunnel_inbound` drains it.
         #[cfg(feature = "multitransport")]
         let tunnel_inbound = self.multitransport_tunnel_inbound_rx.take();
+        let input_handler = Arc::clone(&self.handler);
         let s = Rc::new(Mutex::new(self));
 
-        let this = Rc::clone(&s);
-        let dispatch_pdu = async move {
+        // (vendored, divergence (27)) Read the socket in its own arm and apply
+        // fast-path input there, without the `Self` lock: `dispatch_events`
+        // holds that lock across its socket writes, so a write blocked on a
+        // client slow to drain would otherwise stop the server reading input.
+        let (x224_tx, mut x224_rx) = mpsc::unbounded_channel::<bytes::BytesMut>();
+        let read_pdus = async move {
             loop {
                 let (action, bytes) = reader.read_pdu().await?;
+                match action {
+                    Action::FastPath => {
+                        let input = decode(&bytes)?;
+                        Self::apply_fastpath_input(&input_handler, input).await;
+                    }
+                    Action::X224 => {
+                        if x224_tx.send(bytes).is_err() {
+                            break Ok(RunState::Disconnect);
+                        }
+                    }
+                }
+            }
+        };
+
+        let this = Rc::clone(&s);
+        let x224_queue = &mut x224_rx;
+        let dispatch_pdu = async move {
+            while let Some(bytes) = x224_queue.recv().await {
                 let mut this = this.lock().await;
                 match this
-                    .dispatch_pdu(action, bytes, &mut writer, io_channel_id, user_channel_id)
+                    .dispatch_pdu(Action::X224, bytes, &mut writer, io_channel_id, user_channel_id)
                     .await?
                 {
                     RunState::Continue => continue,
-                    state => break Ok(state),
+                    state => return Ok(state),
                 }
             }
+            Ok(RunState::Disconnect)
         };
 
         let dispatch_display = async move {
@@ -3074,12 +3114,22 @@ impl RdpServer {
         };
 
         let state = tokio::select!(
+            state = read_pdus => state,
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
             state = dispatch_audio => state,
             state = dispatch_tunnel_inbound => state,
         );
+
+        // PDUs read but not yet dispatched would otherwise have stayed in the
+        // socket for the reactivation's backlog; hand them to it.
+        if let Ok(RunState::DeactivationReactivation { .. }) = state {
+            let mut this = s.lock().await;
+            while let Ok(bytes) = x224_rx.try_recv() {
+                this.read_ahead.push(bytes.to_vec());
+            }
+        }
 
         debug!("End of client loop: {state:?}");
         state
@@ -3530,15 +3580,15 @@ impl RdpServer {
             display.set_client_monitor_layout(&result.monitor_layout);
         }
 
-        if !result.input_events.is_empty() {
+        let mut backlog = core::mem::take(&mut self.read_ahead);
+        if !result.reactivation {
+            backlog.clear();
+        }
+        backlog.extend(result.input_events);
+        if !backlog.is_empty() {
             debug!("Handling input event backlog from acceptor sequence");
-            self.handle_input_backlog(
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.input_events,
-            )
-            .await?;
+            self.handle_input_backlog(writer, result.io_channel_id, result.user_channel_id, backlog)
+                .await?;
         }
 
         self.static_channels = result.static_channels;
@@ -3728,8 +3778,12 @@ impl RdpServer {
     }
 
     async fn handle_fastpath(&mut self, input: FastPathInput) {
+        Self::apply_fastpath_input(&self.handler, input).await;
+    }
+
+    async fn apply_fastpath_input(handler: &Mutex<Box<dyn RdpServerInputHandler>>, input: FastPathInput) {
         for event in input.input_events().iter().copied() {
-            let mut handler = self.handler.lock().await;
+            let mut handler = handler.lock().await;
             match event {
                 FastPathInputEvent::KeyboardEvent(flags, key) => {
                     handler.keyboard((key, flags).into());

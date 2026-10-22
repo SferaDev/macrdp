@@ -2062,3 +2062,17 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     Upstream candidates: the HWHEEL arm and the ordered ainput dispatch are
     general bug fixes; `ScrollEx` only matters with the FreeRDP extension.
 
+(27) Client input read off the `Self` lock (NOT upstreamed; added 2026-10-22).
+    `client_loop` reads the socket in its own `read_pdus` arm: fast-path input
+    goes straight to the input handler, X224 PDUs queue for `dispatch_pdu`,
+    which still takes the lock. `dispatch_events` holds the lock across its
+    socket writes, so a write blocked on a client slow to drain (a multi-monitor
+    session's EGFX streams) used to stop the server reading at all; input froze,
+    and a client that sends input from its UI thread then blocked on its own full
+    socket. X224 PDUs still queued when a reactivation ends the loop go into
+    `read_ahead` and replay ahead of the reactivation's input backlog.
+
+(28) `TCP_NODELAY` on the accepted RDP socket (NOT upstreamed; added
+    2026-10-22). Upstream leaves Nagle on, so the short tail segment of each
+    EGFX frame waits for the ACK of the previous one, which the client may
+    delay; set at both accept sites (the idle listener and the preemption race).
