@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(26) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2045,6 +2045,22 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (moving a Windows App window from a Retina panel to a standard monitor).
     macrdp uses it to pick a HiDPI virtual display for Retina clients. Off unless
     the display implements it, so the upstream-shaped path is unchanged.
+
+(26) Scrolling input (NOT upstreamed; added 2026-10-22, branch `feat/native-scroll`).
+    - `MouseEvent::HorizontalScroll { value }` for the fast-path/slow-path
+      `HORIZONTAL_WHEEL` PDU, checked before `VERTICAL_WHEEL` (FreeRDP's SDL
+      client sets both on a sideways scroll). Before, the PDU fell through to
+      `Move { x_position, y_position }`, i.e. a warp to (0, 0).
+    - `MouseEvent::ScrollEx { x, y, flags }` for an ainput `WHEEL` event with any
+      flag bit above 31 set, so macrdp can read the scroll-gesture extension our
+      FreeRDP fork sends (bit layout in `src/scroll.rs`). Stock ainput clients
+      still get `Scroll { x, y }`; note both carry 16.16 fixed-point wheel units
+      (FreeRDP multiplies by 0x10000), not raw units.
+    - `AInputHandler` delivers events through one thread fed by a channel,
+      instead of a `spawn_blocking` task per event, which could reorder
+      scroll phases, moves and clicks.
+    Upstream candidates: the HWHEEL arm and the ordered ainput dispatch are
+    general bug fixes; `ScrollEx` only matters with the FreeRDP extension.
 
 (27) Client input read off the `Self` lock (NOT upstreamed; added 2026-10-22).
     `client_loop` reads the socket in its own `read_pdus` arm: fast-path input

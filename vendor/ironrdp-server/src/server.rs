@@ -40,7 +40,7 @@ use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo
 use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
 #[cfg(feature = "egfx")]
 use crate::gfx::{EgfxServerMessage, GfxServerFactory};
-use crate::handler::RdpServerInputHandler;
+use crate::handler::{MouseEvent, RdpServerInputHandler};
 use crate::{SoundServerFactory, builder, capabilities};
 
 /// TCP listen backlog size for the RDP server socket.
@@ -250,6 +250,37 @@ impl RdpServerSecurity {
 
 struct AInputHandler {
     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+    // macrdp divergence (26): one thread delivers the events in order. A
+    // blocking task per event let a scroll phase, a click or a move overtake
+    // the one before it.
+    queue: Option<std::sync::mpsc::Sender<MouseEvent>>,
+}
+
+impl AInputHandler {
+    fn new(handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>) -> Self {
+        Self { handler, queue: None }
+    }
+
+    fn dispatch(&mut self, event: MouseEvent) {
+        if self.queue.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<MouseEvent>();
+            let handler = Arc::clone(&self.handler);
+            let spawned = std::thread::Builder::new()
+                .name("ainput".into())
+                .spawn(move || {
+                    for event in rx {
+                        handler.blocking_lock().mouse(event);
+                    }
+                });
+            match spawned {
+                Ok(_) => self.queue = Some(tx),
+                Err(e) => warn!(error = %e, "ainput: no input thread, dropping event"),
+            }
+        }
+        if let Some(queue) = &self.queue {
+            let _ = queue.send(event);
+        }
+    }
 }
 
 impl_as_any!(AInputHandler);
@@ -267,18 +298,15 @@ impl dvc::DvcProcessor for AInputHandler {
         Ok(vec![Box::new(pdu)])
     }
 
-    fn close(&mut self, _channel_id: u32) {}
+    fn close(&mut self, _channel_id: u32) {
+        self.queue = None;
+    }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<dvc::DvcMessage>> {
         use ironrdp_ainput::ClientPdu;
 
         match decode(payload).map_err(|e| decode_err!(e))? {
-            ClientPdu::Mouse(pdu) => {
-                let handler = Arc::clone(&self.handler);
-                task::spawn_blocking(move || {
-                    handler.blocking_lock().mouse(pdu.into());
-                });
-            }
+            ClientPdu::Mouse(pdu) => self.dispatch(pdu.into()),
         }
 
         Ok(Vec::new())
@@ -846,9 +874,7 @@ fn attach_channels_impl(
 
     let dcs_backend = DisplayControlBackend::new(Arc::clone(display));
     let dvc = dvc::DrdynvcServer::new()
-        .with_dynamic_channel(AInputHandler {
-            handler: Arc::clone(handler),
-        })
+        .with_dynamic_channel(AInputHandler::new(Arc::clone(handler)))
         .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
 
     let dvc = {

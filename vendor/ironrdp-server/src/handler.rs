@@ -37,7 +37,11 @@ pub enum MouseEvent {
     Button5Pressed,
     Button5Released,
     VerticalScroll { value: i16 },
+    // macrdp divergence (26): the horizontal wheel PDU, and ainput wheel
+    // events that carry flags beyond FreeRDP's (see CLAUDE.md).
+    HorizontalScroll { value: i16 },
     Scroll { x: i32, y: i32 },
+    ScrollEx { x: i32, y: i32, flags: u64 },
     RelMove { x: i32, y: i32 },
 }
 
@@ -159,6 +163,13 @@ impl From<MousePdu> for MouseEvent {
                 MouseEvent::RightPressed
             } else {
                 MouseEvent::RightReleased
+            }
+        } else if value.flags.contains(PointerFlags::HORIZONTAL_WHEEL) {
+            // Checked before the vertical flag: FreeRDP's SDL client sets both
+            // on a horizontal scroll. Without this arm the PDU fell through to
+            // a Move to its (0, 0) position.
+            MouseEvent::HorizontalScroll {
+                value: value.number_of_wheel_rotation_units,
             }
         } else if value.flags.contains(PointerFlags::VERTICAL_WHEEL) {
             // NO correction here — see the retired divergence (17). ironrdp-pdu
@@ -299,7 +310,15 @@ impl From<ainput::MousePdu> for MouseEvent {
                 MouseEvent::MiddleReleased
             }
         } else if value.flags.contains(MouseEventFlags::WHEEL) {
-            MouseEvent::Scroll { x: value.x, y: value.y }
+            if value.flags.bits() >> 32 == 0 {
+                MouseEvent::Scroll { x: value.x, y: value.y }
+            } else {
+                MouseEvent::ScrollEx {
+                    x: value.x,
+                    y: value.y,
+                    flags: value.flags.bits(),
+                }
+            }
         } else if value.flags.contains(MouseEventFlags::REL) {
             MouseEvent::RelMove { x: value.x, y: value.y }
         } else if value.flags.contains(MouseEventFlags::MOVE) {

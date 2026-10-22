@@ -1139,3 +1139,31 @@ fn wheel_rotation_survives_the_pdu_round_trip_in_both_directions() {
         }
     }
 }
+
+/// A horizontal wheel PDU is a horizontal scroll. It used to fall through to a
+/// Move to the PDU's (0, 0) position, so every sideways scroll warped the
+/// cursor to the corner. FreeRDP's SDL client also sets the vertical flag on
+/// it, which must not turn it vertical.
+#[test]
+fn horizontal_wheel_is_a_horizontal_scroll() {
+    use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
+    use ironrdp_server::MouseEvent;
+
+    for flags in [
+        PointerFlags::HORIZONTAL_WHEEL,
+        PointerFlags::HORIZONTAL_WHEEL | PointerFlags::VERTICAL_WHEEL,
+    ] {
+        let pdu = MousePdu {
+            flags: flags | PointerFlags::WHEEL_NEGATIVE,
+            number_of_wheel_rotation_units: -12,
+            x_position: 0,
+            y_position: 0,
+        };
+        let encoded = ironrdp_core::encode_vec(&pdu).expect("encode mouse pdu");
+        let decoded: MousePdu = ironrdp_core::decode(&encoded).expect("decode mouse pdu");
+        match MouseEvent::from(decoded) {
+            MouseEvent::HorizontalScroll { value } => assert_eq!(value, -12),
+            other => panic!("expected HorizontalScroll for {flags:?}, got {other:?}"),
+        }
+    }
+}
