@@ -1186,6 +1186,17 @@ fn recovery_config_from_env() -> (bool, RecoveryParams) {
     (enabled, params)
 }
 
+/// What became of a non-primary monitor's frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSubmit {
+    /// Submitted to its encoder.
+    Encoded,
+    /// The output isn't set up yet.
+    NotReady,
+    /// Its encoder already has `max_in_flight` frames outstanding.
+    Busy,
+}
+
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1963,6 +1974,7 @@ impl Gfx {
                 .load(Ordering::Relaxed)
                 .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
             if outstanding >= u64::from(self.max_in_flight) {
+                crate::latency_trace::record_us("m0.busy_drop", 0);
                 trace!(
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
@@ -2644,24 +2656,29 @@ impl Gfx {
         })
     }
 
-    /// Encodes a frame of a non-primary monitor. `Ok(false)` until the
-    /// primary's EGFX setup has created that monitor's output.
-    pub fn submit_output_bgra(&self, output: usize, bgra: &[u8], stride: usize) -> Result<bool> {
+    /// Encodes a frame of a non-primary monitor.
+    pub fn submit_output_bgra(
+        &self,
+        output: usize,
+        bgra: &[u8],
+        stride: usize,
+    ) -> Result<OutputSubmit> {
         let mut guard = self.ctx.lock().unwrap();
         let Some(o) = guard.as_mut().and_then(|ctx| ctx.outputs.get_mut(output)) else {
-            return Ok(false);
+            return Ok(OutputSubmit::NotReady);
         };
         let outstanding = o
             .submitted
             .load(Ordering::Relaxed)
             .saturating_sub(o.shipped.load(Ordering::Relaxed));
         if outstanding >= u64::from(self.max_in_flight) {
-            return Ok(true);
+            crate::latency_trace::record_us(&format!("m{}.busy_drop", output + 1), 0);
+            return Ok(OutputSubmit::Busy);
         }
         let keyframe = std::mem::replace(&mut o.need_keyframe, false);
         o.encoder.encode_bgra(bgra, stride, keyframe)?;
         o.submitted.fetch_add(1, Ordering::Relaxed);
-        Ok(true)
+        Ok(OutputSubmit::Encoded)
     }
 
     pub(crate) fn reset_for_live_resize(&self) {
@@ -2929,6 +2946,23 @@ impl Gfx {
                     messages: svc_messages,
                 }))
                 .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+            if crate::latency_trace::enabled() {
+                let label = output.map_or(0, |i| i + 1);
+                let now = crate::latency_trace::now_ns();
+                for f in frames {
+                    crate::latency_trace::record_ns_delta(
+                        &format!("m{label}.vt_encode"),
+                        f.submitted_ns,
+                        f.encoded_ns,
+                    );
+                    crate::latency_trace::record_ns_delta(
+                        &format!("m{label}.encoded_to_queued"),
+                        f.encoded_ns,
+                        now,
+                    );
+                    crate::latency_trace::record_us(&format!("m{label}.frame_bytes"), f.data.len() as u64);
+                }
+            }
             Ok(())
         }
     }

@@ -1157,6 +1157,32 @@ mod macos {
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 
+    /// Skips to the newest sample SCK has queued. Every EGFX frame is a full
+    /// frame, so an older queued one only adds a frame interval of latency
+    /// each. Keeps the last one with content: a trailing idle sample carries
+    /// no image.
+    fn latest_sample(
+        stream: &AsyncSCStream,
+        mut sample: screencapturekit::cm::CMSampleBuffer,
+        label: &str,
+    ) -> screencapturekit::cm::CMSampleBuffer {
+        let mut skipped = 0u64;
+        while let Some(newer) = stream.try_next() {
+            if newer.frame_status().is_none_or(|s| s.has_content()) {
+                sample = newer;
+                skipped += 1;
+            }
+        }
+        if crate::latency_trace::enabled() {
+            crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
+            let pts = sample.presentation_timestamp();
+            if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
+                crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
+            }
+        }
+        sample
+    }
+
     /// Captures a non-primary monitor's display into its EGFX output. The
     /// primary monitor's `ScreenCaptureUpdates` keeps the session's cursor,
     /// resizes and fallbacks; this only feeds video, and stops when dropped.
@@ -1203,17 +1229,23 @@ mod macos {
             stream
                 .start_capture()
                 .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+            let label = format!("m{}", output + 1);
             let task = tokio::spawn(async move {
-                // SCK sends a frame only when the screen changes, so hold the
-                // latest one until the output takes it: the output appears with
-                // the primary's EGFX setup, and a static screen would otherwise
-                // stay blank.
-                let mut held: Option<(Vec<u8>, usize)> = None;
+                // SCK sends a frame only when the screen changes, so a frame the
+                // output can't take yet (not set up, or its encoder still busy)
+                // is held and retried a frame later: dropping it would leave
+                // that change off screen until the next one.
+                let mut held_buf: Vec<u8> = Vec::new();
+                let mut held: Option<usize> = None;
                 loop {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
-                        .await
-                    {
+                    let next = match held {
+                        Some(_) => tokio::time::timeout(retry, stream.next()).await,
+                        None => Ok(stream.next().await),
+                    };
+                    match next {
                         Ok(Some(sample)) => {
+                            let sample = latest_sample(&stream, sample, &label);
                             if sample.frame_status().is_some_and(|s| !s.has_content()) {
                                 continue;
                             }
@@ -1225,9 +1257,17 @@ mod macos {
                                 continue;
                             };
                             let (src, stride) = (guard.as_slice(), guard.bytes_per_row());
+                            let t = Instant::now();
                             match gfx.submit_output_bgra(output, src, stride) {
-                                Ok(true) => held = None,
-                                Ok(false) => held = Some((src.to_vec(), stride)),
+                                Ok(crate::h264::OutputSubmit::Encoded) => {
+                                    crate::latency_trace::record_since(&format!("{label}.submit"), t);
+                                    held = None;
+                                }
+                                Ok(_) => {
+                                    held_buf.clear();
+                                    held_buf.extend_from_slice(src);
+                                    held = Some(stride);
+                                }
                                 Err(e) => {
                                     tracing::warn!(error = ?e, output, "EGFX submit for a secondary monitor failed")
                                 }
@@ -1235,8 +1275,11 @@ mod macos {
                         }
                         Ok(None) => break,
                         Err(_) => {
-                            if let Some((frame, stride)) = &held {
-                                if let Ok(true) = gfx.submit_output_bgra(output, frame, *stride) {
+                            if let Some(stride) = held {
+                                if let Ok(crate::h264::OutputSubmit::Encoded) =
+                                    gfx.submit_output_bgra(output, &held_buf, stride)
+                                {
+                                    crate::latency_trace::record_us(&format!("{label}.held_resubmit"), 0);
                                     held = None;
                                 }
                             }
@@ -1831,6 +1874,14 @@ mod macos {
                     }
                 };
 
+                // Only once EGFX owns the display: the legacy bitmap path needs
+                // every sample's dirty rects.
+                let sample = if self.first_egfx_frame_sent {
+                    latest_sample(&self.stream, sample, "m0")
+                } else {
+                    sample
+                };
+
                 // Skip non-renderable frames (Idle, Blank, Suspended, Stopped).
                 if let Some(status) = sample.frame_status() {
                     if !status.has_content() {
@@ -1951,8 +2002,10 @@ mod macos {
                     } else {
                         false
                     };
+                    let submit_started = Instant::now();
                     match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
                         Ok(true) => {
+                            crate::latency_trace::record_since("m0.submit", submit_started);
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
                             // gate (see `first_egfx_frame_sent` in the struct).
