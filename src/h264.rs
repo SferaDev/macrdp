@@ -2981,6 +2981,16 @@ impl Gfx {
                 let label = output.map_or(0, |i| i + 1);
                 let now = crate::latency_trace::now_ns();
                 for f in frames {
+                    crate::latency_trace::record_since_key(
+                        &format!("m{label}.key_to_submit"),
+                        label * 3 + 1,
+                        f.submitted_ns,
+                    );
+                    crate::latency_trace::record_since_key(
+                        &format!("m{label}.key_to_queued"),
+                        label * 3 + 2,
+                        now,
+                    );
                     crate::latency_trace::record_ns_delta(
                         &format!("m{label}.vt_encode"),
                         f.submitted_ns,

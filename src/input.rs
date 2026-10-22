@@ -68,6 +68,12 @@ impl RdpServerInputHandler for MacInputHandler {
         #[cfg(target_os = "macos")]
         {
             let t = std::time::Instant::now();
+            if matches!(
+                event,
+                KeyboardEvent::Pressed { .. } | KeyboardEvent::UnicodePressed(_)
+            ) {
+                crate::latency_trace::mark_key();
+            }
             self.inner.keyboard(event);
             crate::latency_trace::record_since("input.keyboard_post", t);
         }
@@ -1545,7 +1551,8 @@ mod macos {
             let swapped = self.ctrl_to_cmd_flags();
 
             if down {
-                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true) {
+                if let Ok(ev) = CGEvent::new_keyboard_event(self.source_hid.clone(), VK_LCMD, true)
+                {
                     ev.set_flags(swapped);
                     ev.set_type(CGEventType::FlagsChanged);
                     ev.post(CGEventTapLocation::HID);

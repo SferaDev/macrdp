@@ -48,6 +48,33 @@ pub fn now_ns() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
+static LAST_KEY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEY_SEEN: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Marks a key event, so the first frame each monitor ships after it can be
+/// timed against it.
+pub fn mark_key() {
+    if enabled() {
+        LAST_KEY_NS.store(now_ns().max(1), Ordering::Relaxed);
+    }
+}
+
+/// Records `{stage}` as the time since the last key event, once per key and
+/// monitor slot, and only within 500 ms of the key.
+pub fn record_since_key(stage: &str, slot: usize, at_ns: u64) {
+    if !enabled() || slot >= KEY_SEEN.len() {
+        return;
+    }
+    let key = LAST_KEY_NS.load(Ordering::Relaxed);
+    if key == 0 || at_ns < key || at_ns - key > 500_000_000 {
+        return;
+    }
+    if KEY_SEEN[slot].swap(key, Ordering::Relaxed) != key {
+        record_us(stage, (at_ns - key) / 1000);
+    }
+}
+
 pub fn record_us(stage: &str, us: u64) {
     if !enabled() {
         return;

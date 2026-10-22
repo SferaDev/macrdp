@@ -1384,6 +1384,15 @@ mod macos {
             let pts = sample.presentation_timestamp();
             if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
                 crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
+                let slot = label[1..].parse::<usize>().unwrap_or(0) * 3;
+                let at = crate::latency_trace::now_ns().saturating_sub(age * 1000);
+                if dirty.as_ref().is_none_or(|d| !d.is_empty()) {
+                    crate::latency_trace::record_since_key(
+                        &format!("{label}.key_to_sck"),
+                        slot,
+                        at,
+                    );
+                }
             }
         }
         (sample, dirty)
@@ -2430,6 +2439,9 @@ mod macos {
                         false
                     };
                     let submit_started = Instant::now();
+                    if crate::latency_trace::enabled() && src.len() > stride_bytes * 351 {
+                        tracing::info!(target: "macrdp::latency", px = src[stride_bytes * 350 + 400 * 4], "m0 submit probe pixel");
+                    }
                     match gfx
                         .submit_bgra_status(src, stride_bytes, big_change || resume_keyframe)
                         .map(|status| {
