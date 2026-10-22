@@ -900,7 +900,7 @@ impl CaptureDisplay {
             return Vec::new();
         };
         let primary = session.layout.primary();
-        let mut captures = Vec::new();
+        let mut starts = Vec::new();
         for (output, i) in (0..session.layout.monitors.len())
             .filter(|&i| i != primary)
             .enumerate()
@@ -909,17 +909,23 @@ impl CaptureDisplay {
                 continue;
             }
             let m = session.layout.monitors[i];
-            match macos::SecondaryCapture::start(
+            let start = macos::SecondaryCapture::start(
                 output,
                 session.display_ids[i],
                 m.width,
                 m.height,
                 self.fps,
                 gfx.clone(),
-            )
-            .await
-            {
-                Ok(capture) => captures.push(capture),
+            );
+            starts.push((i, tokio::spawn(start)));
+        }
+        let mut captures = Vec::new();
+        for (i, start) in starts {
+            match start.await {
+                Ok(Ok(capture)) => captures.push(capture),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = ?e, monitor = i, "capturing a secondary monitor failed")
+                }
                 Err(e) => {
                     tracing::warn!(error = ?e, monitor = i, "capturing a secondary monitor failed")
                 }
@@ -946,29 +952,37 @@ impl CaptureDisplay {
             None => (width, height),
         };
         #[cfg(target_os = "macos")]
-        let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
-            macos::ScreenCaptureUpdates::start(
-                capture_w,
-                capture_h,
-                self.fps,
-                self.display_id,
-                self.screen_size_pts,
-                self.cursor_scale,
-                self.warp_cursor_home,
-                self.gfx.clone(),
-                self.keyframe_on_change,
-                self.click_signal.clone(),
-                self.flush_frames,
-                self.display_suppressed.clone(),
-                self.auto_size,
-                self.stretch,
-                self.desktop_size.clone(),
-                self.pending_resize.clone(),
-                self.suppress_next_adopt.clone(),
-            )
-            .await?
-            .with_secondaries(self.start_secondary_captures().await),
-        );
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> = {
+            let started = Instant::now();
+            let (primary, secondaries) = tokio::join!(
+                macos::ScreenCaptureUpdates::start(
+                    capture_w,
+                    capture_h,
+                    self.fps,
+                    self.display_id,
+                    self.screen_size_pts,
+                    self.cursor_scale,
+                    self.warp_cursor_home,
+                    self.gfx.clone(),
+                    self.keyframe_on_change,
+                    self.click_signal.clone(),
+                    self.flush_frames,
+                    self.display_suppressed.clone(),
+                    self.auto_size,
+                    self.stretch,
+                    self.desktop_size.clone(),
+                    self.pending_resize.clone(),
+                    self.suppress_next_adopt.clone(),
+                ),
+                self.start_secondary_captures(),
+            );
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                secondaries = secondaries.len(),
+                "session captures started"
+            );
+            Box::new(primary?.with_secondaries(secondaries))
+        };
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
             Box::new(stub::StubUpdates::new(width, height)?);
