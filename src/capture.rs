@@ -1275,17 +1275,10 @@ fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
 mod macos {
     use super::*;
 
+    use crate::sck_stream::{CaptureStream, StreamParams};
     use anyhow::{anyhow, Context};
-    use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
+    use screencapturekit::async_api::AsyncSCShareableContent;
     use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
-    use screencapturekit::prelude::{
-        PixelFormat as SckPixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType,
-    };
-
-    /// SCK's surface-pool depth: its default (3) plus one for the frame the
-    /// flush burst keeps retained (`ScreenCaptureUpdates::last_frame`), so
-    /// holding it doesn't shrink the headroom SCK had before.
-    const SCK_QUEUE_DEPTH: u32 = 4;
 
     /// How long the shared SuppressOutput flag must remain `true` before
     /// the gate engages. A real minimize lasts seconds-to-minutes and
@@ -1307,48 +1300,26 @@ mod macos {
         height: u16,
         fps: u32,
         preserve_aspect: bool,
-    ) -> Result<AsyncSCStream> {
-        let filter = SCContentFilter::create()
-            .with_display(display)
-            .with_excluding_windows(&[])
-            .build();
-        let config = SCStreamConfiguration::new()
-            .with_width(u32::from(width))
-            .with_height(u32::from(height))
-            .with_pixel_format(SckPixelFormat::BGRA)
-            .with_fps(fps)
-            // Hide the macOS cursor in the captured framebuffer; we forward
-            // it separately as RGBAPointer so the client renders its own
-            // (real-shape) cursor without doubling up.
-            .with_shows_cursor(false)
-            // Aspect handling on a scaling (non-native) capture:
-            //   * letterbox=false (default for explicit --width/--height, or
-            //     auto-size + --stretch): stretch the source to fill the
-            //     output exactly — no black bars, but distorts on aspect
-            //     mismatch.
-            //   * letterbox=true (auto-size default): preserve the Mac's
-            //     aspect ratio, padding with black bars. input.rs maps mouse
-            //     coords into the centered content sub-rect to keep clicks
-            //     aligned (the stretch path needs no such correction, which
-            //     is why fill used to be the only mode).
-            //
-            // Apple replaced `scalesToFit` with `preservesAspectRatio`
-            // (inverse semantics) in macOS 14; on 14+ the newer property is
-            // what takes effect. `scales_to_fit(true)` stays set so the
-            // source scales to the output either way; `preserves_aspect_ratio`
-            // is the knob that picks letterbox vs stretch.
-            .with_scales_to_fit(true)
-            .with_preserves_aspect_ratio(preserve_aspect)
-            .with_queue_depth(SCK_QUEUE_DEPTH);
-        let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
-        stream
-            .start_capture()
-            .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
-        Ok(stream)
+    ) -> Result<CaptureStream> {
+        // Aspect handling on a scaling (non-native) capture: letterbox
+        // (`preserve_aspect`, the auto-size default) pads with black bars and
+        // input.rs maps clicks into the content rect; stretch fills the output.
+        // The configuration itself lives in sck_stream.rs, which reopens the
+        // capture with it after SCK stops a stream (display sleep).
+        CaptureStream::start(
+            display,
+            StreamParams {
+                width,
+                height,
+                fps,
+                preserve_aspect,
+            },
+        )
+        .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))
     }
 
     /// The stream's next frame with content, retained rather than copied.
-    async fn next_frame(stream: &AsyncSCStream) -> Option<CVPixelBuffer> {
+    async fn next_frame(stream: &CaptureStream) -> Option<CVPixelBuffer> {
         loop {
             let sample = stream.next().await?;
             if sample.frame_status().is_some_and(|s| !s.has_content()) {
@@ -1366,7 +1337,7 @@ mod macos {
     struct PreparedStream {
         display_id: u32,
         size: (u16, u16),
-        stream: AsyncSCStream,
+        stream: CaptureStream,
         first_frame: Option<CVPixelBuffer>,
     }
 
@@ -1393,7 +1364,7 @@ mod macos {
     /// no image. Returns the dirty rects of every sample taken, or `None` if
     /// one came without them.
     fn latest_sample(
-        stream: &AsyncSCStream,
+        stream: &CaptureStream,
         mut sample: screencapturekit::cm::CMSampleBuffer,
     ) -> (screencapturekit::cm::CMSampleBuffer, Option<Vec<Dirty>>) {
         let mut dirty = dirty_rects(&sample);
@@ -1553,7 +1524,7 @@ mod macos {
     }
 
     pub struct ScreenCaptureUpdates {
-        stream: AsyncSCStream,
+        stream: CaptureStream,
         secondaries: Vec<SecondaryCapture>,
         pending: std::collections::VecDeque<DisplayUpdate>,
         // Force a full-frame seed on the first sample so the client's
@@ -1614,7 +1585,7 @@ mod macos {
         /// ~20% of macrdp's CPU at a large virtual display, and the flush
         /// path only reads it on the few idle-edge ticks. Holding it pins one
         /// surface of SCK's pool, which is why the stream's queue depth is
-        /// one above SCK's default (see `SCK_QUEUE_DEPTH`).
+        /// one above SCK's default (see `sck_stream::SCK_QUEUE_DEPTH`).
         last_frame: Option<CVPixelBuffer>,
         /// Shared "client minimized" flag — see [`super::CaptureDisplay::display_suppressed`].
         /// `None` disables the gate.
