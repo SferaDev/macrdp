@@ -2648,6 +2648,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_MAX_RTT_MS",
         ),
         ("BLANK_RECOVERY_MIN_QOE", "MACRDP_BLANK_RECOVERY_MIN_QOE"),
+        ("VT_LOW_LATENCY", "MACRDP_VT_LOW_LATENCY"),
         (
             "BLANK_RECOVERY_MIN_RENDER_REPORTS",
             "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
