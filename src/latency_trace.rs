@@ -71,7 +71,10 @@ pub fn record_since_key(stage: &str, slot: usize, at_ns: u64) {
         return;
     }
     if KEY_SEEN[slot].swap(key, Ordering::Relaxed) != key {
-        record_us(stage, (at_ns - key) / 1000);
+        let us = (at_ns - key) / 1000;
+        // One line per key and stage, so a single slow key can be followed.
+        tracing::info!(target: "macrdp::latency", stage, us, "key stage");
+        record_us(stage, us);
     }
 }
 
