@@ -1346,22 +1346,28 @@ mod macos {
         None
     }
 
+    /// A dirty rectangle in buffer pixels: x, y, width, height.
+    type Dirty = (usize, usize, usize, usize);
+
     /// Skips to the newest sample SCK has queued. Every EGFX frame is a full
     /// frame, so an older queued one only adds a frame interval of latency
     /// each. Keeps the last one with content: a trailing idle sample carries
-    /// no image. The flag is false only when every sample taken reported an
-    /// empty dirty-rect list, i.e. the image is the one already sent.
+    /// no image. Returns the dirty rects of every sample taken, or `None` if
+    /// one came without them.
     fn latest_sample(
         stream: &AsyncSCStream,
         mut sample: screencapturekit::cm::CMSampleBuffer,
         label: &str,
-    ) -> (screencapturekit::cm::CMSampleBuffer, bool) {
+    ) -> (screencapturekit::cm::CMSampleBuffer, Option<Vec<Dirty>>) {
         let mut skipped = 0u64;
-        let mut dirty_px = dirty_area(&sample);
+        let mut dirty = dirty_rects(&sample);
         while let Some(newer) = stream.try_next() {
             if newer.frame_status().is_none_or(|s| s.has_content()) {
-                dirty_px = match (dirty_px, dirty_area(&newer)) {
-                    (Some(a), Some(b)) => Some(a + b),
+                dirty = match (dirty, dirty_rects(&newer)) {
+                    (Some(mut a), Some(b)) => {
+                        a.extend(b);
+                        Some(a)
+                    }
                     _ => None,
                 };
                 sample = newer;
@@ -1371,16 +1377,66 @@ mod macos {
         if crate::latency_trace::enabled() {
             log_dirty_rects(&sample, label);
             crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
-            crate::latency_trace::record_us(
-                &format!("{label}.dirty_px"),
-                dirty_px.unwrap_or(u64::MAX),
-            );
+            let area = dirty
+                .as_ref()
+                .map_or(u64::MAX, |d| d.iter().map(|r| (r.2 * r.3) as u64).sum());
+            crate::latency_trace::record_us(&format!("{label}.dirty_px"), area);
             let pts = sample.presentation_timestamp();
             if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
                 crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
             }
         }
-        (sample, dirty_px != Some(0))
+        (sample, dirty)
+    }
+
+    fn dirty_rects(sample: &screencapturekit::cm::CMSampleBuffer) -> Option<Vec<Dirty>> {
+        sample.dirty_rects().map(|rects| {
+            rects
+                .iter()
+                .filter_map(|r| {
+                    let (o, s) = (r.origin(), r.size());
+                    let (w, h) = (s.width.max(0.0) as usize, s.height.max(0.0) as usize);
+                    (w > 0 && h > 0).then_some((o.x.max(0.0) as usize, o.y.max(0.0) as usize, w, h))
+                })
+                .collect()
+        })
+    }
+
+    /// The last frame a capture took, kept to tell a real change from SCK
+    /// redrawing identical pixels (a menu bar clock with seconds re-renders
+    /// every frame) and to offer a dropped frame again.
+    #[derive(Default)]
+    struct LastFrame {
+        pixels: Vec<u8>,
+        stride: usize,
+    }
+
+    impl LastFrame {
+        /// Whether `src` differs from the kept frame inside `dirty` (the whole
+        /// frame when `None`), copying the differing rows in so the kept frame
+        /// becomes `src`.
+        fn update(&mut self, src: &[u8], stride: usize, dirty: Option<&[Dirty]>) -> bool {
+            if self.stride != stride || self.pixels.len() != src.len() || stride == 0 {
+                self.pixels.clear();
+                self.pixels.extend_from_slice(src);
+                self.stride = stride;
+                return true;
+            }
+            let rows = src.len() / stride;
+            let whole = [(0, 0, stride / 4, rows)];
+            let mut changed = false;
+            for &(x, y, w, h) in dirty.unwrap_or(&whole) {
+                let (x0, x1) = ((x * 4).min(stride), ((x + w) * 4).min(stride));
+                for row in y.min(rows)..(y + h).min(rows) {
+                    let span = row * stride + x0..row * stride + x1;
+                    if self.pixels[span.clone()] != src[span.clone()] {
+                        self.pixels[span.clone()].copy_from_slice(&src[span]);
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
     }
 
     /// Logs one sample's dirty rects per monitor every 5 s, to find what keeps
@@ -1404,19 +1460,6 @@ mod macos {
             })
             .collect();
         tracing::info!(target: "macrdp::latency", label, ?rects, "dirty rects sample");
-    }
-
-    /// Dirty-rect area SCK attached to a sample; `None` when it attached none.
-    fn dirty_area(sample: &screencapturekit::cm::CMSampleBuffer) -> Option<u64> {
-        sample.dirty_rects().map(|rects| {
-            rects
-                .iter()
-                .map(|r| {
-                    let s = r.size();
-                    (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
-                })
-                .sum()
-        })
     }
 
     /// Captures a non-primary monitor's display into its EGFX output. The
@@ -1455,30 +1498,20 @@ mod macos {
             let task = tokio::spawn(async move {
                 // SCK sends a frame only when the screen changes, so a frame the
                 // output can't take yet (not set up, or its encoder still busy)
-                // is held and retried a frame later: dropping it would leave
-                // that change off screen until the next one.
-                let mut held_buf: Vec<u8> = Vec::new();
-                let mut held: Option<usize> = None;
+                // is kept and offered again a frame later: dropping it would
+                // leave that change off screen until the next one.
+                let mut last = LastFrame::default();
+                let mut pending = false;
                 loop {
-                    let next = match held {
-                        Some(_) => tokio::time::timeout(retry, stream.next()).await,
-                        None => Ok(stream.next().await),
+                    let next = if pending {
+                        tokio::time::timeout(retry, stream.next()).await
+                    } else {
+                        Ok(stream.next().await)
                     };
                     match next {
                         Ok(Some(sample)) => {
-                            let (sample, changed) = latest_sample(&stream, sample, &label);
+                            let (sample, dirty) = latest_sample(&stream, sample, &label);
                             if sample.frame_status().is_some_and(|s| !s.has_content()) {
-                                continue;
-                            }
-                            // An unchanged frame still costs a full encode here
-                            // and a full decode on the client, at up to 60 fps
-                            // per monitor. A held frame or a pending keyframe
-                            // still goes out.
-                            if !changed && held.is_none() && !gfx.output_keyframe_pending(output) {
-                                crate::latency_trace::record_us(
-                                    &format!("{label}.unchanged_skip"),
-                                    0,
-                                );
                                 continue;
                             }
                             let Some(pixel_buffer) = sample.image_buffer() else {
@@ -1488,39 +1521,36 @@ mod macos {
                             else {
                                 continue;
                             };
-                            let (src, stride) = (guard.as_slice(), guard.bytes_per_row());
-                            let t = Instant::now();
-                            match gfx.submit_output_bgra(output, src, stride) {
-                                Ok(crate::h264::OutputSubmit::Encoded) => {
-                                    crate::latency_trace::record_since(
-                                        &format!("{label}.submit"),
-                                        t,
-                                    );
-                                    held = None;
-                                }
-                                Ok(_) => {
-                                    held_buf.clear();
-                                    held_buf.extend_from_slice(src);
-                                    held = Some(stride);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = ?e, output, "EGFX submit for a secondary monitor failed")
-                                }
+                            let changed = last.update(
+                                guard.as_slice(),
+                                guard.bytes_per_row(),
+                                dirty.as_deref(),
+                            );
+                            drop(guard);
+                            if !changed && !pending && !gfx.output_keyframe_pending(output) {
+                                crate::latency_trace::record_us(
+                                    &format!("{label}.unchanged_skip"),
+                                    0,
+                                );
+                                continue;
                             }
                         }
                         Ok(None) => break,
-                        Err(_) => {
-                            if let Some(stride) = held {
-                                if let Ok(crate::h264::OutputSubmit::Encoded) =
-                                    gfx.submit_output_bgra(output, &held_buf, stride)
-                                {
-                                    crate::latency_trace::record_us(
-                                        &format!("{label}.held_resubmit"),
-                                        0,
-                                    );
-                                    held = None;
-                                }
-                            }
+                        Err(_) => {}
+                    }
+                    if last.pixels.is_empty() {
+                        continue;
+                    }
+                    let t = Instant::now();
+                    match gfx.submit_output_bgra(output, &last.pixels, last.stride) {
+                        Ok(crate::h264::OutputSubmit::Encoded) => {
+                            crate::latency_trace::record_since(&format!("{label}.submit"), t);
+                            pending = false;
+                        }
+                        Ok(_) => pending = true,
+                        Err(e) => {
+                            tracing::warn!(error = ?e, output, "EGFX submit for a secondary monitor failed");
+                            pending = false;
                         }
                     }
                 }
@@ -1656,6 +1686,11 @@ mod macos {
         /// change.
         held_frame: Option<(Vec<u8>, usize)>,
         hold_until: Instant,
+        /// The frame EGFX dropped last (busy encoder); offered again a frame
+        /// later until it is encoded. Lives in `last_frame`.
+        resubmit: bool,
+        /// The last captured frame, for telling real changes from redraws.
+        last_frame_kept: LastFrame,
         /// Re-modes the display ahead of a live resize; `None` outside
         /// single-monitor virtual-display sessions.
         remode: Option<super::PrimaryRemode>,
@@ -1726,6 +1761,28 @@ mod macos {
                 stream,
                 first_frame,
             });
+        }
+
+        /// Offers the frame EGFX dropped again.
+        fn offer_last_frame(&mut self) {
+            let Some(gfx) = self.gfx.as_ref() else {
+                return;
+            };
+            if self.last_frame.is_empty() {
+                self.resubmit = false;
+                return;
+            }
+            match gfx.submit_bgra_status(&self.last_frame, self.last_stride, false) {
+                Ok(crate::h264::OutputSubmit::Busy) => {}
+                Ok(_) => {
+                    crate::latency_trace::record_us("m0.held_resubmit", 0);
+                    self.resubmit = false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "EGFX resubmit failed");
+                    self.resubmit = false;
+                }
+            }
         }
 
         /// Ships the held frame once EGFX takes it. Returns whether it did.
@@ -1928,6 +1985,8 @@ mod macos {
                 suppress_next_adopt,
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
+                resubmit: false,
+                last_frame_kept: LastFrame::default(),
                 remode,
                 display_id,
                 fps,
@@ -2171,12 +2230,15 @@ mod macos {
                 let sample = if self.flush_remaining > 0
                     || self.pending_resize.has_pending()
                     || self.held_frame.is_some()
+                    || self.resubmit
                 {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
                         Err(_) => {
-                            if self.flush_remaining > 0 {
+                            if self.resubmit {
+                                self.offer_last_frame();
+                            } else if self.flush_remaining > 0 {
                                 self.flush_remaining -= 1;
                                 if let Some(gfx) = self.gfx.as_ref() {
                                     if !self.last_frame.is_empty() {
@@ -2203,11 +2265,27 @@ mod macos {
                 // Only once EGFX owns the display: the legacy bitmap path needs
                 // every sample's dirty rects.
                 let sample = if self.first_egfx_frame_sent {
-                    let (sample, changed) = latest_sample(&self.stream, sample, "m0");
+                    let (sample, dirty) = latest_sample(&self.stream, sample, "m0");
+                    if sample.frame_status().is_some_and(|s| !s.has_content()) {
+                        continue;
+                    }
+                    let changed = match sample.image_buffer().map(|pb| {
+                        pb.lock(CVPixelBufferLockFlags::READ_ONLY).map(|guard| {
+                            self.last_frame_kept.update(
+                                guard.as_slice(),
+                                guard.bytes_per_row(),
+                                dirty.as_deref(),
+                            )
+                        })
+                    }) {
+                        Some(Ok(changed)) => changed,
+                        _ => continue,
+                    };
                     // See the secondary capture: skip re-encoding an unchanged
-                    // frame unless a keyframe is pending or the suppress gate
-                    // needs to see this iteration.
+                    // frame unless a dropped one waits, a keyframe is pending
+                    // or the suppress gate needs to see this iteration.
                     if !changed
+                        && !self.resubmit
                         && !self.was_suppressed
                         && self.gfx.as_ref().is_some_and(|g| !g.keyframe_pending())
                     {
@@ -2352,7 +2430,12 @@ mod macos {
                         false
                     };
                     let submit_started = Instant::now();
-                    match gfx.submit_bgra(src, stride_bytes, big_change || resume_keyframe) {
+                    match gfx
+                        .submit_bgra_status(src, stride_bytes, big_change || resume_keyframe)
+                        .map(|status| {
+                            self.resubmit = status == crate::h264::OutputSubmit::Busy;
+                            status != crate::h264::OutputSubmit::NotReady
+                        }) {
                         Ok(true) => {
                             crate::latency_trace::record_since("m0.submit", submit_started);
                             self.seeded = true;
@@ -2369,9 +2452,11 @@ mod macos {
                             // it enough times to drain mstsc's presentation
                             // buffer. Reuse the buffer to avoid a per-frame
                             // realloc; clear keeps the capacity.
-                            self.last_frame.clear();
-                            self.last_frame.extend_from_slice(src);
-                            self.last_stride = stride_bytes;
+                            if self.flush_frames > 0 || self.resubmit {
+                                self.last_frame.clear();
+                                self.last_frame.extend_from_slice(src);
+                                self.last_stride = stride_bytes;
+                            }
                             self.flush_remaining = self.flush_frames;
                             self.held_frame = None;
                             continue;
@@ -2437,6 +2522,39 @@ mod macos {
                 }
                 self.seeded = true;
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod last_frame_tests {
+        use super::LastFrame;
+
+        #[test]
+        fn reports_only_real_changes_inside_the_dirty_rects() {
+            let stride = 8 * 4;
+            let mut a = vec![0u8; stride * 4];
+            let mut last = LastFrame::default();
+            assert!(last.update(&a, stride, None), "first frame is a change");
+            assert!(
+                !last.update(&a, stride, Some(&[(0, 0, 8, 4)])),
+                "identical redraw"
+            );
+            a[stride * 2 + 5 * 4] = 9;
+            assert!(
+                !last.update(&a, stride, Some(&[(0, 0, 4, 2)])),
+                "outside the dirty rect"
+            );
+            assert!(last.update(&a, stride, Some(&[(4, 1, 4, 2)])));
+            assert_eq!(last.pixels, a);
+            a[0] = 1;
+            assert!(
+                last.update(&a, stride, None),
+                "no rects compares the whole frame"
+            );
+            assert!(
+                !last.update(&a, stride, Some(&[(6, 3, 100, 100)])),
+                "clipped rect"
+            );
         }
     }
 }

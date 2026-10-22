@@ -1648,6 +1648,12 @@ impl Gfx {
         );
     }
 
+    /// [`Self::submit_bgra_status`], true unless EGFX isn't the display path yet.
+    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+        self.submit_bgra_status(bgra, stride, request_keyframe)
+            .map(|s| s != OutputSubmit::NotReady)
+    }
+
     /// Feed one full-frame BGRA buffer. Never blocks on the encoder.
     ///
     /// `request_keyframe` asks for the next encoded frame to be a forced IDR —
@@ -1656,12 +1662,17 @@ impl Gfx {
     /// some clients (mstsc) only resolve cleanly at the next periodic IDR (the
     /// "takes a while to come to front" lag); a forced IDR lands them at once.
     ///
-    /// Returns `Ok(true)` when EGFX is the active display path (so the caller
-    /// should suppress legacy BitmapUpdates for this frame — even if this
-    /// particular frame was skipped for backpressure or isn't encoded yet).
-    /// Returns `Ok(false)` when EGFX hasn't negotiated (no connection, still
+    /// `NotReady` when EGFX hasn't negotiated (no connection, still
     /// negotiating, or a non-EGFX client), so the caller falls back to legacy.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
+    /// `Busy` when EGFX is the display path but this frame was dropped
+    /// (backpressure, throttling, recovery); the caller must offer it again
+    /// or the change stays off screen on a static desktop.
+    pub fn submit_bgra_status(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+    ) -> Result<OutputSubmit> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
         // pulls each encoded frame off VT's output channel and ships it the
@@ -1676,10 +1687,10 @@ impl Gfx {
         let force_keyframe = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(false); // no active connection
+                return Ok(OutputSubmit::NotReady); // no active connection
             };
             if !ctx.is_ready {
-                return Ok(false); // channel not negotiated yet (or non-EGFX client)
+                return Ok(OutputSubmit::NotReady); // channel not negotiated yet (or non-EGFX client)
             }
             // Arm the keyframe BEFORE the throttle check so a large change that
             // lands on a dropped frame still forces the IDR on the next encoded
@@ -1955,7 +1966,7 @@ impl Gfx {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    return Ok(true);
+                    return Ok(OutputSubmit::Busy);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
@@ -1979,7 +1990,7 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                return Ok(true); // still the active path; just dropped this frame
+                return Ok(OutputSubmit::Busy); // still the active path; just dropped this frame
             }
             // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
             // socket backpressure to pace us to the client (unlike TCP), so without
@@ -2016,7 +2027,7 @@ impl Gfx {
                             lag,
                             "EGFX-on-UDP lag high; dropping capture (trickle floor)"
                         );
-                        return Ok(true);
+                        return Ok(OutputSubmit::Busy);
                     }
                     ctx.last_throttle_ship = now;
                     trace!(
@@ -2043,7 +2054,7 @@ impl Gfx {
             if let Err(e) = result {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
-            return Ok(true);
+            return Ok(OutputSubmit::Busy);
         }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
@@ -2051,7 +2062,7 @@ impl Gfx {
         {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
-                return Ok(true);
+                return Ok(OutputSubmit::Busy);
             };
             // Congestion-responsive control (P1 bitrate + P2a IDR backoff): compute
             // the adjustments (mutates ctx adaptive state, may set need_keyframe)
@@ -2059,7 +2070,7 @@ impl Gfx {
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
-                return Ok(true);
+                return Ok(OutputSubmit::Busy);
             };
             if let Some(bps) = adaptive.bitrate_bps {
                 if let Err(e) = encoder.set_bitrate(bps) {
@@ -2074,7 +2085,7 @@ impl Gfx {
             encoder.encode_bgra(bgra, stride, force_keyframe)?;
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(true)
+        Ok(OutputSubmit::Encoded)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
