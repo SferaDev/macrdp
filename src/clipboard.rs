@@ -1,7 +1,7 @@
 //! Bidirectional clipboard sync between the Mac and the RDP client.
 //!
 //! Text (CF_UNICODETEXT ↔ NSPasteboardTypeString) and images
-//! (CF_DIB ↔ PNG/TIFF) flow both directions. File copy is **Mac → Windows
+//! (registered `PNG`, CF_DIBV5 and CF_DIB ↔ PNG/TIFF) flow both directions. File copy is **Mac → Windows
 //! only**: copying a file in Finder advertises FileGroupDescriptorW with
 //! the file names + sizes, and Windows can fetch the actual bytes via
 //! FileContentsRequest (SIZE for the per-file size query, RANGE for the
@@ -17,9 +17,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
-use image::{ImageEncoder, ImageReader};
 use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
     ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardFormatName,
@@ -54,12 +53,13 @@ const MAX_INCOMING_PAYLOAD: usize = 50 * 1024 * 1024;
 /// being imperceptible to the user.
 const CONNECT_ADVERTISE_DELAY: Duration = Duration::from_millis(300);
 
-/// Registered-format IDs macrdp uses when *advertising* rich text to the
-/// remote. For registered formats the sender picks the ID and the receiver
+/// Registered-format IDs macrdp uses when *advertising* rich text and PNG to
+/// the remote. For registered formats the sender picks the ID and the receiver
 /// matches by NAME (MS-RDPECLIP 2.2.3.1), so any value in the registered
 /// range (0xC000–0xFFFF) that's unique within our own format list works.
 const HTML_FORMAT_ID: u32 = 0xC0F0;
 const RTF_FORMAT_ID: u32 = 0xC0F1;
+const PNG_FORMAT_ID: u32 = 0xC0F2;
 
 /// One representation to fetch from the remote as part of a single copy.
 /// The format ID is the remote's own (it varies for registered formats); the
@@ -68,7 +68,14 @@ const RTF_FORMAT_ID: u32 = 0xC0F1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Want {
     Text(ClipboardFormatId),
+    /// CF_DIB or CF_DIBV5.
     Image(ClipboardFormatId),
+    /// The registered `PNG` format, with the bitmap format to ask for
+    /// instead if the PNG can't be had.
+    Png {
+        id: ClipboardFormatId,
+        fallback: Option<ClipboardFormatId>,
+    },
     Html(ClipboardFormatId),
     Rtf(ClipboardFormatId),
     /// A request whose reply isn't ours to decode here (the file-list
@@ -79,9 +86,12 @@ enum Want {
 impl Want {
     fn id(self) -> ClipboardFormatId {
         match self {
-            Want::Text(id) | Want::Image(id) | Want::Html(id) | Want::Rtf(id) | Want::Other(id) => {
-                id
-            }
+            Want::Text(id)
+            | Want::Image(id)
+            | Want::Png { id, .. }
+            | Want::Html(id)
+            | Want::Rtf(id)
+            | Want::Other(id) => id,
         }
     }
 }
@@ -95,14 +105,6 @@ enum RemotePlan {
     Nothing,
 }
 
-/// Decide what to fetch for a remote copy. Files ALWAYS win and are decided
-/// first — a copy that also offers rich text must still take the file path,
-/// exactly as before rich text existed. Otherwise fetch every representation
-/// we can use, so a copy that offers an image AND rich text (Chrome's "Copy
-/// Image" also puts HTML on the clipboard) keeps the image instead of
-/// degrading to an `<img>` tag: plain text, then one rich format (HTML
-/// preferred — browsers only offer HTML, and it's usually the smaller), then
-/// one image (DIBV5 preferred over DIB for colour).
 /// A short, escaped prefix of a rejected clipboard payload for the log, so a
 /// client that answers with something unexpected can be diagnosed without a
 /// packet capture. Bounded, and escaped so it can't inject log lines.
@@ -114,6 +116,15 @@ fn payload_preview(data: &[u8]) -> String {
         .collect()
 }
 
+/// Decide what to fetch for a remote copy. Files ALWAYS win and are decided
+/// first — a copy that also offers rich text must still take the file path,
+/// exactly as before rich text existed. Otherwise fetch every representation
+/// we can use, so a copy that offers an image AND rich text (Chrome's "Copy
+/// Image" also puts HTML on the clipboard) keeps the image instead of
+/// degrading to an `<img>` tag: plain text, then one rich format (HTML
+/// preferred — browsers only offer HTML, and it's usually the smaller), then
+/// one image: PNG, passed through without a bitmap round trip, then DIBV5,
+/// then DIB.
 fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
     let named = |name: &str| {
         formats
@@ -148,10 +159,15 @@ fn plan_remote_fetch(formats: &[ClipboardFormat], rich: bool) -> RemotePlan {
             wants.push(Want::Rtf(id));
         }
     }
-    if let Some(id) = [ClipboardFormatId::CF_DIBV5, ClipboardFormatId::CF_DIB]
+    let bitmap = [ClipboardFormatId::CF_DIBV5, ClipboardFormatId::CF_DIB]
         .into_iter()
-        .find(|&id| has(id))
-    {
+        .find(|&id| has(id));
+    if let Some(id) = named(crate::clipboard_image::PNG_FORMAT_NAME) {
+        wants.push(Want::Png {
+            id,
+            fallback: bitmap,
+        });
+    } else if let Some(id) = bitmap {
         wants.push(Want::Image(id));
     }
     if wants.is_empty() {
@@ -208,144 +224,6 @@ struct RemoteFetch {
 /// lost. Every FormatDataRequest is answered (data or a failure), so this only
 /// bounds a misbehaving client.
 const STALE_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Convert PNG/TIFF bytes from NSPasteboard into a CF_DIB payload: a
-/// `BITMAPINFOHEADER` (40 bytes) followed by 32bpp BGRA pixels in
-/// top-down order (negative `biHeight`). 32bpp is the most widely
-/// supported variant; we deliberately do not output BITMAPV5HEADER
-/// since it complicates color-space negotiation with older clients.
-fn png_or_tiff_to_dib(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let img = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()?
-        .decode()?
-        .to_rgba8();
-    let (w, h) = (img.width(), img.height());
-    let row_bytes = (w as usize) * 4;
-    let pixel_bytes = row_bytes * (h as usize);
-
-    let mut out = Vec::with_capacity(40 + pixel_bytes);
-    // BITMAPINFOHEADER
-    out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    out.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
-    out.extend_from_slice(&(-(h as i32)).to_le_bytes()); // biHeight (negative = top-down)
-    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
-    out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
-    out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes()); // biSizeImage
-    out.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
-    out.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
-    out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
-    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-
-    // RGBA → BGRA, row order already top-down.
-    for px in img.pixels() {
-        let [r, g, b, a] = px.0;
-        out.extend_from_slice(&[b, g, r, a]);
-    }
-    Ok(out)
-}
-
-/// Parse a CF_DIB / CF_DIBV5 payload into PNG bytes. We accept any
-/// header size ≥ 40 (BITMAPINFOHEADER), 24bpp or 32bpp uncompressed
-/// pixels (BI_RGB), top-down or bottom-up. Anything else is rejected
-/// with an error.
-fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
-    use anyhow::{anyhow, bail};
-    if dib.len() < 40 {
-        bail!("DIB shorter than BITMAPINFOHEADER");
-    }
-    let bi_size = u32::from_le_bytes(dib[0..4].try_into().unwrap()) as usize;
-    if bi_size < 40 || bi_size > dib.len() {
-        bail!("bogus biSize {bi_size}");
-    }
-    let width = i32::from_le_bytes(dib[4..8].try_into().unwrap());
-    let height_signed = i32::from_le_bytes(dib[8..12].try_into().unwrap());
-    let bit_count = u16::from_le_bytes(dib[14..16].try_into().unwrap());
-    let compression = u32::from_le_bytes(dib[16..20].try_into().unwrap());
-
-    if width <= 0 {
-        bail!("invalid width {width}");
-    }
-    if height_signed == 0 {
-        bail!("invalid height 0");
-    }
-    // BI_RGB (0) we treat as canonical layout. BI_BITFIELDS (3) we accept
-    // for 32bpp under the assumption of standard ARGB masks
-    //   (R=0x00FF0000, G=0x0000FF00, B=0x000000FF, A=0xFF000000)
-    // — which is the only layout modern Windows actually emits. The masks
-    // are stored differently per header version:
-    //   BITMAPINFOHEADER (40):       12 bytes of RGB masks AFTER the header
-    //   BITMAPV4HEADER  (108):       masks are INSIDE the header
-    //   BITMAPV5HEADER  (124):       masks are INSIDE the header
-    let bitfields = compression == 3 || compression == 6; // BI_BITFIELDS / BI_ALPHABITFIELDS
-    if compression != 0 && !bitfields {
-        bail!("unsupported BI_COMPRESSION {compression}");
-    }
-    if bit_count != 24 && bit_count != 32 {
-        bail!("unsupported biBitCount {bit_count}");
-    }
-    if bitfields && bit_count != 32 {
-        bail!("BI_BITFIELDS with biBitCount={bit_count} not supported");
-    }
-
-    let w = width as u32;
-    let h = height_signed.unsigned_abs();
-    let top_down = height_signed < 0;
-    let bpp = (bit_count / 8) as usize;
-    // BMP rows are padded to a 4-byte multiple.
-    let stride = (w as usize * bpp + 3) & !3;
-    // Pixel data starts after the header AND any out-of-band masks
-    // (BITMAPINFOHEADER + BI_BITFIELDS = masks follow header).
-    let mask_bytes = if bitfields && bi_size == 40 {
-        if compression == 6 {
-            16 // RGBA masks
-        } else {
-            12 // RGB masks
-        }
-    } else {
-        0
-    };
-    let pixel_start = bi_size + mask_bytes;
-    let need = pixel_start
-        .checked_add(
-            stride
-                .checked_mul(h as usize)
-                .ok_or_else(|| anyhow!("overflow"))?,
-        )
-        .ok_or_else(|| anyhow!("overflow"))?;
-    if dib.len() < need {
-        bail!("DIB payload truncated: have {}, need {need}", dib.len());
-    }
-
-    // Capacity arithmetic must match the byte-bounds checked_mul above —
-    // otherwise an attacker could craft a DIB whose dimensions overflow u32
-    // and silently allocate a too-small buffer. Vec would still grow on
-    // push, so no UB, but be consistent.
-    let cap = (w as usize)
-        .checked_mul(h as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| anyhow!("RGBA buffer size overflow"))?;
-    let mut rgba: Vec<u8> = Vec::with_capacity(cap);
-    for row in 0..h {
-        let src_row = if top_down { row } else { h - 1 - row };
-        let row_off = pixel_start + (src_row as usize) * stride;
-        let row_bytes = &dib[row_off..row_off + w as usize * bpp];
-        for chunk in row_bytes.chunks_exact(bpp) {
-            // BMP pixels are BGR(A); convert to RGBA.
-            let (b, g, r, a) = if bpp == 4 {
-                (chunk[0], chunk[1], chunk[2], chunk[3])
-            } else {
-                (chunk[0], chunk[1], chunk[2], 0xFF)
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
-
-    let mut png = Vec::new();
-    let encoder = image::codecs::png::PngEncoder::new(&mut png);
-    encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)?;
-    Ok(png)
-}
 
 /// Shared state coordinating the Mac-side advertise poller with the cliprdr
 /// backend's `on_format_list_response` hook. Lets us retry on Fail while
@@ -703,6 +581,18 @@ impl MacCliprdrBackend {
         true
     }
 
+    /// A PNG that failed (after its retry) or didn't validate: ask for the
+    /// bitmap format the same copy offered instead, next.
+    fn queue_png_fallback(&mut self, failed: Option<Want>) {
+        if let Some(Want::Png {
+            fallback: Some(id), ..
+        }) = failed
+        {
+            debug!(format_id = ?id, "falling back from PNG to the bitmap format");
+            self.fetch.queue.push_front(Want::Image(id));
+        }
+    }
+
     /// Request the next representation of the current remote copy, or — once
     /// the queue is drained — publish everything that arrived.
     fn request_next(&mut self) {
@@ -870,6 +760,14 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
         }
     }
     if pb::has_image() {
+        // PNG first for transparency; CF_DIB last for clients that know
+        // nothing newer.
+        formats.push(
+            ClipboardFormat::new(ClipboardFormatId::new(PNG_FORMAT_ID)).with_name(
+                ClipboardFormatName::new(crate::clipboard_image::PNG_FORMAT_NAME),
+            ),
+        );
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIBV5));
         formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
     }
     if pb::has_string() {
@@ -886,6 +784,23 @@ fn advertise_pasteboard(sender: &Sender, paths: &Paths, rich: bool) -> bool {
         sender,
         ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats)),
     )
+}
+
+/// Answer a CF_DIB / CF_DIBV5 request from the Mac pasteboard's image.
+fn bitmap_response(
+    what: &str,
+    encode: fn(&image::RgbaImage) -> Vec<u8>,
+) -> OwnedFormatDataResponse {
+    let Some(png) = pb::read_image_png() else {
+        return OwnedFormatDataResponse::new_error();
+    };
+    match crate::clipboard_image::decode_png(&png) {
+        Ok(img) => OwnedFormatDataResponse::new_data(encode(&img)),
+        Err(e) => {
+            warn!("{what} encode failed: {e}");
+            OwnedFormatDataResponse::new_error()
+        }
+    }
 }
 
 fn send(sender: &Sender, event: ServerEvent) -> bool {
@@ -1122,7 +1037,7 @@ impl CliprdrBackend for MacCliprdrBackend {
         // once we go through `initiate_file_copy` (the
         // ServerEvent::ClipboardFileCopy path) — it answers the FormatData
         // request from its stored `local_file_list` without ever reaching
-        // us. So we only deal with CF_UNICODETEXT and CF_DIB here.
+        // us. So we only deal with text, images and rich text here.
         let response = match request.format {
             ClipboardFormatId::CF_UNICODETEXT => match pb::read_string() {
                 Some(s) => {
@@ -1136,14 +1051,14 @@ impl CliprdrBackend for MacCliprdrBackend {
                 }
                 None => OwnedFormatDataResponse::new_error(),
             },
-            ClipboardFormatId::CF_DIB => match pb::read_image_bytes() {
-                Some((_enc, bytes)) => match png_or_tiff_to_dib(&bytes) {
-                    Ok(dib) => OwnedFormatDataResponse::new_data(dib),
-                    Err(e) => {
-                        warn!("DIB encode failed: {e}");
-                        OwnedFormatDataResponse::new_error()
-                    }
-                },
+            ClipboardFormatId::CF_DIB => {
+                bitmap_response("CF_DIB", crate::clipboard_image::encode_dib)
+            }
+            ClipboardFormatId::CF_DIBV5 => {
+                bitmap_response("CF_DIBV5", crate::clipboard_image::encode_dibv5)
+            }
+            f if f.value() == PNG_FORMAT_ID => match pb::read_image_png() {
+                Some(png) => OwnedFormatDataResponse::new_data(png),
                 None => OwnedFormatDataResponse::new_error(),
             },
             f if f.value() == HTML_FORMAT_ID => match pb::read_html() {
@@ -1186,6 +1101,7 @@ impl CliprdrBackend for MacCliprdrBackend {
             // One representation failing (e.g. an app that advertises HTML
             // but can't render it) mustn't cost the others: carry on.
             warn!(?want, "remote returned error for format data");
+            self.queue_png_fallback(want);
             self.request_next();
             return;
         }
@@ -1223,9 +1139,22 @@ impl CliprdrBackend for MacCliprdrBackend {
                     }
                 }
             }
-            Some(Want::Image(_)) => match dib_to_png(data) {
+            Some(Want::Image(_)) => match crate::clipboard_image::decode_dib(data)
+                .and_then(|img| crate::clipboard_image::encode_png(&img))
+            {
                 Ok(png) => self.fetch.got.png = Some(png),
                 Err(e) => warn!("DIB decode failed: {e}"),
+            },
+            Some(Want::Png { .. }) => match crate::clipboard_image::validate_png(data) {
+                Ok(()) => self.fetch.got.png = Some(data.to_vec()),
+                Err(e) => {
+                    warn!(
+                        len = data.len(),
+                        preview = %payload_preview(data),
+                        "remote PNG payload rejected: {e}"
+                    );
+                    self.queue_png_fallback(want);
+                }
             },
             Some(Want::Html(_)) => match crate::clipboard_rich::decode_cf_html(data) {
                 Some(html) => self.fetch.got.html = Some(html),
@@ -1339,10 +1268,10 @@ pub(crate) fn pasteboard() -> objc2::rc::Retained<objc2_app_kit::NSPasteboard> {
 mod pb {
     use objc2::rc::autoreleasepool;
     use objc2_app_kit::{
-        NSPasteboardTypeFileURL, NSPasteboardTypeHTML, NSPasteboardTypePNG, NSPasteboardTypeRTF,
-        NSPasteboardTypeString, NSPasteboardTypeTIFF,
+        NSBitmapImageFileType, NSBitmapImageRep, NSPasteboardTypeFileURL, NSPasteboardTypeHTML,
+        NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF,
     };
-    use objc2_foundation::{NSData, NSString, NSURL};
+    use objc2_foundation::{NSData, NSDictionary, NSString, NSURL};
 
     pub fn change_count() -> i64 {
         let _pb_guard = super::pasteboard_guard();
@@ -1588,20 +1517,23 @@ mod pb {
         }
     }
 
-    /// Return the Mac clipboard's image, normalized to PNG bytes. Tries
-    /// PNG first, falls back to TIFF (which we re-encode in clipboard.rs
-    /// via the `image` crate so this returns PNG either way).
-    pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
+    /// Return the Mac clipboard's image as PNG bytes: the PNG itself when
+    /// there is one, otherwise the TIFF converted by AppKit (the `image`
+    /// crate is built without its TIFF decoder).
+    pub fn read_image_png() -> Option<Vec<u8>> {
         let _pb_guard = super::pasteboard_guard();
         autoreleasepool(|_| unsafe {
             let pb = super::pasteboard();
             if let Some(d) = pb.dataForType(NSPasteboardTypePNG) {
-                return Some((ImageEncoding::Png, nsdata_to_vec(&d)));
+                return Some(nsdata_to_vec(&d));
             }
-            if let Some(d) = pb.dataForType(NSPasteboardTypeTIFF) {
-                return Some((ImageEncoding::Tiff, nsdata_to_vec(&d)));
-            }
-            None
+            let tiff = pb.dataForType(NSPasteboardTypeTIFF)?;
+            let rep = NSBitmapImageRep::imageRepWithData(&tiff)?;
+            let png = rep.representationUsingType_properties(
+                NSBitmapImageFileType::PNG,
+                &NSDictionary::new(),
+            )?;
+            Some(nsdata_to_vec(&png))
         })
     }
 
@@ -1653,19 +1585,10 @@ mod pb {
             std::slice::from_raw_parts(ptr, len).to_vec()
         }
     }
-
-    pub enum ImageEncoding {
-        Png,
-        Tiff,
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod pb {
-    pub enum ImageEncoding {
-        Png,
-        Tiff,
-    }
     pub struct FileEntry {
         pub name: String,
         pub size: Option<u64>,
@@ -1690,7 +1613,7 @@ mod pb {
     }
     #[cfg(test)]
     pub fn write_string(_: &str) {}
-    pub fn read_image_bytes() -> Option<(ImageEncoding, Vec<u8>)> {
+    pub fn read_image_png() -> Option<Vec<u8>> {
         None
     }
     pub fn has_html() -> bool {
@@ -2010,6 +1933,232 @@ mod tests {
     fn plan_nothing_for_unsupported_formats() {
         let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_ENHMETAFILE)];
         assert_eq!(plan_remote_fetch(&formats, true), RemotePlan::Nothing);
+    }
+
+    const PNG: u32 = 0xC0D4;
+
+    /// PNG wins over both bitmaps, and the best bitmap offered rides along as
+    /// its fallback.
+    #[test]
+    fn plan_prefers_png_and_keeps_the_best_bitmap_as_fallback() {
+        let formats = vec![
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIBV5),
+            named(PNG, "PNG"),
+        ];
+        assert_eq!(
+            plan_remote_fetch(&formats, true),
+            RemotePlan::Fetch(vec![Want::Png {
+                id: ClipboardFormatId::new(PNG),
+                fallback: Some(ClipboardFormatId::CF_DIBV5),
+            }])
+        );
+    }
+
+    /// Images aren't rich text: PNG is taken with `--no-rich-clipboard` too,
+    /// matched by name case-insensitively, with no fallback when it's alone.
+    #[test]
+    fn plan_takes_a_lone_png_by_name_even_without_rich() {
+        let formats = vec![named(PNG, "png")];
+        assert_eq!(
+            plan_remote_fetch(&formats, false),
+            RemotePlan::Fetch(vec![Want::Png {
+                id: ClipboardFormatId::new(PNG),
+                fallback: None,
+            }])
+        );
+    }
+
+    fn png_formats() -> Vec<ClipboardFormat> {
+        vec![
+            named(PNG, "PNG"),
+            ClipboardFormat::new(ClipboardFormatId::CF_DIB),
+        ]
+    }
+
+    fn sample_image() -> image::RgbaImage {
+        image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 64]).unwrap()
+    }
+
+    fn next_paste_request(rx: &mut mpsc::UnboundedReceiver<ServerEvent>) -> ClipboardFormatId {
+        match rx.try_recv() {
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(id))) => id,
+            other => panic!("expected a paste request, got {other:?}"),
+        }
+    }
+
+    /// A remote PNG reaches the pasteboard byte for byte: no bitmap round trip.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_remote_png_is_passed_through_untouched() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&png_formats());
+        assert_eq!(next_paste_request(&mut rx), ClipboardFormatId::new(PNG));
+        let png = crate::clipboard_image::encode_png(&sample_image()).unwrap();
+        backend
+            .fetch
+            .queue
+            .push_back(Want::Text(ClipboardFormatId::CF_UNICODETEXT)); // hold off the publish
+        backend.on_format_data_response(FormatDataResponse::new_data(png.clone()));
+        assert_eq!(backend.fetch.got.png.as_deref(), Some(png.as_slice()));
+        assert_eq!(
+            next_paste_request(&mut rx),
+            ClipboardFormatId::CF_UNICODETEXT,
+            "the bitmap fallback isn't fetched once the PNG is good"
+        );
+    }
+
+    /// A PNG reply that isn't a PNG falls back to the bitmap format.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_invalid_remote_png_falls_back_to_the_bitmap() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&png_formats());
+        let _ = next_paste_request(&mut rx);
+        backend.on_format_data_response(FormatDataResponse::new_data(b"not a png".to_vec()));
+        assert_eq!(next_paste_request(&mut rx), ClipboardFormatId::CF_DIB);
+        assert_eq!(
+            backend.fetch.current,
+            Some(Want::Image(ClipboardFormatId::CF_DIB))
+        );
+        assert!(backend.fetch.got.png.is_none());
+    }
+
+    /// A PNG the remote can't render is retried once, then the bitmap is
+    /// requested instead, and its reply is decoded as a DIB.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_failing_remote_png_falls_back_after_its_retry() {
+        let (mut backend, mut rx) = test_backend();
+        backend.on_remote_copy(&png_formats());
+        let _ = next_paste_request(&mut rx);
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert_eq!(next_paste_request(&mut rx), ClipboardFormatId::new(PNG));
+        backend.on_format_data_response(FormatDataResponse::new_error());
+        assert_eq!(next_paste_request(&mut rx), ClipboardFormatId::CF_DIB);
+        backend
+            .fetch
+            .queue
+            .push_back(Want::Text(ClipboardFormatId::CF_UNICODETEXT)); // hold off the publish
+        let dib = crate::clipboard_image::encode_dibv5(&sample_image());
+        backend.on_format_data_response(FormatDataResponse::new_data(dib));
+        let png = backend
+            .fetch
+            .got
+            .png
+            .as_deref()
+            .expect("the DIB was decoded");
+        assert_eq!(
+            crate::clipboard_image::decode_png(png).unwrap(),
+            sample_image()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn data_for(
+        backend: &mut MacCliprdrBackend,
+        rx: &mut mpsc::UnboundedReceiver<ServerEvent>,
+        format: ClipboardFormatId,
+    ) -> Vec<u8> {
+        backend.on_format_data_request(FormatDataRequest { format });
+        match rx.try_recv() {
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendFormatData(r))) => {
+                assert!(!r.is_error(), "{format:?} request failed");
+                r.data().to_vec()
+            }
+            other => panic!("expected format data, got {other:?}"),
+        }
+    }
+
+    /// A Mac image is offered as PNG, CF_DIBV5 and CF_DIB, in that order of
+    /// preference, and each request is answered with that format, alpha
+    /// intact in the two that carry it. (Writes the test thread's private
+    /// pasteboard.)
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_mac_image_is_offered_and_served_as_png_dibv5_and_dib() {
+        let (mut backend, mut rx) = test_backend();
+        let png = crate::clipboard_image::encode_png(&sample_image()).unwrap();
+        pb::write_items(
+            None,
+            None,
+            None,
+            Some(&png),
+            &std::sync::atomic::AtomicI64::new(-1),
+        );
+
+        assert!(advertise_pasteboard(
+            &backend.sender,
+            &backend.file_paths,
+            true
+        ));
+        match rx.try_recv() {
+            Ok(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(formats))) => {
+                let listed: Vec<_> = formats
+                    .iter()
+                    .map(|f| (f.id.value(), f.name.as_ref().map(|n| n.value().to_owned())))
+                    .collect();
+                assert_eq!(
+                    listed,
+                    vec![
+                        (PNG_FORMAT_ID, Some("PNG".to_owned())),
+                        (ClipboardFormatId::CF_DIBV5.value(), None),
+                        (ClipboardFormatId::CF_DIB.value(), None),
+                    ]
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let id = ClipboardFormatId::new(PNG_FORMAT_ID);
+        assert_eq!(
+            data_for(&mut backend, &mut rx, id),
+            png,
+            "PNG passes through"
+        );
+        let v5 = data_for(&mut backend, &mut rx, ClipboardFormatId::CF_DIBV5);
+        assert_eq!(
+            crate::clipboard_image::decode_dib(&v5).unwrap(),
+            sample_image()
+        );
+        let dib = data_for(&mut backend, &mut rx, ClipboardFormatId::CF_DIB);
+        assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
+        assert_eq!(
+            crate::clipboard_image::decode_dib(&dib).unwrap(),
+            sample_image()
+        );
+    }
+
+    /// Apps that only put TIFF on the pasteboard still serve PNG (and so the
+    /// bitmaps): AppKit converts, since the `image` crate has no TIFF decoder.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_tiff_only_mac_image_is_served_as_png() {
+        use objc2_app_kit::{NSBitmapImageRep, NSPasteboardTypeTIFF};
+        use objc2_foundation::NSData;
+        let png = crate::clipboard_image::encode_png(&sample_image()).unwrap();
+        {
+            let _guard = pasteboard_guard();
+            unsafe {
+                let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(&png)).unwrap();
+                let tiff = rep.TIFFRepresentation().unwrap();
+                let pb = pasteboard();
+                pb.clearContents();
+                pb.setData_forType(Some(&tiff), NSPasteboardTypeTIFF);
+            }
+        }
+        assert!(pb::has_image());
+        let (mut backend, mut rx) = test_backend();
+        let served = data_for(&mut backend, &mut rx, ClipboardFormatId::new(PNG_FORMAT_ID));
+        assert_eq!(
+            crate::clipboard_image::decode_png(&served).unwrap(),
+            sample_image()
+        );
+        let v5 = data_for(&mut backend, &mut rx, ClipboardFormatId::CF_DIBV5);
+        assert_eq!(
+            crate::clipboard_image::decode_dib(&v5).unwrap(),
+            sample_image()
+        );
     }
 
     /// End to end through the backend: a copy offering files AND rich text
