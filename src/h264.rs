@@ -2656,6 +2656,26 @@ impl Gfx {
         })
     }
 
+    /// Whether the primary surface's next encoded frame must be an IDR.
+    pub fn keyframe_pending(&self) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|ctx| ctx.need_keyframe)
+    }
+
+    /// Whether a non-primary monitor's next encoded frame must be an IDR, or
+    /// its output doesn't exist yet.
+    pub fn output_keyframe_pending(&self, output: usize) -> bool {
+        self.ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|ctx| ctx.outputs.get(output))
+            .is_none_or(|o| o.need_keyframe)
+    }
+
     /// Encodes a frame of a non-primary monitor.
     pub fn submit_output_bgra(
         &self,

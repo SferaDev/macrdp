@@ -1334,27 +1334,47 @@ mod macos {
     /// Skips to the newest sample SCK has queued. Every EGFX frame is a full
     /// frame, so an older queued one only adds a frame interval of latency
     /// each. Keeps the last one with content: a trailing idle sample carries
-    /// no image.
+    /// no image. The flag is false only when every sample taken reported an
+    /// empty dirty-rect list, i.e. the image is the one already sent.
     fn latest_sample(
         stream: &AsyncSCStream,
         mut sample: screencapturekit::cm::CMSampleBuffer,
         label: &str,
-    ) -> screencapturekit::cm::CMSampleBuffer {
+    ) -> (screencapturekit::cm::CMSampleBuffer, bool) {
         let mut skipped = 0u64;
+        let mut dirty_px = dirty_area(&sample);
         while let Some(newer) = stream.try_next() {
             if newer.frame_status().is_none_or(|s| s.has_content()) {
+                dirty_px = match (dirty_px, dirty_area(&newer)) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
                 sample = newer;
                 skipped += 1;
             }
         }
         if crate::latency_trace::enabled() {
             crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
+            crate::latency_trace::record_us(&format!("{label}.dirty_px"), dirty_px.unwrap_or(u64::MAX));
             let pts = sample.presentation_timestamp();
             if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
                 crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
             }
         }
-        sample
+        (sample, dirty_px != Some(0))
+    }
+
+    /// Dirty-rect area SCK attached to a sample; `None` when it attached none.
+    fn dirty_area(sample: &screencapturekit::cm::CMSampleBuffer) -> Option<u64> {
+        sample.dirty_rects().map(|rects| {
+            rects
+                .iter()
+                .map(|r| {
+                    let s = r.size();
+                    (s.width.max(0.0) as u64) * (s.height.max(0.0) as u64)
+                })
+                .sum()
+        })
     }
 
     /// Captures a non-primary monitor's display into its EGFX output. The
@@ -1404,8 +1424,16 @@ mod macos {
                     };
                     match next {
                         Ok(Some(sample)) => {
-                            let sample = latest_sample(&stream, sample, &label);
+                            let (sample, changed) = latest_sample(&stream, sample, &label);
                             if sample.frame_status().is_some_and(|s| !s.has_content()) {
+                                continue;
+                            }
+                            // An unchanged frame still costs a full encode here
+                            // and a full decode on the client, at up to 60 fps
+                            // per monitor. A held frame or a pending keyframe
+                            // still goes out.
+                            if !changed && held.is_none() && !gfx.output_keyframe_pending(output) {
+                                crate::latency_trace::record_us(&format!("{label}.unchanged_skip"), 0);
                                 continue;
                             }
                             let Some(pixel_buffer) = sample.image_buffer() else {
@@ -2124,7 +2152,30 @@ mod macos {
                 // Only once EGFX owns the display: the legacy bitmap path needs
                 // every sample's dirty rects.
                 let sample = if self.first_egfx_frame_sent {
-                    latest_sample(&self.stream, sample, "m0")
+                    let (sample, changed) = latest_sample(&self.stream, sample, "m0");
+                    // See the secondary capture: skip re-encoding an unchanged
+                    // frame unless a keyframe is pending or the suppress gate
+                    // needs to see this iteration.
+                    if !changed
+                        && !self.was_suppressed
+                        && self.gfx.as_ref().is_some_and(|g| !g.keyframe_pending())
+                    {
+                        crate::latency_trace::record_us("m0.unchanged_skip", 0);
+                        // SCK keeps sending these, so the flush burst's
+                        // idle timeout never fires; run it from here.
+                        if self.flush_remaining > 0 && !self.last_frame.is_empty() {
+                            self.flush_remaining -= 1;
+                            if let Some(gfx) = self.gfx.as_ref() {
+                                if let Err(e) =
+                                    gfx.submit_bgra(&self.last_frame, self.last_stride, false)
+                                {
+                                    tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    sample
                 } else {
                     sample
                 };
