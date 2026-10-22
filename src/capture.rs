@@ -725,6 +725,9 @@ impl CaptureDisplay {
         };
         let (cur_w, cur_h) = vd.size_px();
         if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
+            // A live resize re-modes the display before the reactivation that
+            // lands here.
+            self.screen_size_pts = vd.size_pts();
             return (width, height);
         }
         match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
@@ -952,6 +955,17 @@ impl CaptureDisplay {
             None => (width, height),
         };
         #[cfg(target_os = "macos")]
+        let remode = match (&self.virtual_display, &self.monitor_layout) {
+            (Some(vd), None) => Some(PrimaryRemode {
+                vd: vd.clone(),
+                client_scale_percent: self.client_scale_percent,
+                headless: self.session_tracker.is_some(),
+                captured_primary: self.captured_primary.clone(),
+                shielded_primary: self.shielded_primary.clone(),
+            }),
+            _ => None,
+        };
+        #[cfg(target_os = "macos")]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> = {
             let started = Instant::now();
             let (primary, secondaries) = tokio::join!(
@@ -973,6 +987,7 @@ impl CaptureDisplay {
                     self.desktop_size.clone(),
                     self.pending_resize.clone(),
                     self.suppress_next_adopt.clone(),
+                    remode,
                 ),
                 self.start_secondary_captures(),
             );
@@ -1104,6 +1119,49 @@ fn after_headless_remode(
     });
 }
 
+/// Re-modes a single-monitor session's virtual display to a new session size
+/// the way `sync_primary_display` does, for a live resize to run ahead of its
+/// reactivation.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct PrimaryRemode {
+    vd: Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>,
+    client_scale_percent: u32,
+    headless: bool,
+    captured_primary:
+        Option<Arc<std::sync::Mutex<Option<crate::virtual_display::CapturedPrimary>>>>,
+    shielded_primary:
+        Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl PrimaryRemode {
+    /// Returns the display's id once it has the size. Blocks while the
+    /// WindowServer applies the mode.
+    fn apply(&self, width: u16, height: u16) -> Option<u32> {
+        let scale = virtual_display_scale(width, height, self.client_scale_percent);
+        let mut vd = self.vd.lock().expect("virtual display mutex poisoned");
+        if vd.size_px() == (u32::from(width), u32::from(height)) && vd.scale() == scale {
+            return Some(vd.display_id());
+        }
+        if let Err(e) = vd.resize(u32::from(width), u32::from(height), scale) {
+            tracing::warn!(error = ?e, "re-moding the virtual display ahead of a live resize failed");
+            return None;
+        }
+        tracing::info!(
+            width,
+            height,
+            scale,
+            display_id = vd.display_id(),
+            "virtual display re-moded ahead of a live resize"
+        );
+        if self.headless {
+            after_headless_remode(&mut vd, &self.captured_primary, &self.shielded_primary);
+        }
+        Some(vd.display_id())
+    }
+}
+
 /// Max pixels per emitted legacy `BitmapUpdate`. The bitmap encoder packs a
 /// whole rect into one update PDU (one RLE rectangle per ~`65535/(w*4)`
 /// rows); mstsc renders a single ~1280×720 (≈0.9 MP) update but DROPS a
@@ -1184,6 +1242,95 @@ mod macos {
     /// channel that isn't ready yet.
     const EGFX_READY_GRACE: Duration = Duration::from_secs(10);
 
+    /// How long a live resize waits for the resized display's first frame.
+    const RESIZE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Starts a capture of `display` at `width`×`height` pixels.
+    fn start_stream(
+        display: &screencapturekit::shareable_content::SCDisplay,
+        width: u16,
+        height: u16,
+        fps: u32,
+        preserve_aspect: bool,
+    ) -> Result<AsyncSCStream> {
+        let filter = SCContentFilter::create()
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
+        let config = SCStreamConfiguration::new()
+            .with_width(u32::from(width))
+            .with_height(u32::from(height))
+            .with_pixel_format(SckPixelFormat::BGRA)
+            .with_fps(fps)
+            // Hide the macOS cursor in the captured framebuffer; we forward
+            // it separately as RGBAPointer so the client renders its own
+            // (real-shape) cursor without doubling up.
+            .with_shows_cursor(false)
+            // Aspect handling on a scaling (non-native) capture:
+            //   * letterbox=false (default for explicit --width/--height, or
+            //     auto-size + --stretch): stretch the source to fill the
+            //     output exactly — no black bars, but distorts on aspect
+            //     mismatch.
+            //   * letterbox=true (auto-size default): preserve the Mac's
+            //     aspect ratio, padding with black bars. input.rs maps mouse
+            //     coords into the centered content sub-rect to keep clicks
+            //     aligned (the stretch path needs no such correction, which
+            //     is why fill used to be the only mode).
+            //
+            // Apple replaced `scalesToFit` with `preservesAspectRatio`
+            // (inverse semantics) in macOS 14; on 14+ the newer property is
+            // what takes effect. `scales_to_fit(true)` stays set so the
+            // source scales to the output either way; `preserves_aspect_ratio`
+            // is the knob that picks letterbox vs stretch.
+            .with_scales_to_fit(true)
+            .with_preserves_aspect_ratio(preserve_aspect);
+        let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+        stream
+            .start_capture()
+            .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+        Ok(stream)
+    }
+
+    /// The pixels of the stream's next frame with content.
+    async fn next_frame(stream: &AsyncSCStream) -> Option<(Vec<u8>, usize)> {
+        loop {
+            let sample = stream.next().await?;
+            if sample.frame_status().is_some_and(|s| !s.has_content()) {
+                continue;
+            }
+            let Some(pixel_buffer) = sample.image_buffer() else {
+                continue;
+            };
+            let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+                continue;
+            };
+            return Some((guard.as_slice().to_vec(), guard.bytes_per_row()));
+        }
+    }
+
+    /// A capture opened ahead of a live resize's reactivation, with its first
+    /// frame, for the capture the reactivation starts to take over.
+    struct PreparedStream {
+        display_id: u32,
+        size: (u16, u16),
+        stream: AsyncSCStream,
+        first_frame: Option<(Vec<u8>, usize)>,
+    }
+
+    static PREPARED_STREAM: std::sync::Mutex<Option<PreparedStream>> = std::sync::Mutex::new(None);
+
+    fn take_prepared_stream(display_id: u32, size: (u16, u16)) -> Option<PreparedStream> {
+        let prepared = PREPARED_STREAM
+            .lock()
+            .expect("prepared stream mutex poisoned")
+            .take()?;
+        if (prepared.display_id, prepared.size) == (display_id, size) {
+            return Some(prepared);
+        }
+        let _ = prepared.stream.stop_capture();
+        None
+    }
+
     /// Skips to the newest sample SCK has queued. Every EGFX frame is a full
     /// frame, so an older queued one only adds a frame interval of latency
     /// each. Keeps the last one with content: a trailing idle sample carries
@@ -1240,22 +1387,7 @@ mod macos {
                 .iter()
                 .find(|d| d.display_id() == display_id)
                 .with_context(|| format!("SCK enumeration has no display with id={display_id}"))?;
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-            let config = SCStreamConfiguration::new()
-                .with_width(u32::from(width))
-                .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
-                .with_shows_cursor(false)
-                .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(false);
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
-            stream
-                .start_capture()
-                .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let stream = start_stream(display, width, height, fps, false)?;
             let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let label = format!("m{}", output + 1);
             let task = tokio::spawn(async move {
@@ -1445,12 +1577,75 @@ mod macos {
         /// change.
         held_frame: Option<(Vec<u8>, usize)>,
         hold_until: Instant,
+        /// Re-modes the display ahead of a live resize; `None` outside
+        /// single-monitor virtual-display sessions.
+        remode: Option<super::PrimaryRemode>,
+        fps: u32,
     }
 
     impl ScreenCaptureUpdates {
         pub fn with_secondaries(mut self, secondaries: Vec<SecondaryCapture>) -> Self {
             self.secondaries = secondaries;
             self
+        }
+
+        /// Re-modes the display for a live resize and opens the capture that
+        /// the reactivation's `updates()` takes over, so the display settles
+        /// before the reactivation instead of after it. This capture stops
+        /// shipping meanwhile, which leaves the client on its last frame
+        /// rather than a black window.
+        async fn prepare_resize(
+            remode: Option<super::PrimaryRemode>,
+            fps: u32,
+            width: u16,
+            height: u16,
+        ) {
+            let Some(remode) = remode else {
+                return;
+            };
+            let started = Instant::now();
+            let Ok(Some(display_id)) =
+                tokio::task::spawn_blocking(move || remode.apply(width, height)).await
+            else {
+                return;
+            };
+            let stream = async {
+                let content = AsyncSCShareableContent::get()
+                    .await
+                    .map_err(|e| anyhow!("AsyncSCShareableContent::get failed: {e:?}"))?;
+                let displays = content.displays();
+                let display = displays
+                    .iter()
+                    .find(|d| d.display_id() == display_id)
+                    .with_context(|| {
+                        format!("SCK enumeration has no display with id={display_id}")
+                    })?;
+                start_stream(display, width, height, fps, false)
+            };
+            let stream = match stream.await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "opening the resized display's capture failed");
+                    return;
+                }
+            };
+            let first_frame = tokio::time::timeout(RESIZE_FIRST_FRAME_TIMEOUT, next_frame(&stream))
+                .await
+                .ok()
+                .flatten();
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                has_frame = first_frame.is_some(),
+                "resized display's capture ready"
+            );
+            *PREPARED_STREAM
+                .lock()
+                .expect("prepared stream mutex poisoned") = Some(PreparedStream {
+                display_id,
+                size: (width, height),
+                stream,
+                first_frame,
+            });
         }
 
         /// Ships the held frame once EGFX takes it. Returns whether it did.
@@ -1502,6 +1697,7 @@ mod macos {
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            remode: Option<super::PrimaryRemode>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1579,43 +1775,12 @@ mod macos {
                 );
             }
 
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-
-            let config = SCStreamConfiguration::new()
-                .with_width(u32::from(width))
-                .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
-                // Hide the macOS cursor in the captured framebuffer; we forward
-                // it separately as RGBAPointer so the client renders its own
-                // (real-shape) cursor without doubling up.
-                .with_shows_cursor(false)
-                // Aspect handling on a scaling (non-native) capture:
-                //   * letterbox=false (default for explicit --width/--height, or
-                //     auto-size + --stretch): stretch the source to fill the
-                //     output exactly — no black bars, but distorts on aspect
-                //     mismatch.
-                //   * letterbox=true (auto-size default): preserve the Mac's
-                //     aspect ratio, padding with black bars. input.rs maps mouse
-                //     coords into the centered content sub-rect to keep clicks
-                //     aligned (the stretch path needs no such correction, which
-                //     is why fill used to be the only mode).
-                //
-                // Apple replaced `scalesToFit` with `preservesAspectRatio`
-                // (inverse semantics) in macOS 14; on 14+ the newer property is
-                // what takes effect. `scales_to_fit(true)` stays set so the
-                // source scales to the output either way; `preserves_aspect_ratio`
-                // is the knob that picks letterbox vs stretch.
-                .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(letterbox);
-
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
-            stream
-                .start_capture()
-                .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let display_id = display.display_id();
+            let (stream, held_frame) =
+                match take_prepared_stream(display_id, (width, height)).filter(|_| !letterbox) {
+                    Some(prepared) => (prepared.stream, prepared.first_frame),
+                    None => (start_stream(display, width, height, fps, letterbox)?, None),
+                };
 
             // Cursor scale = session framebuffer px ÷ display backing px.
             // SkyLight hands the cursor back at the display's backing pixels;
@@ -1681,8 +1846,10 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
-                held_frame: None,
+                held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
+                remode,
+                fps,
             })
         }
     }
@@ -1818,6 +1985,7 @@ mod macos {
                 // MonitorLayout PDU) — silently snapping the resize back
                 // before the next frame ships.
                 if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
+                    Self::prepare_resize(self.remode.clone(), self.fps, w, h).await;
                     self.desktop_size.set(w, h);
                     self.suppress_next_adopt.store(true, Ordering::Relaxed);
                     if let Some(gfx) = self.gfx.as_ref() {
