@@ -582,6 +582,11 @@ MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = unca
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
 ```
 
+Encoder mode (env, **settable through `config.env`** as `VT_LOW_LATENCY`):
+```
+MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
+```
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.
