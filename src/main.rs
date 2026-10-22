@@ -2495,6 +2495,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // Per-stage latency histograms in the log; see src/latency_trace.rs.
         ("LATENCY_TRACE", "MACRDP_LATENCY_TRACE"),
         ("VT_LOW_LATENCY", "MACRDP_VT_LOW_LATENCY"),
+        ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         (
             "BLANK_RECOVERY_MIN_RENDER_REPORTS",
             "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
@@ -2889,11 +2890,12 @@ async fn async_main() -> Result<()> {
             let h = args
                 .height
                 .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            // 60 Hz: real displays bottom out around 24 Hz. Refresh rate is
-            // metadata here (capture cadence is governed by --fps); pass a
-            // safe value so CGVirtualDisplay doesn't reject the mode.
-            let vd = virtual_display::VirtualDisplay::new(u32::from(w), u32::from(h), 60)
-                .context("attaching virtual display")?;
+            let vd = virtual_display::VirtualDisplay::new(
+                u32::from(w),
+                u32::from(h),
+                virtual_display::refresh_hz(),
+            )
+            .context("attaching virtual display")?;
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
