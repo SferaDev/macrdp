@@ -284,38 +284,9 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
-/// Wheel units per posted scroll line; see `Inner::scroll`.
-const SCROLL_UNITS_PER_LINE: i32 = 60;
-
-/// Adds a wheel delta to the running total and returns the lines to post (at
-/// most 5 per event) and the new total. Whatever the cap cuts off is dropped,
-/// and a reversal starts from zero.
-fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
-    let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
-        delta
-    } else {
-        accum + delta
-    };
-    let lines = accum / SCROLL_UNITS_PER_LINE;
-    (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
-}
-
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, scroll_lines, should_remap_click};
-
-    #[test]
-    fn scroll_drops_what_the_cap_cuts_off() {
-        assert_eq!(scroll_lines(0, -1236), (-5, -36));
-        assert_eq!(scroll_lines(0, 30), (0, 30));
-        assert_eq!(scroll_lines(30, 30), (1, 0));
-    }
-
-    #[test]
-    fn scroll_reversal_ignores_the_previous_direction() {
-        let (_, accum) = scroll_lines(0, -1236);
-        assert_eq!(scroll_lines(accum, 120), (2, 0));
-    }
+    use super::{is_remappable_shortcut, map_client_to_display, should_remap_click};
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
     /// flag is on, a plain Ctrl is held (no Cmd, no Alt), and the frontmost app
@@ -687,6 +658,7 @@ mod macos {
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
     use super::DisplayRect;
 
+    use crate::scroll::{Source, Unit};
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
     use core_graphics::event::{
@@ -699,6 +671,11 @@ mod macos {
     use ironrdp_server::{KeyboardEvent, MouseEvent};
     use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
     use tracing::{debug, trace, warn};
+
+    // kCGScrollWheelEventScrollPhase / kCGScrollWheelEventMomentumPhase,
+    // which core-graphics does not name.
+    const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99;
+    const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123;
 
     // kVK_* constants we match on for symbolic-hotkey interception.
     const VK_TAB: u16 = 0x30;
@@ -974,13 +951,8 @@ mod macos {
         click_left: Option<ClickState>,
         click_right: Option<ClickState>,
         click_middle: Option<ClickState>,
-        // Running remainder of raw wheel units not yet converted to a whole
-        // line, carried across calls. See `scroll()` — without this, a
-        // client that slices a gesture into many small per-event deltas
-        // (observed: magnitude ~2-40, not one 120-per-notch value) has
-        // nearly every event truncated to zero and the scroll never moves.
-        scroll_v_accum: i32,
-        scroll_h_accum: i32,
+        // Wheel remainders and the open trackpad gesture; see `scroll()`.
+        scroller: crate::scroll::Scroller,
         // Virtual keycodes whose key-down we intercepted as a symbolic
         // hotkey (Cmd+Tab, Cmd+Space, screencapture combos). The matching
         // key-up gets swallowed too so the focused app doesn't see a bare
@@ -1085,8 +1057,7 @@ mod macos {
                 click_left: None,
                 click_right: None,
                 click_middle: None,
-                scroll_v_accum: 0,
-                scroll_h_accum: 0,
+                scroller: crate::scroll::Scroller::default(),
                 consumed_keys: HashSet::new(),
                 remapped_keys: HashSet::new(),
                 left_click_remapped: false,
@@ -1255,6 +1226,9 @@ mod macos {
                 }
                 if self.middle_down {
                     self.button(CGMouseButton::Center, false);
+                }
+                if let Some(post) = self.scroller.close() {
+                    self.post_scroll(post);
                 }
             }
 
@@ -1786,8 +1760,16 @@ mod macos {
                 MouseEvent::RightReleased => self.button(CGMouseButton::Right, false),
                 MouseEvent::MiddlePressed => self.button(CGMouseButton::Center, true),
                 MouseEvent::MiddleReleased => self.button(CGMouseButton::Center, false),
-                MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
-                MouseEvent::Scroll { x, y } => self.scroll(y, x),
+                MouseEvent::VerticalScroll { value } => {
+                    self.scroll(i64::from(value) << 16, 0, Source::Legacy);
+                }
+                MouseEvent::HorizontalScroll { value } => {
+                    self.scroll(0, i64::from(value) << 16, Source::Legacy);
+                }
+                MouseEvent::Scroll { x, y } => self.scroll(y.into(), x.into(), Source::Legacy),
+                MouseEvent::ScrollEx { x, y, flags } => {
+                    self.scroll(y.into(), x.into(), Source::from_ainput_flags(flags));
+                }
                 MouseEvent::Button4Pressed
                 | MouseEvent::Button4Released
                 | MouseEvent::Button5Pressed
@@ -1983,27 +1965,31 @@ mod macos {
             }
         }
 
-        fn scroll(&mut self, vertical: i32, horizontal: i32) {
-            // RDP wheel rotation units are 120 per "tick", but this client
-            // slices a single gesture into many small legacy MOUSE PDU
-            // events (observed raw magnitude ~2-40 per event, not one
-            // 120-per-notch value). A flat per-event division
-            // truncates almost every one of those to zero — scroll never
-            // moves at all. Accumulate the raw delta across calls instead,
-            // and only emit whole lines once the running total crosses
-            // SCROLL_UNITS_PER_LINE (see `scroll_lines`).
-            let (v, v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
-            let (h, h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
-            self.scroll_v_accum = v_accum;
-            self.scroll_h_accum = h_accum;
-            if v == 0 && h == 0 {
-                return;
+        fn scroll(&mut self, vertical: i64, horizontal: i64, source: Source) {
+            // Plain wheel PDUs come in slices of a notch (~2-40 units from the
+            // Windows App) and FreeRDP's ainput in 16.16 fixed point, so the
+            // scroller carries fractions across events. Our FreeRDP client
+            // adds the trackpad's gesture and momentum phases: posting them
+            // as a local trackpad would is what gives apps their own
+            // inertia handling, rubber-banding and precise small movements.
+            if let Some(post) = self.scroller.feed(vertical, horizontal, source) {
+                self.post_scroll(post);
             }
-            let Ok(ev) =
-                CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::LINE, 2, v, h, 0)
+        }
+
+        fn post_scroll(&self, post: crate::scroll::Post) {
+            // Pixel events come out continuous; line events stay discrete like
+            // a notched wheel's.
+            let unit = match post.unit {
+                Unit::Pixel => ScrollEventUnit::PIXEL,
+                Unit::Line => ScrollEventUnit::LINE,
+            };
+            let Ok(ev) = CGEvent::new_scroll_event(self.source.clone(), unit, 2, post.v, post.h, 0)
             else {
                 return;
             };
+            ev.set_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE, post.phase.cg_value());
+            ev.set_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE, post.momentum.cg_value());
             // Carry the held modifiers so Shift+scroll (horizontal in most apps)
             // and Cmd+scroll (zoom) work, same as clicks and drags. Deliberately
             // NO Ctrl→Cmd swap here: the remap's promise is scoped to the
