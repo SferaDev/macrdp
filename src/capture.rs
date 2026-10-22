@@ -1275,6 +1275,7 @@ fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
 mod macos {
     use super::*;
 
+    use crate::damage::{Damage, Rect};
     use crate::sck_stream::{CaptureStream, StreamParams};
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::AsyncSCShareableContent;
@@ -1396,6 +1397,15 @@ mod macos {
         })
     }
 
+    /// `dirty`, unless a rect reaches past the `width`×`height` buffer: then
+    /// they aren't in buffer pixels and the whole frame is compared instead.
+    fn trusted_dirty(dirty: Option<&[Dirty]>, width: usize, height: usize) -> Option<&[Dirty]> {
+        dirty.filter(|d| {
+            d.iter()
+                .all(|&(x, y, w, h)| x + w <= width && y + h <= height)
+        })
+    }
+
     /// The last frame a capture took, kept to tell a real change from SCK
     /// redrawing identical pixels (a menu bar clock with seconds re-renders
     /// every frame) and to offer a dropped frame again.
@@ -1406,27 +1416,45 @@ mod macos {
     }
 
     impl LastFrame {
-        /// Whether `src` differs from the kept frame inside `dirty` (the whole
-        /// frame when `None`), copying the differing rows in so the kept frame
-        /// becomes `src`.
-        fn update(&mut self, src: &[u8], stride: usize, dirty: Option<&[Dirty]>) -> bool {
+        /// Where `src` differs from the kept frame inside `dirty` (the whole
+        /// frame when `None`): per dirty rect, the bounding box of its changed
+        /// pixels. Empty when nothing changed. Copies the differing rows in so
+        /// the kept frame becomes `src`.
+        fn update(&mut self, src: &[u8], stride: usize, dirty: Option<&[Dirty]>) -> Vec<Dirty> {
             if self.stride != stride || self.pixels.len() != src.len() || stride == 0 {
                 self.pixels.clear();
                 self.pixels.extend_from_slice(src);
                 self.stride = stride;
-                return true;
+                return vec![(0, 0, stride / 4, src.len() / stride.max(1))];
             }
             let rows = src.len() / stride;
             let whole = [(0, 0, stride / 4, rows)];
-            let mut changed = false;
+            let mut changed = Vec::new();
             for &(x, y, w, h) in dirty.unwrap_or(&whole) {
                 let (x0, x1) = ((x * 4).min(stride), ((x + w) * 4).min(stride));
+                // Changed byte columns [min, max) and rows [top, bottom).
+                let (mut min, mut max) = (x1, x0);
+                let (mut top, mut bottom) = (usize::MAX, 0);
                 for row in y.min(rows)..(y + h).min(rows) {
-                    let span = row * stride + x0..row * stride + x1;
-                    if self.pixels[span.clone()] != src[span.clone()] {
-                        self.pixels[span.clone()].copy_from_slice(&src[span]);
-                        changed = true;
+                    let base = row * stride;
+                    let (old, new) = (&self.pixels[base..base + stride], &src[base..base + stride]);
+                    if old[x0..x1] == new[x0..x1] {
+                        continue;
                     }
+                    top = top.min(row);
+                    bottom = row + 1;
+                    // Only the parts outside the columns found so far can widen them.
+                    if let Some(i) = (x0..min).find(|&i| old[i] != new[i]) {
+                        min = i;
+                    }
+                    if let Some(i) = (max.max(min)..x1).rev().find(|&i| old[i] != new[i]) {
+                        max = i + 1;
+                    }
+                    self.pixels[base + x0..base + x1].copy_from_slice(&new[x0..x1]);
+                }
+                if top < bottom {
+                    let (px0, px1) = (min / 4, max.div_ceil(4));
+                    changed.push((px0, top, px1 - px0, bottom - top));
                 }
             }
             changed
@@ -1472,6 +1500,8 @@ mod macos {
                 // leave that change off screen until the next one.
                 let mut last = LastFrame::default();
                 let mut pending = false;
+                // What changed since the encoder last took a frame.
+                let mut damage = Damage::default();
                 loop {
                     let next = if pending {
                         tokio::time::timeout(retry, stream.next()).await
@@ -1494,27 +1524,43 @@ mod macos {
                             let changed = last.update(
                                 guard.as_slice(),
                                 guard.bytes_per_row(),
-                                dirty.as_deref(),
+                                trusted_dirty(dirty.as_deref(), guard.width(), guard.height()),
                             );
                             drop(guard);
-                            if !changed && !pending && !gfx.output_keyframe_pending(output) {
+                            if changed.is_empty()
+                                && !pending
+                                && !gfx.output_keyframe_pending(output)
+                            {
                                 continue;
                             }
+                            damage.add_rects(
+                                changed
+                                    .iter()
+                                    .map(|&(x, y, w, h)| Rect::from_xywh(x, y, w, h)),
+                            );
                         }
                         Ok(None) => break,
-                        Err(_) => {}
+                        // The dropped frame again, after a frame interval.
+                        Err(_) => damage = Damage::Full,
                     }
                     if last.pixels.is_empty() {
                         continue;
                     }
-                    match gfx.submit_output_bgra(output, &last.pixels, last.stride) {
+                    let frame_damage = if damage.is_empty() {
+                        Damage::Full
+                    } else {
+                        damage.clone()
+                    };
+                    match gfx.submit_output_bgra(output, &last.pixels, last.stride, frame_damage) {
                         Ok(crate::h264::OutputSubmit::Encoded) => {
                             pending = false;
+                            damage = Damage::default();
                         }
                         Ok(_) => pending = true,
                         Err(e) => {
                             tracing::warn!(error = ?e, output, "EGFX submit for a secondary monitor failed");
                             pending = false;
+                            damage = Damage::Full;
                         }
                     }
                 }
@@ -1659,6 +1705,12 @@ mod macos {
         resubmit: bool,
         /// The last captured frame, for telling real changes from redraws.
         last_frame_kept: LastFrame,
+        /// What changed since EGFX last took a frame: the regions the next
+        /// one ships with.
+        damage: Damage,
+        /// The regions of the last frame EGFX took, for the flush burst's
+        /// repeats of it.
+        last_damage: Damage,
         /// Re-modes the display ahead of a live resize; `None` outside
         /// single-monitor virtual-display sessions.
         remode: Option<super::PrimaryRemode>,
@@ -1733,10 +1785,14 @@ mod macos {
 
         /// Offers the frame EGFX dropped again.
         fn offer_last_frame(&mut self) {
-            match self.submit_last_frame() {
+            match self.submit_last_frame(Damage::Full) {
                 None => self.resubmit = false,
                 Some(Ok(crate::h264::OutputSubmit::Busy)) => {}
-                Some(Ok(_)) => self.resubmit = false,
+                Some(Ok(_)) => {
+                    self.resubmit = false;
+                    self.damage = Damage::default();
+                    self.last_damage = Damage::Full;
+                }
                 Some(Err(e)) => {
                     tracing::warn!(error = ?e, "EGFX resubmit failed");
                     self.resubmit = false;
@@ -1746,13 +1802,15 @@ mod macos {
 
         /// Submits the retained last frame as a non-keyframe; `None` when
         /// there is no EGFX channel or no frame yet.
-        fn submit_last_frame(&self) -> Option<Result<crate::h264::OutputSubmit>> {
+        fn submit_last_frame(&self, damage: Damage) -> Option<Result<crate::h264::OutputSubmit>> {
             let gfx = self.gfx.as_ref()?;
             let pb = self.last_frame.as_ref()?;
             Some(
                 pb.lock(CVPixelBufferLockFlags::READ_ONLY)
                     .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))
-                    .and_then(|g| gfx.submit_bgra_status(g.as_slice(), g.bytes_per_row(), false)),
+                    .and_then(|g| {
+                        gfx.submit_bgra_status(g.as_slice(), g.bytes_per_row(), false, damage)
+                    }),
             )
         }
 
@@ -1764,9 +1822,11 @@ mod macos {
             let submitted = held
                 .lock(CVPixelBufferLockFlags::READ_ONLY)
                 .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))
-                .and_then(|g| gfx.submit_bgra(g.as_slice(), g.bytes_per_row(), true));
+                .and_then(|g| gfx.submit_bgra(g.as_slice(), g.bytes_per_row(), true, Damage::Full));
             match submitted {
                 Ok(true) => {
+                    self.damage = Damage::default();
+                    self.last_damage = Damage::Full;
                     self.last_frame = self.held_frame.take();
                     self.flush_remaining = self.flush_frames;
                     self.seeded = true;
@@ -1973,6 +2033,8 @@ mod macos {
                 hold_until: Instant::now() + EGFX_READY_GRACE,
                 resubmit: false,
                 last_frame_kept: LastFrame::default(),
+                damage: Damage::default(),
+                last_damage: Damage::Full,
                 remode,
                 display_id,
                 fps,
@@ -2238,6 +2300,7 @@ mod macos {
                                                     g.as_slice(),
                                                     g.bytes_per_row(),
                                                     false,
+                                                    self.last_damage.clone(),
                                                 )
                                             });
                                         if let Err(e) = res {
@@ -2263,18 +2326,31 @@ mod macos {
                     if sample.frame_status().is_some_and(|s| !s.has_content()) {
                         continue;
                     }
+                    // A scaling capture's dirty rects are in source coordinates.
+                    let force_full_frame = self.force_full_frame;
                     let changed = match sample.image_buffer().map(|pb| {
                         pb.lock(CVPixelBufferLockFlags::READ_ONLY).map(|guard| {
+                            let dirty = if force_full_frame {
+                                None
+                            } else {
+                                trusted_dirty(dirty.as_deref(), guard.width(), guard.height())
+                            };
                             self.last_frame_kept.update(
                                 guard.as_slice(),
                                 guard.bytes_per_row(),
-                                dirty.as_deref(),
+                                dirty,
                             )
                         })
                     }) {
                         Some(Ok(changed)) => changed,
                         _ => continue,
                     };
+                    self.damage.add_rects(
+                        changed
+                            .iter()
+                            .map(|&(x, y, w, h)| Rect::from_xywh(x, y, w, h)),
+                    );
+                    let changed = !changed.is_empty();
                     // See the secondary capture: skip re-encoding an unchanged
                     // frame unless a dropped one waits, a keyframe is pending
                     // or the suppress gate needs to see this iteration.
@@ -2287,7 +2363,7 @@ mod macos {
                         // idle timeout never fires; run it from here.
                         if self.flush_remaining > 0 && self.last_frame.is_some() {
                             self.flush_remaining -= 1;
-                            if let Some(Err(e)) = self.submit_last_frame() {
+                            if let Some(Err(e)) = self.submit_last_frame(self.last_damage.clone()) {
                                 tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                             }
                         }
@@ -2418,10 +2494,26 @@ mod macos {
                     } else {
                         false
                     };
+                    // Nothing recorded (before the first EGFX frame, or a frame
+                    // offered again without a change) ships the whole surface.
+                    let damage = if self.damage.is_empty() {
+                        Damage::Full
+                    } else {
+                        self.damage.clone()
+                    };
                     match gfx
-                        .submit_bgra_status(src, stride_bytes, big_change || resume_keyframe)
+                        .submit_bgra_status(
+                            src,
+                            stride_bytes,
+                            big_change || resume_keyframe,
+                            damage.clone(),
+                        )
                         .map(|status| {
                             self.resubmit = status == crate::h264::OutputSubmit::Busy;
+                            if status == crate::h264::OutputSubmit::Encoded {
+                                self.damage = Damage::default();
+                                self.last_damage = damage;
+                            }
                             status != crate::h264::OutputSubmit::NotReady
                         }) {
                         Ok(true) => {
@@ -2513,26 +2605,56 @@ mod macos {
             let stride = 8 * 4;
             let mut a = vec![0u8; stride * 4];
             let mut last = LastFrame::default();
-            assert!(last.update(&a, stride, None), "first frame is a change");
+            assert_eq!(
+                last.update(&a, stride, None),
+                vec![(0, 0, 8, 4)],
+                "first frame"
+            );
             assert!(
-                !last.update(&a, stride, Some(&[(0, 0, 8, 4)])),
+                last.update(&a, stride, Some(&[(0, 0, 8, 4)])).is_empty(),
                 "identical redraw"
             );
             a[stride * 2 + 5 * 4] = 9;
             assert!(
-                !last.update(&a, stride, Some(&[(0, 0, 4, 2)])),
+                last.update(&a, stride, Some(&[(0, 0, 4, 2)])).is_empty(),
                 "outside the dirty rect"
             );
-            assert!(last.update(&a, stride, Some(&[(4, 1, 4, 2)])));
+            assert_eq!(
+                last.update(&a, stride, Some(&[(4, 1, 4, 2)])),
+                vec![(5, 2, 1, 1)]
+            );
             assert_eq!(last.pixels, a);
             a[0] = 1;
-            assert!(
+            assert_eq!(
                 last.update(&a, stride, None),
+                vec![(0, 0, 1, 1)],
                 "no rects compares the whole frame"
             );
             assert!(
-                !last.update(&a, stride, Some(&[(6, 3, 100, 100)])),
+                last.update(&a, stride, Some(&[(6, 3, 100, 100)]))
+                    .is_empty(),
                 "clipped rect"
+            );
+        }
+
+        #[test]
+        fn bounds_every_changed_pixel_of_each_dirty_rect() {
+            let stride = 16 * 4;
+            let mut a = vec![0u8; stride * 8];
+            let mut last = LastFrame::default();
+            last.update(&a, stride, None);
+            // Changes in the middle, then further left on a lower row, then
+            // further right on a row in between.
+            a[stride + 7 * 4 + 2] = 1;
+            a[stride * 5 + 2 * 4] = 1;
+            a[stride * 3 + 12 * 4 + 3] = 1;
+            assert_eq!(last.update(&a, stride, None), vec![(2, 1, 11, 5)]);
+            assert_eq!(last.pixels, a);
+            a[stride * 6 + 15 * 4] = 7;
+            a[stride * 6 + 4] = 7;
+            assert_eq!(
+                last.update(&a, stride, Some(&[(0, 0, 8, 8), (8, 0, 8, 8)])),
+                vec![(1, 6, 1, 1), (15, 6, 1, 1)]
             );
         }
     }

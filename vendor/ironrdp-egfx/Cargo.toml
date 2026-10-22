@@ -1,0 +1,52 @@
+[package]
+name = "ironrdp-egfx"
+version = "0.3.0"
+readme = "README.md"
+description = "Graphics pipeline dynamic channel extension implementation"
+# Vendored copy of upstream ironrdp-egfx (copied 2026-10-22 from
+# Devolutions/IronRDP@a5d1c682, same rev as the git pins in the root Cargo.toml).
+# Workspace-inherited fields are inlined below because we're not inside the
+# IronRDP cargo workspace. The divergence: an AVC420 send with an explicit
+# WireToSurface1 destination, so frames can carry changed-region rects. See
+# CLAUDE.md for the divergence log.
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>"]
+keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+test = false
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"], optional = true }
+bit_field = "0.10"
+bitflags = "2.11"
+# path = "../ironrdp-*" entries dropped: we live outside the upstream
+# workspace, so cargo resolves these via the root macrdp Cargo.toml's
+# [patch] redirects (git pin to upstream, vendored ironrdp-dvc).
+ironrdp-core = { version = "0.2" } # public
+ironrdp-dvc = { version = "0.8" } # public
+ironrdp-graphics = { version = "0.9" } # public
+ironrdp-pdu = { version = "0.9" } # public
+openh264 = { version = "0.9", optional = true, default-features = false }
+tracing = { version = "0.1", features = ["log"] }
+
+[features]
+arbitrary = ["dep:arbitrary", "bitflags/arbitrary", "ironrdp-pdu/arbitrary"]
+openh264 = ["dep:openh264"]
+openh264-bundled = ["openh264", "openh264/source"]
+openh264-libloading = ["openh264", "openh264/libloading"]
+
+# Honored ONLY when this crate is built standalone (isolated validation); ignored
+# when it's a path dependency of macrdp (the root Cargo.toml's [patch] wins). Keep
+# the rev in sync with the root Cargo.toml when bumping the IronRDP pin.
+[patch.crates-io]
+ironrdp-core     = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-dvc      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
+ironrdp-pdu      = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }

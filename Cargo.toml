@@ -117,6 +117,10 @@ ironrdp-rdpdr = { path = "vendor/ironrdp-rdpdr" }
 # tunnel. Upstream is client-oriented and errors on the server-inbound
 # SoftSyncResponse. See vendor/ironrdp-dvc/CLAUDE.md.
 ironrdp-dvc = { path = "vendor/ironrdp-dvc" }
+# ironrdp-egfx is vendored (same upstream rev) for an AVC420 send that takes the
+# WireToSurface1 destination, so frames can carry changed-region rects. See
+# vendor/ironrdp-egfx/CLAUDE.md.
+ironrdp-egfx = { path = "vendor/ironrdp-egfx" }
 # ironrdp-rdpeusb: FORK RETIRED at the a5d1c682 pin bump — all four vendored
 # divergences merged upstream (div1 #1418 SupportedUsbVer newtype + USB_32, div2
 # #1513 usb_device match, div3 #1420 UsbConfigDesc.trailing, div4 #1321 completion
@@ -139,7 +143,6 @@ ironrdp-cliprdr          = { git = "https://github.com/Devolutions/IronRDP.git",
 ironrdp-connector        = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-core             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-displaycontrol   = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
-ironrdp-egfx             = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-graphics         = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-pdu              = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }
 ironrdp-rdpsnd           = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a5d1c682fd1f65287f6f5727bdead2aef7a2bea7" }

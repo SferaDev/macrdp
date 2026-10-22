@@ -587,6 +587,17 @@ Encoder mode (env, **settable through `config.env`** as `VT_LOW_LATENCY`):
 MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
 ```
 
+EGFX changed regions (env only). Each AVC420 frame still encodes the whole
+surface, but its metablock lists only the rects that changed (from SCK's dirty
+rects, confirmed by a pixel compare, grown to 16 px macroblocks plus a one
+macroblock margin, at most 8), so the client converts and blits only those.
+Keyframes, the 8 frames after one, resubmits after a busy drop, frames with no
+known damage and changes covering half the surface or more ship whole:
+```
+MACRDP_EGFX_DIRTY_RECTS=1         # 0/off = always the whole surface (the old wire bytes)
+MACRDP_EGFX_FULL_REFRESH_MS=1000  # ship a frame whole when the last whole one is older (0 = never)
+```
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.
