@@ -222,6 +222,33 @@ mod tests {
         );
     }
 
+    /// FreeRDP 3.32 `/multimon` with the same monitors: it announces no scale
+    /// and puts the MacBook panel lower.
+    #[test]
+    fn places_freerdps_layout_as_logged() {
+        let layout = MonitorLayout::from_client(&[
+            client(0, 0, 3439, 1439, true, 100),
+            client(-1080, -227, -1, 1692, false, 100),
+            client(3440, 767, 6463, 2664, false, 100),
+        ])
+        .unwrap();
+        assert_eq!((layout.width, layout.height), (7544, 2892));
+        let placed: Vec<_> = layout
+            .monitors
+            .iter()
+            .map(|m| (m.x, m.y, m.width, m.height, m.scale))
+            .collect();
+        assert_eq!(
+            placed,
+            [
+                (1080, 227, 3440, 1440, 1),
+                (0, 0, 1080, 1920, 1),
+                (4520, 994, 3024, 1898, 1)
+            ]
+        );
+        assert_eq!(layout.origins_pts(), [(0, 0), (-1080, -227), (3440, 767)]);
+    }
+
     #[test]
     fn one_monitor_is_not_a_layout() {
         assert_eq!(

@@ -156,6 +156,88 @@ fn map_client_to_display(
     )
 }
 
+/// A display's global bounds in points: origin x, origin y, width, height.
+type DisplayRect = (f64, f64, f64, f64);
+
+fn rect_is_empty(r: DisplayRect) -> bool {
+    r.2 <= 0.0 || r.3 <= 0.0
+}
+
+fn rect_contains(r: DisplayRect, x: f64, y: f64) -> bool {
+    !rect_is_empty(r) && x >= r.0 && x < r.0 + r.2 && y >= r.1 && y < r.1 + r.3
+}
+
+/// The display serving monitor `i`, or the primary's when that one isn't
+/// active (a display that never came up reports empty bounds).
+fn session_display(
+    layout: &crate::monitor_layout::MonitorLayout,
+    displays: &[DisplayRect],
+    i: usize,
+) -> Option<(usize, DisplayRect)> {
+    [i, layout.primary()].into_iter().find_map(|j| {
+        displays
+            .get(j)
+            .filter(|r| !rect_is_empty(**r))
+            .map(|r| (j, *r))
+    })
+}
+
+/// Maps a point on a multi-monitor session desktop (origin at the monitors'
+/// bounding box) to macOS's global coordinates, through the display serving
+/// the monitor under it. `displays` holds each monitor's display bounds, in the
+/// layout's monitor order. `None` when no display is active.
+///
+/// Pure (no platform deps) so it's unit-tested on every target.
+fn map_session_point(
+    layout: &crate::monitor_layout::MonitorLayout,
+    displays: &[DisplayRect],
+    x: u16,
+    y: u16,
+) -> Option<(f64, f64)> {
+    let i = layout.monitor_at(x, y);
+    let m = layout.monitors[i];
+    let (j, r) = session_display(layout, displays, i)?;
+    // A fallback display gets the point in its own monitor's frame.
+    let m = if j == i { m } else { layout.monitors[j] };
+    let (mx, my) = map_client_to_display(
+        x.saturating_sub(m.x).min(m.width.saturating_sub(1)),
+        y.saturating_sub(m.y).min(m.height.saturating_sub(1)),
+        m.width,
+        m.height,
+        r.2,
+        r.3,
+        false,
+    );
+    Some((r.0 + mx, r.1 + my))
+}
+
+/// Applies a relative pointer move in a multi-monitor session: the delta is in
+/// the pixels of the monitor under the pointer, and the pointer may cross onto
+/// any of the session's displays but stops at their outer edges.
+fn move_session_rel(
+    layout: &crate::monitor_layout::MonitorLayout,
+    displays: &[DisplayRect],
+    (px, py): (f64, f64),
+    dx: i32,
+    dy: i32,
+) -> Option<(f64, f64)> {
+    let current = displays
+        .iter()
+        .position(|r| rect_contains(*r, px, py))
+        .unwrap_or(layout.primary());
+    let (j, r) = session_display(layout, displays, current)?;
+    let m = layout.monitors[j];
+    let tx = px + f64::from(dx) * r.2 / f64::from(m.width.max(1));
+    let ty = py + f64::from(dy) * r.3 / f64::from(m.height.max(1));
+    if displays.iter().any(|d| rect_contains(*d, tx, ty)) {
+        return Some((tx, ty));
+    }
+    Some((
+        tx.clamp(r.0, r.0 + r.2 - 1.0),
+        ty.clamp(r.1, r.1 + r.3 - 1.0),
+    ))
+}
+
 /// macOS virtual keycodes whose `Ctrl+<key>` combo is remapped to `Cmd+<key>`
 /// under --map-ctrl-to-cmd: C V X A Z S F N T W O P R G , (copy / paste / cut /
 /// select-all / undo / save / find / new / new-tab / close / open / print /
@@ -332,6 +414,100 @@ mod coord_tests {
     }
 }
 
+#[cfg(test)]
+mod session_coord_tests {
+    use super::{map_session_point, move_session_rel, DisplayRect};
+    use crate::monitor_layout::{Monitor, MonitorLayout};
+
+    /// FreeRDP 3.32 `/multimon` on endor as macrdp logged it: an ultrawide
+    /// primary, a portrait monitor to its upper left and the MacBook panel to
+    /// its lower right, on a 7544x2892 desktop.
+    fn freerdp_layout() -> MonitorLayout {
+        let m = |x, y, width, height, primary| Monitor {
+            x,
+            y,
+            width,
+            height,
+            scale: 1,
+            primary,
+        };
+        MonitorLayout {
+            width: 7544,
+            height: 2892,
+            monitors: vec![
+                m(1080, 227, 3440, 1440, true),
+                m(0, 0, 1080, 1920, false),
+                m(4520, 994, 3024, 1898, false),
+            ],
+        }
+    }
+
+    /// The displays macrdp arranged for it: placements
+    /// `[(157, 0, 0), (158, -1080, -227), (159, 3440, 767)]`.
+    const DISPLAYS: [DisplayRect; 3] = [
+        (0.0, 0.0, 3440.0, 1440.0),
+        (-1080.0, -227.0, 1080.0, 1920.0),
+        (3440.0, 767.0, 3024.0, 1898.0),
+    ];
+
+    fn map(displays: &[DisplayRect], x: u16, y: u16) -> Option<(f64, f64)> {
+        map_session_point(&freerdp_layout(), displays, x, y)
+    }
+
+    #[test]
+    fn each_monitors_corners_land_on_its_displays_corners() {
+        let cases = [
+            ((1080, 227), (0.0, 0.0)),
+            ((4519, 1666), (3439.0, 1439.0)),
+            ((0, 0), (-1080.0, -227.0)),
+            ((1079, 1919), (-1.0, 1692.0)),
+            ((4520, 994), (3440.0, 767.0)),
+            ((7543, 2891), (6463.0, 2664.0)),
+        ];
+        for ((x, y), want) in cases {
+            assert_eq!(map(&DISPLAYS, x, y), Some(want), "client point {x},{y}");
+        }
+    }
+
+    #[test]
+    fn a_point_between_monitors_clamps_onto_the_nearest() {
+        // Below the portrait monitor, left of the primary's bottom edge.
+        assert_eq!(map(&DISPLAYS, 500, 2500), Some((-580.0, 1692.0)));
+        // Above the MacBook panel, right of the primary.
+        assert_eq!(map(&DISPLAYS, 6000, 100), Some((4920.0, 767.0)));
+    }
+
+    #[test]
+    fn a_2x_display_takes_the_monitors_pixels_at_half_size() {
+        let mut displays = DISPLAYS;
+        displays[2] = (3440.0, 767.0, 1512.0, 949.0);
+        assert_eq!(
+            map(&displays, 4520 + 1512, 994 + 949),
+            Some((3440.0 + 756.0, 767.0 + 474.5))
+        );
+    }
+
+    #[test]
+    fn a_monitor_without_an_active_display_lands_on_the_primary() {
+        let mut displays = DISPLAYS;
+        displays[2] = (0.0, 0.0, 0.0, 0.0);
+        assert_eq!(map(&displays, 5000, 1500), Some((3439.0, 1273.0)));
+        assert_eq!(map(&[(0.0, 0.0, 0.0, 0.0); 3], 5000, 1500), None);
+    }
+
+    #[test]
+    fn relative_moves_cross_between_displays_but_stop_at_outer_edges() {
+        let layout = freerdp_layout();
+        let rel = |from, dx, dy| move_session_rel(&layout, &DISPLAYS, from, dx, dy);
+        // Off the primary's right edge, level with the MacBook panel.
+        assert_eq!(rel((3439.0, 1000.0), 10, 0), Some((3449.0, 1000.0)));
+        // Off the primary's right edge above the MacBook panel: nothing there.
+        assert_eq!(rel((3439.0, 100.0), 10, 0), Some((3439.0, 100.0)));
+        // Off the primary's left edge onto the portrait monitor.
+        assert_eq!(rel((0.0, 500.0), -10, 0), Some((-10.0, 500.0)));
+    }
+}
+
 /// When true, Cmd+Tab un-minimizes the target app's window (sets `AXMinimized`
 /// to false) instead of leaving it minimized in the Dock. Off by default, which
 /// matches native macOS Cmd+Tab (it activates the app but doesn't restore a
@@ -480,6 +656,7 @@ mod macos {
 
     use super::is_remappable_shortcut;
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
+    use super::DisplayRect;
 
     use anyhow::{anyhow, Result};
     use core_graphics::display::CGDisplay;
@@ -731,6 +908,9 @@ mod macos {
         }
     }
 
+    /// A multi-monitor session's layout and each monitor's display bounds.
+    type SessionGeometry = (crate::monitor_layout::MonitorLayout, Vec<DisplayRect>);
+
     pub struct Inner {
         source: CGEventSource,
         // Source for modifier FlagsChanged events. See `Inner::new`.
@@ -754,6 +934,10 @@ mod macos {
         // reconfig mis-maps moves for < the TTL before self-correcting.
         cached_bounds: Option<(f64, f64, f64, f64)>,
         bounds_cached_at: Instant,
+        // The same cache for a multi-monitor session's layout and display
+        // bounds (see `session_geometry`); the inner `None` caches "no session".
+        cached_session: Option<Option<SessionGeometry>>,
+        session_cached_at: Instant,
         // Per-button click history so a quick second press at (roughly) the
         // same spot becomes click_count=2 and Finder recognises a double-
         // click. Without this every press has click_count=1 implicitly and
@@ -867,6 +1051,8 @@ mod macos {
                 target_display_id,
                 cached_bounds: None,
                 bounds_cached_at: Instant::now(),
+                cached_session: None,
+                session_cached_at: Instant::now(),
                 click_left: None,
                 click_right: None,
                 click_middle: None,
@@ -911,6 +1097,29 @@ mod macos {
             self.cached_bounds = Some(bounds);
             self.bounds_cached_at = Instant::now();
             bounds
+        }
+
+        /// A multi-monitor session's layout and each monitor's display bounds,
+        /// through the `target_bounds` TTL cache. `None` outside one.
+        fn session_geometry(&mut self) -> Option<&SessionGeometry> {
+            if self.cached_session.is_none()
+                || self.session_cached_at.elapsed() >= Self::BOUNDS_CACHE_TTL
+            {
+                let geometry = crate::virtual_display::session_monitors().map(|s| {
+                    let rects = s
+                        .display_ids
+                        .iter()
+                        .map(|&id| {
+                            let b = CGDisplay::new(id).bounds();
+                            (b.origin.x, b.origin.y, b.size.width, b.size.height)
+                        })
+                        .collect();
+                    (s.layout, rects)
+                });
+                self.cached_session = Some(geometry);
+                self.session_cached_at = Instant::now();
+            }
+            self.cached_session.as_ref().and_then(Option::as_ref)
         }
 
         pub fn keyboard(&mut self, event: KeyboardEvent) {
@@ -1560,22 +1769,13 @@ mod macos {
         }
 
         fn move_to(&mut self, x: u16, y: u16, desktop_w: u16, desktop_h: u16, letterbox: bool) {
-            if let Some(session) = crate::virtual_display::session_monitors() {
-                // A multi-monitor desktop spans every monitor: land on the
-                // display serving the monitor under the pointer.
-                let i = session.layout.monitor_at(x, y);
-                let m = session.layout.monitors[i];
-                let b = CGDisplay::new(session.display_ids[i]).bounds();
-                let (mx, my) = super::map_client_to_display(
-                    x.saturating_sub(m.x).min(m.width - 1),
-                    y.saturating_sub(m.y).min(m.height - 1),
-                    m.width,
-                    m.height,
-                    b.size.width,
-                    b.size.height,
-                    false,
-                );
-                self.post_move(b.origin.x + mx, b.origin.y + my);
+            // A multi-monitor desktop spans every monitor: land on the display
+            // serving the monitor under the pointer.
+            let session_point = self
+                .session_geometry()
+                .and_then(|(layout, displays)| super::map_session_point(layout, displays, x, y));
+            if let Some((sx, sy)) = session_point {
+                self.post_move(sx, sy);
                 return;
             }
             // Scale desktop coords → screen points, then translate into the
@@ -1603,6 +1803,14 @@ mod macos {
         /// on it for some or all pointer motion — left the cursor unable to
         /// reach the screen edge at all.
         fn move_rel(&mut self, dx: i32, dy: i32, desktop_w: u16, desktop_h: u16) {
+            let last = (self.last_x, self.last_y);
+            let session_point = self.session_geometry().and_then(|(layout, displays)| {
+                super::move_session_rel(layout, displays, last, dx, dy)
+            });
+            if let Some((sx, sy)) = session_point {
+                self.post_move(sx, sy);
+                return;
+            }
             let (ox, oy, sw, sh) = self.target_bounds();
             // Deltas are session pixels and the target is points, as in `move_to`.
             let sx = (self.last_x + f64::from(dx) * sw / f64::from(desktop_w.max(1)))
