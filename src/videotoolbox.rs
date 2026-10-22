@@ -649,6 +649,13 @@ mod ffi {
         if prepared != 0 {
             bail!("VTCompressionSessionPrepareToEncodeFrames failed: OSStatus {prepared}");
         }
+        tracing::info!(
+            width,
+            height,
+            low_latency,
+            hardware = ?using_hardware(&guard),
+            "VideoToolbox session ready"
+        );
         Ok(guard)
     }
 
@@ -685,16 +692,40 @@ mod ffi {
         )
     }
 
+    extern "C" {
+        fn VTSessionCopyProperty(
+            session: VTCompressionSessionRef,
+            key: CFStringRef,
+            allocator: CFAllocatorRef,
+            value_out: *mut CFTypeRef,
+        ) -> OSStatus;
+        static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
+    }
+
+    /// Whether VT picked the hardware encoder for this session; `None` if it
+    /// doesn't say.
+    pub(super) fn using_hardware(guard: &SessionGuard) -> Option<bool> {
+        unsafe {
+            let mut value: CFTypeRef = ptr::null();
+            let st = VTSessionCopyProperty(
+                guard.session,
+                kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                ptr::null(),
+                &mut value,
+            );
+            if st != 0 || value.is_null() {
+                return None;
+            }
+            let hw = value == kCFBooleanTrue;
+            CFRelease(value);
+            Some(hw)
+        }
+    }
+
     /// Reads back `MaxFrameDelayCount`, to confirm VT took the zero.
     #[cfg(test)]
     pub(super) fn max_frame_delay_count(guard: &SessionGuard) -> Option<i32> {
         extern "C" {
-            fn VTSessionCopyProperty(
-                session: VTCompressionSessionRef,
-                key: CFStringRef,
-                allocator: CFAllocatorRef,
-                value_out: *mut CFTypeRef,
-            ) -> OSStatus;
             fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> Boolean;
         }
         unsafe {
@@ -1774,6 +1805,9 @@ mod tests {
             let guard = guard.unwrap();
             // Low-latency rate control has no frame delay and doesn't expose
             // the property at all.
+            // The low-latency encoder is hardware-only and doesn't report it.
+            let hw = super::ffi::using_hardware(&guard);
+            assert!(hw == Some(true) || (low_latency && hw.is_none()), "low_latency={low_latency}: {hw:?}");
             let expected = if low_latency { None } else { Some(0) };
             assert_eq!(
                 super::ffi::max_frame_delay_count(&guard),
@@ -1818,6 +1852,7 @@ mod tests {
                 }
             }
             let mut enc = Encoder::new(w, h, FPS, 20_000_000, 2.0).unwrap();
+            println!("  {w}x{h}: hardware={:?}", super::ffi::using_hardware(&enc.inner));
             let rx = enc.take_receiver().unwrap();
             let submits: Arc<Mutex<HashMap<i64, Instant>>> = Arc::default();
             let collector = {
