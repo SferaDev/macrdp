@@ -731,6 +731,33 @@ mod macos {
                 "physical displays detached"
             );
 
+            // Parking the panel beside the virtual display can overlap a
+            // multi-monitor session's other displays, which macOS then shoves
+            // aside; put them back where the client has them.
+            if let Some(session) = super::session_monitors() {
+                std::thread::sleep(TX_SETTLE);
+                let origins = session.layout.origins_pts();
+                let placements: Vec<_> = session
+                    .display_ids
+                    .iter()
+                    .zip(origins)
+                    .filter(|&(&id, _)| id != virtual_display_id)
+                    .map(|(&id, (x, y))| (id, x, y))
+                    .chain(std::iter::once((virtual_display_id, 0, 0)))
+                    .collect();
+                match arrange(&placements) {
+                    Ok(true) => tracing::info!(
+                        ?placements,
+                        "re-arranged the session's virtual displays after detaching"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        error = ?e,
+                        "re-arranging the session's virtual displays after detaching failed"
+                    ),
+                }
+            }
+
             Ok(Self {
                 virtual_id: virtual_display_id,
                 virtual_old_origin,
