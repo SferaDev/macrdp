@@ -61,6 +61,7 @@ use ironrdp_egfx::pdu::{
 };
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
@@ -69,6 +70,7 @@ use ironrdp_svc::ChannelFlags;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use crate::damage::{Damage, DamageTracker};
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
@@ -175,11 +177,16 @@ struct Output {
     need_keyframe: bool,
     submitted: Arc<AtomicU64>,
     shipped: Arc<AtomicU64>,
+    /// Shared with this encoder's ship thread.
+    damage: Arc<Mutex<DamageTracker>>,
 }
 
 struct ConnectionContext {
     server_handle: GfxServerHandle,
     encoder: Option<Encoder>,
+    /// The primary encoder's frame damage, shared with its ship thread and
+    /// replaced along with the encoder.
+    damage: Arc<Mutex<DamageTracker>>,
     surface_id: Option<u16>,
     is_ready: bool,
     epoch: Instant,
@@ -1362,6 +1369,8 @@ pub struct Gfx {
     /// deactivation–reactivation. Shared across `Gfx` clones (the capture loop
     /// holds one).
     reactivate_request: Arc<AtomicU32>,
+    /// Region policy each new encoder's [`DamageTracker`] starts from.
+    damage_policy: DamageTracker,
 }
 
 impl Gfx {
@@ -1546,6 +1555,10 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let damage_policy = DamageTracker::from_env();
+        if !damage_policy.enabled() {
+            info!("EGFX changed-region rects DISABLED (MACRDP_EGFX_DIRTY_RECTS) — every frame updates the whole surface");
+        }
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1612,6 +1625,7 @@ impl Gfx {
             link_rtt_ms,
             adaptive_seed_rtt_ms,
             reactivate_request: Arc::new(AtomicU32::new(0)),
+            damage_policy,
         }
     }
 
@@ -1657,8 +1671,14 @@ impl Gfx {
     }
 
     /// [`Self::submit_bgra_status`], true unless EGFX isn't the display path yet.
-    pub fn submit_bgra(&self, bgra: &[u8], stride: usize, request_keyframe: bool) -> Result<bool> {
-        self.submit_bgra_status(bgra, stride, request_keyframe)
+    pub fn submit_bgra(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        damage: Damage,
+    ) -> Result<bool> {
+        self.submit_bgra_status(bgra, stride, request_keyframe, damage)
             .map(|s| s != OutputSubmit::NotReady)
     }
 
@@ -1675,11 +1695,15 @@ impl Gfx {
     /// `Busy` when EGFX is the display path but this frame was dropped
     /// (backpressure, throttling, recovery); the caller must offer it again
     /// or the change stays off screen on a static desktop.
+    ///
+    /// `damage` is what changed since the last frame this returned `Encoded`
+    /// for; the frame's AVC420 region rects come from it.
     pub fn submit_bgra_status(
         &self,
         bgra: &[u8],
         stride: usize,
         request_keyframe: bool,
+        damage: Damage,
     ) -> Result<OutputSubmit> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
@@ -2051,7 +2075,8 @@ impl Gfx {
                     trace!(error = ?e, frames, "adaptive set_keyframe_interval failed");
                 }
             }
-            encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            let pts = encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            ctx.damage.lock().unwrap().submitted(pts, damage);
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(OutputSubmit::Encoded)
@@ -2310,6 +2335,7 @@ impl Gfx {
         &self,
         rx: std::sync::mpsc::Receiver<EncodedFrame>,
         shipped: Arc<AtomicU64>,
+        damage: Arc<Mutex<DamageTracker>>,
         output: Option<usize>,
     ) {
         while let Ok(frame) = rx.recv() {
@@ -2319,7 +2345,7 @@ impl Gfx {
                 frames.push(f);
             }
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames, output) {
+            if let Err(e) = self.ship_frames(&frames, &damage, output) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -2463,11 +2489,15 @@ impl Gfx {
             // Fresh throttle counters for this connection.
             ctx.submitted.store(0, Ordering::Relaxed);
             ctx.shipped.store(0, Ordering::Relaxed);
+            // The new encoder restarts its timestamps; a previous ship thread
+            // still draining keeps the old tracker.
+            ctx.damage = Arc::new(Mutex::new(self.damage_policy.clone()));
             let gfx = self.clone();
             let shipped = ctx.shipped.clone();
+            let damage = ctx.damage.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped, None))
+                .spawn(move || gfx.ship_loop(rx, shipped, damage, None))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
             info!("EGFX VideoToolbox encoder initialized + ship thread started");
         }
@@ -2620,11 +2650,13 @@ impl Gfx {
             .take_receiver()
             .ok_or_else(|| anyhow!("EGFX: encoder receiver already taken"))?;
         let shipped = Arc::new(AtomicU64::new(0));
+        let damage = Arc::new(Mutex::new(self.damage_policy.clone()));
         let gfx = self.clone();
         let ship_count = shipped.clone();
+        let ship_damage = damage.clone();
         std::thread::Builder::new()
             .name(format!("egfx-ship-{}", index + 1))
-            .spawn(move || gfx.ship_loop(rx, ship_count, Some(index)))
+            .spawn(move || gfx.ship_loop(rx, ship_count, ship_damage, Some(index)))
             .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
         Ok(Output {
             surface_id,
@@ -2633,6 +2665,7 @@ impl Gfx {
             need_keyframe: true,
             submitted: Arc::new(AtomicU64::new(0)),
             shipped,
+            damage,
         })
     }
 
@@ -2696,6 +2729,7 @@ impl Gfx {
         output: usize,
         bgra: &[u8],
         stride: usize,
+        damage: Damage,
     ) -> Result<OutputSubmit> {
         let mut guard = self.ctx.lock().unwrap();
         let Some(o) = guard.as_mut().and_then(|ctx| ctx.outputs.get_mut(output)) else {
@@ -2714,7 +2748,8 @@ impl Gfx {
         }
         let o = &mut ctx.outputs[output];
         let keyframe = std::mem::replace(&mut o.need_keyframe, false);
-        o.encoder.encode_bgra(bgra, stride, keyframe)?;
+        let pts = o.encoder.encode_bgra(bgra, stride, keyframe)?;
+        o.damage.lock().unwrap().submitted(pts, damage);
         o.submitted.fetch_add(1, Ordering::Relaxed);
         Ok(OutputSubmit::Encoded)
     }
@@ -2843,7 +2878,12 @@ impl Gfx {
         Ok(())
     }
 
-    fn ship_frames(&self, frames: &[EncodedFrame], output: Option<usize>) -> Result<()> {
+    fn ship_frames(
+        &self,
+        frames: &[EncodedFrame],
+        damage: &Mutex<DamageTracker>,
+        output: Option<usize>,
+    ) -> Result<()> {
         {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
             // before touching `server_handle`. The inbound EGFX frame-ack path
@@ -2894,24 +2934,40 @@ impl Gfx {
                 )
             };
 
+            // Each frame's changed regions; `None` keeps the whole-surface
+            // region the path always sent (MACRDP_EGFX_DIRTY_RECTS=0).
+            let regions: Vec<Option<Vec<Avc420Region>>> = {
+                let mut tracker = damage.lock().unwrap();
+                let now = Instant::now();
+                frames
+                    .iter()
+                    .map(|f| {
+                        tracker.enabled().then(|| {
+                            avc420_regions(
+                                tracker.regions(f.pts, f.is_keyframe, width, height, now),
+                                width,
+                                height,
+                            )
+                        })
+                    })
+                    .collect()
+            };
+            // The WireToSurface1 destination stays the whole surface; only
+            // the regions narrow.
+            let surface_rect = ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+
             // Phase 2: lock `server_handle` ALONE (ctx already released).
             let mut server = server_handle.lock().unwrap();
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
-            for f in frames {
-                // Region = full actual frame, inclusive bounds. QP 22 /
-                // quality 100 are first-light defaults; tuned in M3. Rebuilt
-                // per frame because `Avc420Region` isn't `Copy`.
-                let region = Avc420Region {
-                    left: 0,
-                    top: 0,
-                    right: width.saturating_sub(1),
-                    bottom: height.saturating_sub(1),
-                    quantization_parameter: 22,
-                    quality: 100,
-                };
+            for (f, frame_regions) in frames.iter().zip(regions) {
                 let payload = self.frame_payload(f);
                 let ts_ms =
                     u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
@@ -2924,7 +2980,28 @@ impl Gfx {
                 // the surface stays blank.
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
-                let sent = server.send_avc420_frame(surface_id, &payload, &[region], ts_ms);
+                let sent = match frame_regions {
+                    Some(regions) => server.send_avc420_frame_to_rect(
+                        surface_id,
+                        &payload,
+                        &regions,
+                        surface_rect.clone(),
+                        ts_ms,
+                    ),
+                    None => {
+                        // Region = full actual frame, inclusive bounds. QP 22 /
+                        // quality 100 are first-light defaults; tuned in M3.
+                        let region = Avc420Region {
+                            left: 0,
+                            top: 0,
+                            right: width.saturating_sub(1),
+                            bottom: height.saturating_sub(1),
+                            quantization_parameter: 22,
+                            quality: 100,
+                        };
+                        server.send_avc420_frame(surface_id, &payload, &[region], ts_ms)
+                    }
+                };
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -3082,6 +3159,7 @@ impl GfxServerFactory for Gfx {
         *self.ctx.lock().unwrap() = Some(ConnectionContext {
             server_handle: handle.clone(),
             encoder: None,
+            damage: Arc::new(Mutex::new(self.damage_policy.clone())),
             surface_id: None,
             outputs: Vec::new(),
             is_ready: false,
@@ -3129,6 +3207,37 @@ impl GfxServerFactory for Gfx {
             handle,
         ))
     }
+}
+
+/// A frame's AVC420 metablock regions for `rects` (`None` = the whole
+/// surface). The wire's `RDPGFX_RECT16` is right/bottom exclusive (FreeRDP
+/// rejects `left >= right`), so these carry exclusive bounds even though
+/// ironrdp's `Avc420Region` documents them as inclusive. QP 22 / quality
+/// 100 as the whole-surface region always had.
+fn avc420_regions(
+    rects: Option<Vec<crate::damage::Rect>>,
+    width: u16,
+    height: u16,
+) -> Vec<Avc420Region> {
+    let clamp = |v: u32, max: u16| u16::try_from(v).unwrap_or(max).min(max);
+    let full = [crate::damage::Rect {
+        left: 0,
+        top: 0,
+        right: u32::from(width),
+        bottom: u32::from(height),
+    }];
+    let rects = rects.unwrap_or_else(|| full.to_vec());
+    rects
+        .iter()
+        .map(|r| Avc420Region {
+            left: clamp(r.left, width),
+            top: clamp(r.top, height),
+            right: clamp(r.right, width),
+            bottom: clamp(r.bottom, height),
+            quantization_parameter: 22,
+            quality: 100,
+        })
+        .collect()
 }
 
 /// Whether the client's advertised EGFX capabilities indicate AVC420 (H.264)
@@ -4945,6 +5054,105 @@ mod tests {
             min
         ));
         assert!(frame_drop_at_floor(true, true, Duration::ZERO, min));
+    }
+
+    #[test]
+    fn avc420_regions_carry_exclusive_bounds() {
+        let rect = crate::damage::Rect {
+            left: 16,
+            top: 32,
+            right: 48,
+            bottom: 64,
+        };
+        let regions = avc420_regions(Some(vec![rect]), 1920, 1080);
+        assert_eq!(
+            (
+                regions[0].left,
+                regions[0].top,
+                regions[0].right,
+                regions[0].bottom
+            ),
+            (16, 32, 48, 64)
+        );
+        let full = avc420_regions(None, 1920, 1080);
+        assert_eq!(full.len(), 1);
+        assert_eq!(
+            (full[0].left, full[0].top, full[0].right, full[0].bottom),
+            (0, 0, 1920, 1080)
+        );
+        let bytes = ironrdp_egfx::pdu::encode_avc420_bitmap_stream(&regions, &[0xAA]);
+        // numRegionRects, one RDPGFX_RECT16, its quantQualityVal (QP 22, not
+        // progressive, quality 100), then the H.264 data.
+        assert_eq!(
+            bytes,
+            [1, 0, 0, 0, 16, 0, 32, 0, 48, 0, 64, 0, 22, 100, 0xAA]
+        );
+    }
+
+    #[test]
+    fn avc420_frame_to_rect_keeps_the_whole_surface_as_destination() {
+        use ironrdp_core::{decode, encode_vec};
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{Avc420BitmapStream, CapabilitiesAdvertisePdu, Codec1Type, GfxPdu};
+
+        struct Handler;
+        impl GraphicsPipelineHandler for Handler {
+            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+        }
+
+        let mut server = GraphicsPipelineServer::new(Box::new(Handler));
+        server.start(7).unwrap();
+        let advertise =
+            GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[avc_ready()]));
+        server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+        let sid = server
+            .create_surface_with_format(64, 48, PixelFormat::XRgb)
+            .unwrap();
+        server.drain_output();
+
+        let rect = crate::damage::Rect {
+            left: 16,
+            top: 0,
+            right: 64,
+            bottom: 16,
+        };
+        let regions = avc420_regions(Some(vec![rect]), 64, 48);
+        let surface = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 64,
+            bottom: 48,
+        };
+        assert!(server
+            .send_avc420_frame_to_rect(sid, &[0xAA], &regions, surface, 0)
+            .is_some());
+
+        let wire_to_surface = server
+            .drain_output()
+            .iter()
+            .map(|m| {
+                let bytes = encode_vec(m.as_ref()).unwrap();
+                // Uncompressed single ZGFX segment: descriptor and flags bytes.
+                assert_eq!(&bytes[..2], &[0xE0, 0x04]);
+                decode::<GfxPdu>(&bytes[2..]).unwrap()
+            })
+            .find_map(|pdu| match pdu {
+                GfxPdu::WireToSurface1(w) => Some(w),
+                _ => None,
+            })
+            .expect("a WireToSurface1 PDU");
+        assert_eq!(wire_to_surface.codec_id, Codec1Type::Avc420);
+        let dest = &wire_to_surface.destination_rectangle;
+        assert_eq!(
+            (dest.left, dest.top, dest.right, dest.bottom),
+            (0, 0, 64, 48)
+        );
+        let stream = decode::<Avc420BitmapStream<'_>>(&wire_to_surface.bitmap_data).unwrap();
+        let r = &stream.rectangles[0];
+        assert_eq!(stream.rectangles.len(), 1);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (16, 0, 64, 16));
+        assert_eq!(stream.data, &[0xAA]);
     }
 
     #[test]

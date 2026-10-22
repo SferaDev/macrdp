@@ -36,7 +36,6 @@ use anyhow::{anyhow, bail, Result};
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
-    #[allow(dead_code)]
     pub pts: i64,
     /// SPS / PPS NAL units (raw, no length prefix and no start code).
     /// Populated only on keyframes — empty on non-keyframes.
@@ -165,8 +164,9 @@ impl Encoder {
     ///
     /// Returns immediately; encoded output arrives asynchronously via
     /// `drain()`. VT calls our output callback on its own thread, so
-    /// the channel decouples producer and consumer cleanly.
-    pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<()> {
+    /// the channel decouples producer and consumer cleanly. Returns the
+    /// frame's presentation timestamp, which its `EncodedFrame::pts` carries.
+    pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<i64> {
         let expected = stride
             .checked_mul(self.height.into())
             .ok_or_else(|| anyhow!("stride*height overflows usize"))?;
@@ -191,7 +191,8 @@ impl Encoder {
             self.fps,
             force_keyframe,
             self.full_range,
-        )
+        )?;
+        Ok(pts)
     }
 
     /// Pull every encoded frame the callback has produced so far.

@@ -21,6 +21,9 @@ mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
 mod cursor;
+// Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod damage;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
