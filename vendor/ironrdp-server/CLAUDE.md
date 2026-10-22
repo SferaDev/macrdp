@@ -2071,3 +2071,10 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     and a client that sends input from its UI thread then blocked on its own full
     socket. X224 PDUs still queued when a reactivation ends the loop go into
     `read_ahead` and replay ahead of the reactivation's input backlog.
+
+(28) `TCP_NODELAY` on the accepted RDP socket, plus an opt-in EGFX socket-write
+    timer (NOT upstreamed; added 2026-10-22). Upstream leaves Nagle on, so the
+    short tail segment of each EGFX frame waits for the ACK of the previous one,
+    which the client may delay; set at both accept sites (the idle listener and
+    the preemption race). `trace_egfx_write` logs p50/p95/max of the EGFX
+    `write_all` time every 5 s, only under `MACRDP_LATENCY_TRACE=1`.
