@@ -1009,6 +1009,9 @@ mod macos {
         klid_handle: Option<super::SharedKeyboardLayout>,
         last_klid: u32,
         auto_layout: bool,
+        // Whether the Mac translates with an ISO keyboard type, and when that
+        // was read; see `iso_keyboard`.
+        iso_keyboard: Option<(bool, Instant)>,
     }
 
     impl Inner {
@@ -1087,6 +1090,7 @@ mod macos {
                 klid_handle,
                 last_klid: 0,
                 auto_layout,
+                iso_keyboard: None,
             })
         }
 
@@ -1319,8 +1323,33 @@ mod macos {
             };
         }
 
+        /// How long `iso_keyboard` trusts its last answer. The type follows the
+        /// keyboard last typed on at the Mac, which changes rarely.
+        const KEYBOARD_TYPE_TTL: Duration = Duration::from_secs(5);
+
+        /// Whether the events we post are translated as coming from an ISO
+        /// keyboard. Read off a posted event's keyboard-type field rather than
+        /// `LMGetKbdType`, which reports ANSI to a process without a UI.
+        fn iso_keyboard(&mut self) -> bool {
+            if let Some((iso, at)) = self.iso_keyboard {
+                if at.elapsed() < Self::KEYBOARD_TYPE_TTL {
+                    return iso;
+                }
+            }
+            let iso = CGEvent::new_keyboard_event(self.source.clone(), 0, true)
+                .map(|ev| {
+                    crate::keyboard_layout::is_iso_keyboard_type(
+                        ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYBOARD_TYPE),
+                    )
+                })
+                .unwrap_or(false);
+            self.iso_keyboard = Some((iso, Instant::now()));
+            iso
+        }
+
         fn key(&mut self, scancode: u8, extended: bool, down: bool) {
-            let Some(vk) = scancode_to_cgkeycode(scancode, extended) else {
+            let iso = !extended && matches!(scancode, 0x29 | 0x56) && self.iso_keyboard();
+            let Some(vk) = scancode_to_cgkeycode(scancode, extended, iso) else {
                 tracing::debug!(scancode, extended, down, "unmapped scancode");
                 return;
             };

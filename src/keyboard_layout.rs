@@ -32,7 +32,7 @@ pub fn is_translatable_keycode(vk: u16) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::KeyboardLayout;
+pub use macos::{is_iso_keyboard_type, KeyboardLayout};
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -55,6 +55,7 @@ mod macos {
         fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
         fn TISGetInputSourceProperty(source: TISInputSourceRef, key: CFStringRef) -> *const c_void;
         fn LMGetKbdType() -> u8;
+        fn KBGetLayoutType(keyboard_type: i16) -> u32;
         fn UCKeyTranslate(
             key_layout_ptr: *const c_void,
             virtual_key_code: u16,
@@ -77,6 +78,16 @@ mod macos {
     }
 
     const KEY_ACTION_DOWN: u16 = 0;
+    const KEYBOARD_ISO: u32 = u32::from_be_bytes(*b"ISO ");
+
+    /// Whether a CG keyboard type (`kCGKeyboardEventKeyboardType`) is an ISO
+    /// keyboard, the shape with the extra key left of Z.
+    pub fn is_iso_keyboard_type(keyboard_type: i64) -> bool {
+        let Ok(t) = i16::try_from(keyboard_type) else {
+            return false;
+        };
+        unsafe { KBGetLayoutType(t) == KEYBOARD_ISO }
+    }
     // Carbon modifier bits, in the `(eventModifiers >> 8) & 0xFF` form that
     // UCKeyTranslate's `modifierKeyState` expects: shiftKey>>8 = 0x02,
     // alphaLock>>8 = 0x04, optionKey>>8 = 0x08. We deliberately never set the
@@ -443,6 +454,17 @@ mod macos {
         use super::*;
 
         #[test]
+        fn keyboard_types_classify_as_iso_or_not() {
+            // 40/41/42 are the classic Apple ANSI/ISO/JIS types; 92 is what a
+            // current MacBook's internal ISO keyboard reports.
+            assert!(!is_iso_keyboard_type(40));
+            assert!(is_iso_keyboard_type(41));
+            assert!(!is_iso_keyboard_type(42));
+            assert!(is_iso_keyboard_type(92));
+            assert!(!is_iso_keyboard_type(-1_000_000));
+        }
+
+        #[test]
         fn spec_resolution_prefers_names_then_klids() {
             assert_eq!(
                 spec_to_source_id("french"),
@@ -485,6 +507,22 @@ mod macos {
                 Some("1")
             );
             assert_eq!(us.translate(0x12, true, false, false).as_deref(), Some("!"));
+
+            // Why scancodes.rs sends 0x29 to kVK_ISO_Section on ISO keyboards:
+            // Apple's ISO layouts draw the key left of 1 at 0x0A and `<>` at
+            // kVK_ANSI_Grave. Same thread as above: TIS aborts when two test
+            // threads resolve layouts at once.
+            if let Some(mut es) = KeyboardLayout::resolve("com.apple.keylayout.Spanish-ISO") {
+                assert_eq!(
+                    es.translate(0x0A, false, false, false).as_deref(),
+                    Some("º")
+                );
+                assert_eq!(
+                    es.translate(0x32, false, false, false).as_deref(),
+                    Some("<")
+                );
+                assert_eq!(es.translate(0x32, true, false, false).as_deref(), Some(">"));
+            }
         }
 
         #[test]
