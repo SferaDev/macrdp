@@ -1235,10 +1235,8 @@ pub struct Gfx {
     recovery_params: RecoveryParams,
     egfx_on_lossy: Arc<AtomicBool>,
     /// Runtime gate the vendored server flips true when EGFX is migrated onto the
-    /// UDP multitransport tunnel (reliable OR lossy). Enables the frame-ack-lag
-    /// backpressure in `submit_bgra` — only on the UDP tunnel, since the TCP path
-    /// is paced by socket backpressure and must stay byte-identical (never-drop
-    /// push model). Stays false on TCP → the gate is a no-op there.
+    /// UDP multitransport tunnel (reliable OR lossy). Picks the UDP limit for the
+    /// frame-ack-lag backpressure in `client_backlogged`.
     egfx_on_udp: Arc<AtomicBool>,
     /// Max EGFX frame-ack lag (shipped − decoded, in frames) tolerated on the UDP
     /// tunnel before `submit_bgra` drops captures to let the client catch up.
@@ -1246,6 +1244,11 @@ pub struct Gfx {
     /// that a healthy high-RTT link never trips it; low enough to cap the decode
     /// backlog so video degrades to choppy-but-live instead of freezing.
     max_frame_lag: u64,
+    /// The same limit on TCP, where a client that drains the socket into its own
+    /// unbounded queue (FreeRDP) gives the server no backpressure: without it a
+    /// decode-bound client falls seconds behind. `MACRDP_EGFX_MAX_FRAME_LAG`
+    /// (default 3, 0 disables); a healthy LAN client acks within a frame or two.
+    tcp_max_frame_lag: u64,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1383,6 +1386,10 @@ impl Gfx {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16);
+        let tcp_max_frame_lag = std::env::var("MACRDP_EGFX_MAX_FRAME_LAG")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(3);
         let watchdog_enabled = match std::env::var("MACRDP_UDP_EGFX_WATCHDOG") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true, // default on (no-op unless EGFX is on the reliable UDP tunnel)
@@ -1582,6 +1589,7 @@ impl Gfx {
             egfx_on_lossy,
             egfx_on_udp,
             max_frame_lag,
+            tcp_max_frame_lag,
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -1992,50 +2000,13 @@ impl Gfx {
                 );
                 return Ok(OutputSubmit::Busy); // still the active path; just dropped this frame
             }
-            // EGFX-on-UDP frame-ack backpressure: on the UDP tunnel there's no
-            // socket backpressure to pace us to the client (unlike TCP), so without
-            // this the server floods frames and the client's DECODE queue runs away
-            // → frozen video while audio (on TCP) keeps playing. When the client's
-            // decode backlog (shipped − decoded, from FrameAcknowledge) exceeds the
-            // threshold, drop this capture so the client catches up — video degrades
-            // to choppy-but-live instead of freezing. Gated to the UDP tunnel
-            // (TCP push path stays byte-identical), to acks actually flowing (a
-            // suspended-ack client falls back to the submitted−shipped throttle
-            // above), and to having seen ≥1 ack (no cold-start false drop). Dropping
-            // before encode keeps the H.264 reference chain valid.
-            if self.egfx_on_udp.load(Ordering::Relaxed) && ctx.egfx_acks_seen && !ctx.acks_suspended
-            {
-                let lag = ctx
-                    .last_shipped_frame_id
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
-                if lag > self.max_frame_lag {
-                    // Client is behind. Drop MOST captures so it catches up — but
-                    // keep a low-rate trickle, never zero: mstsc only presents (and
-                    // thus frame-acks) an H.264 frame once a couple more arrive
-                    // behind it, so dropping to zero means it never acks the
-                    // in-flight frames, `lag` never falls back under the threshold,
-                    // and the video freezes PERMANENTLY (recovers only on
-                    // reconnect). The trickle keeps trailing frames flowing so the
-                    // presentation buffer drains and the window reopens. Dropping
-                    // before encode keeps the H.264 reference chain valid (the
-                    // encoder never sees the dropped frames, so the next encoded
-                    // frame is a valid P-frame from the client's last reference).
-                    let now = Instant::now();
-                    if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
-                        trace!(
-                            lag,
-                            "EGFX-on-UDP lag high; dropping capture (trickle floor)"
-                        );
-                        return Ok(OutputSubmit::Busy);
-                    }
-                    ctx.last_throttle_ship = now;
-                    trace!(
-                        lag,
-                        "EGFX-on-UDP lag high; letting a trickle frame through to drain client buffer"
-                    );
-                    // fall through: ship this one to keep the client presenting/acking
-                }
+            // Frame-ack backpressure: neither the UDP tunnel nor a client that
+            // queues what it reads (FreeRDP) paces us, so without this the
+            // client's decode queue runs away and video and input lag by seconds.
+            if self.client_backlogged(ctx) {
+                crate::latency_trace::record_us("m0.lag_drop", 0);
+                trace!("EGFX frame-ack lag high; dropping capture");
+                return Ok(OutputSubmit::Busy);
             }
             std::mem::replace(&mut ctx.need_keyframe, false)
         };
@@ -2687,6 +2658,41 @@ impl Gfx {
             .is_none_or(|o| o.need_keyframe)
     }
 
+    /// Whether the client's decode backlog (frames shipped minus frames it has
+    /// acknowledged as decoded) is over this transport's limit, so a capture
+    /// should be dropped before encode; that keeps the H.264 reference chain
+    /// valid and the capture loop offers the frame again. One frame per
+    /// [`UDP_THROTTLE_FLOOR`] still goes through: mstsc only acks a frame once
+    /// more arrive behind it, and with none the lag would never recover. Off
+    /// until the first ack and while acks are suspended.
+    fn client_backlogged(&self, ctx: &mut ConnectionContext) -> bool {
+        if !ctx.egfx_acks_seen || ctx.acks_suspended {
+            return false;
+        }
+        let limit = if self.egfx_on_udp.load(Ordering::Relaxed) {
+            self.max_frame_lag
+        } else {
+            self.tcp_max_frame_lag
+        };
+        if limit == 0 {
+            return false;
+        }
+        let lag = ctx
+            .last_shipped_frame_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
+        crate::latency_trace::record_us("ack_lag", lag);
+        if lag <= limit {
+            return false;
+        }
+        let now = Instant::now();
+        if now.duration_since(ctx.last_throttle_ship) < UDP_THROTTLE_FLOOR {
+            return true;
+        }
+        ctx.last_throttle_ship = now;
+        false
+    }
+
     /// Encodes a frame of a non-primary monitor.
     pub fn submit_output_bgra(
         &self,
@@ -2706,6 +2712,12 @@ impl Gfx {
             crate::latency_trace::record_us(&format!("m{}.busy_drop", output + 1), 0);
             return Ok(OutputSubmit::Busy);
         }
+        let ctx = guard.as_mut().expect("checked above");
+        if self.client_backlogged(ctx) {
+            crate::latency_trace::record_us(&format!("m{}.lag_drop", output + 1), 0);
+            return Ok(OutputSubmit::Busy);
+        }
+        let o = &mut ctx.outputs[output];
         let keyframe = std::mem::replace(&mut o.need_keyframe, false);
         o.encoder.encode_bgra(bgra, stride, keyframe)?;
         o.submitted.fetch_add(1, Ordering::Relaxed);
