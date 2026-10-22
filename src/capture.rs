@@ -1180,6 +1180,10 @@ mod macos {
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 
+    /// How long the primary capture keeps its latest frame for an EGFX
+    /// channel that isn't ready yet.
+    const EGFX_READY_GRACE: Duration = Duration::from_secs(10);
+
     /// Skips to the newest sample SCK has queued. Every EGFX frame is a full
     /// frame, so an older queued one only adds a frame interval of latency
     /// each. Keeps the last one with content: a trailing idle sample carries
@@ -1435,12 +1439,48 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// A frame EGFX hasn't taken yet. SCK sends a frame only when the
+        /// screen changes, and its first ones come before the client opens
+        /// EGFX, so on a static screen the surfaces would wait for the next
+        /// change.
+        held_frame: Option<(Vec<u8>, usize)>,
+        hold_until: Instant,
     }
 
     impl ScreenCaptureUpdates {
         pub fn with_secondaries(mut self, secondaries: Vec<SecondaryCapture>) -> Self {
             self.secondaries = secondaries;
             self
+        }
+
+        /// Ships the held frame once EGFX takes it. Returns whether it did.
+        fn ship_held_frame(&mut self) -> bool {
+            let (Some(gfx), Some((frame, stride))) = (self.gfx.as_ref(), self.held_frame.as_ref())
+            else {
+                return false;
+            };
+            match gfx.submit_bgra(frame, *stride, true) {
+                Ok(true) => {
+                    let (frame, stride) = self.held_frame.take().expect("held frame checked above");
+                    self.last_frame = frame;
+                    self.last_stride = stride;
+                    self.flush_remaining = self.flush_frames;
+                    self.seeded = true;
+                    self.first_egfx_frame_sent = true;
+                    true
+                }
+                Ok(false) => {
+                    if Instant::now() >= self.hold_until {
+                        self.held_frame = None;
+                    }
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "EGFX submit of a held frame failed");
+                    self.held_frame = None;
+                    false
+                }
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -1641,6 +1681,8 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                held_frame: None,
+                hold_until: Instant::now() + EGFX_READY_GRACE,
             })
         }
     }
@@ -1788,6 +1830,10 @@ mod macos {
                     })));
                 }
 
+                if self.ship_held_frame() {
+                    continue;
+                }
+
                 // Poll cursor at loop top — preempts queued bitmap rects so
                 // pointer shape updates keep up instead of batching behind the
                 // bitmap drain of the previous SCK sample. Throttled to
@@ -1868,7 +1914,10 @@ mod macos {
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
                 // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || self.held_frame.is_some()
+                {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
@@ -2047,9 +2096,17 @@ mod macos {
                             self.last_frame.extend_from_slice(src);
                             self.last_stride = stride_bytes;
                             self.flush_remaining = self.flush_frames;
+                            self.held_frame = None;
                             continue;
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            if !self.first_egfx_frame_sent && Instant::now() < self.hold_until {
+                                let held = self.held_frame.get_or_insert_with(Default::default);
+                                held.0.clear();
+                                held.0.extend_from_slice(src);
+                                held.1 = stride_bytes;
+                            }
+                        }
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
