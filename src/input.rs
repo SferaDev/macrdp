@@ -202,38 +202,46 @@ fn should_remap_click(remap_on: bool, ctrl: bool, cmd: bool, alt: bool, excluded
     remap_on && ctrl && !cmd && !alt && !excluded
 }
 
-/// Wheel units per posted scroll line; see `Inner::scroll`.
-const SCROLL_UNITS_PER_LINE: i32 = 60;
+/// Pixels posted per wheel notch (120 units); see `Inner::scroll`.
+const SCROLL_PIXELS_PER_NOTCH: i32 = 100;
+const SCROLL_MAX_PIXELS: i32 = 600;
 
-/// Adds a wheel delta to the running total and returns the lines to post (at
-/// most 5 per event) and the new total. Whatever the cap cuts off is dropped,
-/// and a reversal starts from zero: a backlog carried over from a fast scroll
-/// otherwise swallowed the next scroll the other way, or kept going.
-fn scroll_lines(accum: i32, delta: i32) -> (i32, i32) {
+/// Adds a wheel delta to the running total and returns the pixels to post (at
+/// most `SCROLL_MAX_PIXELS` per event) and the new total. Whatever the cap cuts
+/// off is dropped, and a reversal starts from zero: a backlog carried over from
+/// a fast scroll otherwise swallowed the next scroll the other way, or kept going.
+fn scroll_pixels(accum: i32, delta: i32) -> (i32, i32) {
     let accum = if delta != 0 && accum != 0 && (accum < 0) != (delta < 0) {
         delta
     } else {
         accum + delta
     };
-    let lines = accum / SCROLL_UNITS_PER_LINE;
-    (lines.clamp(-5, 5), accum - lines * SCROLL_UNITS_PER_LINE)
+    let pixels = accum * SCROLL_PIXELS_PER_NOTCH / 120;
+    let rest = accum - pixels * 120 / SCROLL_PIXELS_PER_NOTCH;
+    (pixels.clamp(-SCROLL_MAX_PIXELS, SCROLL_MAX_PIXELS), rest)
 }
 
 #[cfg(test)]
 mod coord_tests {
-    use super::{is_remappable_shortcut, map_client_to_display, scroll_lines, should_remap_click};
+    use super::{is_remappable_shortcut, map_client_to_display, scroll_pixels, should_remap_click};
+
+    #[test]
+    fn scroll_posts_pixels_and_keeps_the_fraction() {
+        assert_eq!(scroll_pixels(0, 120), (100, 0));
+        assert_eq!(scroll_pixels(0, 12), (10, 0));
+        assert_eq!(scroll_pixels(0, 1), (0, 1));
+        assert_eq!(scroll_pixels(1, 1), (1, 1));
+    }
 
     #[test]
     fn scroll_drops_what_the_cap_cuts_off() {
-        assert_eq!(scroll_lines(0, -1236), (-5, -36));
-        assert_eq!(scroll_lines(0, 30), (0, 30));
-        assert_eq!(scroll_lines(30, 30), (1, 0));
+        assert_eq!(scroll_pixels(0, -12_000), (-600, 0));
     }
 
     #[test]
     fn scroll_reversal_ignores_the_previous_direction() {
-        let (_, accum) = scroll_lines(0, -1236);
-        assert_eq!(scroll_lines(accum, 120), (2, 0));
+        let (_, accum) = scroll_pixels(0, -13);
+        assert_eq!(scroll_pixels(accum, 120), (100, 0));
     }
 
     /// The full mouse Ctrl→Cmd decision table. Exactly one row remaps: the
@@ -1754,21 +1762,24 @@ mod macos {
             // 120-per-notch value). A flat `delta / SCALE` per event
             // truncates almost every one of those to zero — scroll never
             // moves at all. Accumulate the raw delta across calls instead,
-            // and only emit whole lines once the running total crosses
-            // SCROLL_UNITS_PER_LINE, carrying the remainder forward so no
-            // motion is lost (see `scroll_lines`).
+            // and post them as pixels, carrying the fraction of a pixel
+            // forward so no motion is lost (see `scroll_pixels`). Pixels
+            // rather than lines keep trackpads and high-resolution wheels as
+            // smooth as they are on the client.
             let v;
             let h;
-            (v, self.scroll_v_accum) = super::scroll_lines(self.scroll_v_accum, vertical);
-            (h, self.scroll_h_accum) = super::scroll_lines(self.scroll_h_accum, horizontal);
+            (v, self.scroll_v_accum) = super::scroll_pixels(self.scroll_v_accum, vertical);
+            (h, self.scroll_h_accum) = super::scroll_pixels(self.scroll_h_accum, horizontal);
             if v == 0 && h == 0 {
                 return;
             }
             let Ok(ev) =
-                CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::LINE, 2, v, h, 0)
+                CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::PIXEL, 2, v, h, 0)
             else {
                 return;
             };
+            // Without it apps read the pixel deltas as lines.
+            ev.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
             // Carry the held modifiers so Shift+scroll (horizontal in most apps)
             // and Cmd+scroll (zoom) work, same as clicks and drags. Deliberately
             // NO Ctrl→Cmd swap here: the remap's promise is scoped to the
