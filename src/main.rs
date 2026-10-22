@@ -17,6 +17,7 @@ mod avc444;
 mod camera;
 mod capture;
 mod clipboard;
+mod clipboard_image;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;

@@ -486,7 +486,7 @@ missing on their side:
   (Audio *input* — the client's mic — is ours alone; see below.)
 - **Clipboard** — both have it (theirs ~53 KB incl. `transfer.rs`, `pasteboard.rs`, `file.rs`,
   `html.rs`; ours ~110 KB incl. `clipboard_rich.rs`). Format-by-format: **text**
-  (CF_UNICODETEXT) ✅ both; **images** ✅ both — ours PNG↔DIB (and DIBV5 accepted from Windows),
+  (CF_UNICODETEXT) ✅ both; **images** ✅ both — ours the registered `PNG` format both ways plus DIBV5 (alpha) and DIB,
   theirs accepting `public.png`/`tiff`/`jpeg`→DIB; **file lists** (FileGroupDescriptorW) ✅ both;
   **HTML** ✅ both — theirs since before July, **ours since v0.9.9 (2026-09-29)**, which closed
   the one clipboard gap the July comparison found. Ours also carries **RTF** (Word's native
