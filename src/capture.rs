@@ -1369,6 +1369,7 @@ mod macos {
             }
         }
         if crate::latency_trace::enabled() {
+            log_dirty_rects(&sample, label);
             crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
             crate::latency_trace::record_us(
                 &format!("{label}.dirty_px"),
@@ -1380,6 +1381,29 @@ mod macos {
             }
         }
         (sample, dirty_px != Some(0))
+    }
+
+    /// Logs one sample's dirty rects per monitor every 5 s, to find what keeps
+    /// a static screen dirty.
+    fn log_dirty_rects(sample: &screencapturekit::cm::CMSampleBuffer, label: &str) {
+        static LAST: std::sync::Mutex<Vec<(String, Instant)>> = std::sync::Mutex::new(Vec::new());
+        let mut last = LAST.lock().unwrap();
+        match last.iter_mut().find(|(l, _)| l == label) {
+            Some((_, t)) if t.elapsed() < Duration::from_secs(5) => return,
+            Some((_, t)) => *t = Instant::now(),
+            None => last.push((label.to_owned(), Instant::now())),
+        }
+        let rects: Vec<String> = sample
+            .dirty_rects()
+            .unwrap_or_default()
+            .iter()
+            .take(8)
+            .map(|r| {
+                let (o, s) = (r.origin(), r.size());
+                format!("{}x{}+{}+{}", s.width, s.height, o.x, o.y)
+            })
+            .collect();
+        tracing::info!(target: "macrdp::latency", label, ?rects, "dirty rects sample");
     }
 
     /// Dirty-rect area SCK attached to a sample; `None` when it attached none.
