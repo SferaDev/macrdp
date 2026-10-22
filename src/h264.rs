@@ -2532,7 +2532,8 @@ impl Gfx {
             let sid = server
                 .create_surface_with_format(width, height, PixelFormat::XRgb)
                 .ok_or_else(|| anyhow!("EGFX blank remap: create_surface failed"))?;
-            if !server.map_surface_to_output(sid, 0, 0) {
+            let (origin_x, origin_y) = self.primary_origin();
+            if !server.map_surface_to_output(sid, origin_x, origin_y) {
                 return Err(anyhow!("EGFX blank remap: map_surface_to_output failed"));
             }
             (server.drain_output(), egfx_channel_id, sid)
@@ -2603,6 +2604,19 @@ impl Gfx {
     /// connection.
     pub(crate) fn set_monitor_layout(&self, layout: Option<crate::monitor_layout::MonitorLayout>) {
         *self.monitor_layout.lock().unwrap() = layout;
+    }
+
+    /// Where the primary monitor's surface sits on the desktop: its place in a
+    /// multi-monitor session, otherwise the origin.
+    fn primary_origin(&self) -> (u32, u32) {
+        self.monitor_layout
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or((0, 0), |l| {
+                let p = l.monitors[l.primary()];
+                (u32::from(p.x), u32::from(p.y))
+            })
     }
 
     /// Starts the encoder and ship thread of a non-primary monitor's surface.
