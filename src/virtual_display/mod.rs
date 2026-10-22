@@ -194,7 +194,7 @@ mod macos {
             Self::create(
                 width,
                 height,
-                60,
+                super::refresh_hz(),
                 &format!("macrdp {}", index + 1),
                 serial,
                 scale,
@@ -1979,4 +1979,15 @@ mod stub {
             0
         }
     }
+}
+
+/// Refresh rate of the session's virtual displays: 60 Hz unless
+/// `MACRDP_VD_REFRESH_HZ` asks for another (WindowServer composites and SCK
+/// samples them at this cadence, so it bounds input-to-capture latency).
+pub fn refresh_hz() -> u32 {
+    std::env::var("MACRDP_VD_REFRESH_HZ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|hz| (24..=240).contains(hz))
+        .unwrap_or(60)
 }
