@@ -108,9 +108,10 @@ ifd-handler/      Standalone cdylib (NOT in the macrdp cargo package) — macrdp
                   loopback TCP (src/rdpdr/smartcard.rs). From scratch (MIT/Apache)
                   so smart-card redirection ships no GPL vpcd. Built + embedded in
                   macrdp.app by packaging/; installed by install-ifd-handler.sh.
-src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + CF_DIB
+src/clipboard.rs  CLIPRDR ↔ NSPasteboard (CF_UNICODETEXT + PNG/CF_DIBV5/CF_DIB
                   + Mac↔Windows file copy via FileGroupDescriptorW
                   and FileContentsRequest streaming)
+src/clipboard_image.rs  pure PNG / CF_DIB / CF_DIBV5 codecs
 src/file_promise.rs  Windows→Mac EAGER download to /tmp + NSPasteboard
                      publish + Glass-chime auto-paste into Finder.
                      Default path; provides fetch_one_file (Arc<File>+
