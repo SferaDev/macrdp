@@ -686,7 +686,7 @@ impl RdpServerDisplay for CaptureDisplay {
 
         let (w, h) = monitor.dimensions();
         self.client_scale_percent = monitor.desktop_scale_factor().unwrap_or(100);
-        let (Ok(mut width), Ok(mut height)) = (u16::try_from(w), u16::try_from(h)) else {
+        let (Ok(width), Ok(height)) = (u16::try_from(w), u16::try_from(h)) else {
             tracing::warn!(
                 w,
                 h,
@@ -760,6 +760,9 @@ impl CaptureDisplay {
         };
         let (cur_w, cur_h) = vd.size_px();
         if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
+            // A live resize re-modes the display before the reactivation that
+            // lands here.
+            self.screen_size_pts = vd.size_pts();
             return (width, height);
         }
         match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
@@ -798,109 +801,7 @@ impl CaptureDisplay {
                 // window off the vd may be intentionally on the physical panel.
                 #[cfg(target_os = "macos")]
                 if self.session_tracker.is_some() {
-                    // --shield-primary in keep-physical-main mode deliberately
-                    // does NOT make the vd the system main display (so the lock
-                    // screen stays on the visible physical panel). Re-anchoring
-                    // it as main here would undo that on every resize, so skip it.
-                    let skip_reanchor = self.shielded_primary.is_some()
-                        && crate::virtual_display::shield_keeps_physical_main();
-                    if !skip_reanchor {
-                        if let Err(e) = vd.reanchor_as_main() {
-                            tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
-                        }
-                    }
-                    // 0. Re-assert the --capture-primary gamma blanking. The
-                    //    re-mode (applySettings) and the re-anchor above are
-                    //    display reconfigurations, and macOS RESETS the physical
-                    //    panels' gamma tables on a reconfiguration — so the
-                    //    all-black blanking installed at connect is lost and the
-                    //    desktop shows through on resize. This immediate re-assert
-                    //    (after the re-anchor, whose own reconfiguration would
-                    //    otherwise undo an earlier one) covers the common case; the
-                    //    LATE resets (capture re-engage / a final relayout after the
-                    //    session re-enters, ~1 s in — the "quick blink after the
-                    //    resize" a polling burst couldn't beat) are handled by the
-                    //    post-sweep re-blanks in the thread below. (An event-driven
-                    //    re-blank was tried and REMOVED: the private
-                    //    CGVirtualDisplay applySettings resets gamma without
-                    //    emitting a public reconfiguration event, so the callback
-                    //    never fired — see the NOTE in virtual_display/mod.rs.)
-                    //    No-op for --detach-primary (slot is None; that mode
-                    //    disables the panel, not gamma).
-                    if let Some(cap) = self.captured_primary.as_ref() {
-                        if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
-                            let failed = g.reassert_blanking();
-                            tracing::info!(
-                                failed,
-                                "re-asserted capture-primary blanking after re-mode"
-                            );
-                        }
-                    }
-                    // Same hook for --shield-primary: re-fit the shield windows to
-                    // the panels' new frames. Cheap and idempotent (SHOW
-                    // reconciles rather than stacking).
-                    if let Some(sh) = self.shielded_primary.as_ref() {
-                        if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
-                            let failed = g.reassert_blanking();
-                            tracing::info!(failed, "re-fitted shield windows after re-mode");
-                        }
-                    }
-                    let captured_primary = self.captured_primary.clone();
-                    let shielded_primary = self.shielded_primary.clone();
-                    std::thread::spawn(move || {
-                        // Re-blank after each window-gather sweep. DIAGNOSED from
-                        // the callback trace: the vd re-mode resets the physical
-                        // gamma WITHOUT emitting a CGDisplay reconfiguration event
-                        // (it's the private CGVirtualDisplay applySettings), so an
-                        // event-driven re-blank never fires — AND the sync
-                        // re-assert on the capture path (before this thread) is
-                        // undone ~700 ms later by the gather's own WindowServer
-                        // relayout, which re-resets the gamma. That's the "quick
-                        // blink a little less than a second after the resize". So
-                        // the re-assert has to run AFTER each sweep, here.
-                        let reblank = || {
-                            if let Some(cap) = captured_primary.as_ref() {
-                                if let Some(g) =
-                                    cap.lock().expect("captured_primary poisoned").as_ref()
-                                {
-                                    g.reassert_blanking();
-                                }
-                            }
-                            if let Some(sh) = shielded_primary.as_ref() {
-                                if let Some(g) =
-                                    sh.lock().expect("shielded_primary poisoned").as_ref()
-                                {
-                                    g.reassert_blanking();
-                                }
-                            }
-                        };
-                        // TWO sweeps. The re-anchor's WindowServer relayout can
-                        // still be finishing well after the first sweep (it fires
-                        // during the reactivation churn, so it's slow) and would
-                        // re-strand windows the first sweep just placed — the
-                        // "apps flicker then disappear" symptom. A second sweep
-                        // after the relayout has fully settled sticks. Robust to
-                        // however long the relayout takes; a no-op second sweep is
-                        // cheap when the first already stuck.
-                        std::thread::sleep(std::time::Duration::from_millis(700));
-                        let first = crate::input::gather_windows_onto_display(vd_id);
-                        reblank();
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                        let second = crate::input::gather_windows_onto_display(vd_id);
-                        reblank();
-                        // One more after the relayout has fully settled, in case
-                        // the second sweep's relayout also trails.
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                        reblank();
-                        if first > 0 || second > 0 {
-                            tracing::info!(
-                                first,
-                                second,
-                                display_id = vd_id,
-                                "gathered stranded windows after live resize (two sweeps)"
-                            );
-                        }
-                    });
+                    after_headless_remode(&mut vd, &self.captured_primary, &self.shielded_primary);
                 }
                 (width, height)
             }
@@ -1037,7 +938,7 @@ impl CaptureDisplay {
             return Vec::new();
         };
         let primary = session.layout.primary();
-        let mut captures = Vec::new();
+        let mut starts = Vec::new();
         for (output, i) in (0..session.layout.monitors.len())
             .filter(|&i| i != primary)
             .enumerate()
@@ -1046,17 +947,23 @@ impl CaptureDisplay {
                 continue;
             }
             let m = session.layout.monitors[i];
-            match macos::SecondaryCapture::start(
+            let start = macos::SecondaryCapture::start(
                 output,
                 session.display_ids[i],
                 m.width,
                 m.height,
                 self.fps,
                 gfx.clone(),
-            )
-            .await
-            {
-                Ok(capture) => captures.push(capture),
+            );
+            starts.push((i, tokio::spawn(start)));
+        }
+        let mut captures = Vec::new();
+        for (i, start) in starts {
+            match start.await {
+                Ok(Ok(capture)) => captures.push(capture),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = ?e, monitor = i, "capturing a secondary monitor failed")
+                }
                 Err(e) => {
                     tracing::warn!(error = ?e, monitor = i, "capturing a secondary monitor failed")
                 }
@@ -1083,29 +990,49 @@ impl CaptureDisplay {
             None => (width, height),
         };
         #[cfg(target_os = "macos")]
-        let inner: Box<dyn RdpServerDisplayUpdates + Send> = Box::new(
-            macos::ScreenCaptureUpdates::start(
-                capture_w,
-                capture_h,
-                self.fps,
-                self.display_id,
-                self.screen_size_pts,
-                self.cursor_scale,
-                self.warp_cursor_home,
-                self.gfx.clone(),
-                self.keyframe_on_change,
-                self.click_signal.clone(),
-                self.flush_frames,
-                self.display_suppressed.clone(),
-                self.auto_size,
-                self.stretch,
-                self.desktop_size.clone(),
-                self.pending_resize.clone(),
-                self.suppress_next_adopt.clone(),
-            )
-            .await?
-            .with_secondaries(self.start_secondary_captures().await),
-        );
+        let remode = match (&self.virtual_display, &self.monitor_layout) {
+            (Some(vd), None) => Some(PrimaryRemode {
+                vd: vd.clone(),
+                client_scale_percent: self.client_scale_percent,
+                headless: self.session_tracker.is_some(),
+                captured_primary: self.captured_primary.clone(),
+                shielded_primary: self.shielded_primary.clone(),
+            }),
+            _ => None,
+        };
+        #[cfg(target_os = "macos")]
+        let inner: Box<dyn RdpServerDisplayUpdates + Send> = {
+            let started = Instant::now();
+            let (primary, secondaries) = tokio::join!(
+                macos::ScreenCaptureUpdates::start(
+                    capture_w,
+                    capture_h,
+                    self.fps,
+                    self.display_id,
+                    self.screen_size_pts,
+                    self.cursor_scale,
+                    self.warp_cursor_home,
+                    self.gfx.clone(),
+                    self.keyframe_on_change,
+                    self.click_signal.clone(),
+                    self.flush_frames,
+                    self.display_suppressed.clone(),
+                    self.auto_size,
+                    self.stretch,
+                    self.desktop_size.clone(),
+                    self.pending_resize.clone(),
+                    self.suppress_next_adopt.clone(),
+                    remode,
+                ),
+                self.start_secondary_captures(),
+            );
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                secondaries = secondaries.len(),
+                "session captures started"
+            );
+            Box::new(primary?.with_secondaries(secondaries))
+        };
         #[cfg(not(target_os = "macos"))]
         let inner: Box<dyn RdpServerDisplayUpdates + Send> =
             Box::new(stub::StubUpdates::new(width, height)?);
@@ -1113,6 +1040,160 @@ impl CaptureDisplay {
             Some(tracker) => Box::new(CountedUpdates::new(inner, tracker)),
             None => inner,
         })
+    }
+}
+
+/// The display fixes the headless modes need after a re-mode of the session's
+/// main virtual display, which is the only visible display there.
+#[cfg(target_os = "macos")]
+fn after_headless_remode(
+    vd: &mut crate::virtual_display::VirtualDisplay,
+    captured_primary: &Option<
+        Arc<std::sync::Mutex<Option<crate::virtual_display::CapturedPrimary>>>,
+    >,
+    shielded_primary: &Option<
+        Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>,
+    >,
+) {
+    let vd_id = vd.display_id();
+    // --shield-primary in keep-physical-main mode deliberately
+    // does NOT make the vd the system main display (so the lock
+    // screen stays on the visible physical panel). Re-anchoring
+    // it as main here would undo that on every resize, so skip it.
+    let skip_reanchor =
+        shielded_primary.is_some() && crate::virtual_display::shield_keeps_physical_main();
+    if !skip_reanchor {
+        if let Err(e) = vd.reanchor_as_main() {
+            tracing::warn!(error = ?e, "re-anchoring the vd as main after re-mode failed");
+        }
+    }
+    // 0. Re-assert the --capture-primary gamma blanking. The
+    //    re-mode (applySettings) and the re-anchor above are
+    //    display reconfigurations, and macOS RESETS the physical
+    //    panels' gamma tables on a reconfiguration — so the
+    //    all-black blanking installed at connect is lost and the
+    //    desktop shows through on resize. This immediate re-assert
+    //    (after the re-anchor, whose own reconfiguration would
+    //    otherwise undo an earlier one) covers the common case; the
+    //    LATE resets (capture re-engage / a final relayout after the
+    //    session re-enters, ~1 s in — the "quick blink after the
+    //    resize" a polling burst couldn't beat) are handled by the
+    //    post-sweep re-blanks in the thread below. (An event-driven
+    //    re-blank was tried and REMOVED: the private
+    //    CGVirtualDisplay applySettings resets gamma without
+    //    emitting a public reconfiguration event, so the callback
+    //    never fired — see the NOTE in virtual_display/mod.rs.)
+    //    No-op for --detach-primary (slot is None; that mode
+    //    disables the panel, not gamma).
+    if let Some(cap) = captured_primary.as_ref() {
+        if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
+            let failed = g.reassert_blanking();
+            tracing::info!(failed, "re-asserted capture-primary blanking after re-mode");
+        }
+    }
+    // Same hook for --shield-primary: re-fit the shield windows to
+    // the panels' new frames. Cheap and idempotent (SHOW
+    // reconciles rather than stacking).
+    if let Some(sh) = shielded_primary.as_ref() {
+        if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
+            let failed = g.reassert_blanking();
+            tracing::info!(failed, "re-fitted shield windows after re-mode");
+        }
+    }
+    let captured_primary = captured_primary.clone();
+    let shielded_primary = shielded_primary.clone();
+    std::thread::spawn(move || {
+        // Re-blank after each window-gather sweep. DIAGNOSED from
+        // the callback trace: the vd re-mode resets the physical
+        // gamma WITHOUT emitting a CGDisplay reconfiguration event
+        // (it's the private CGVirtualDisplay applySettings), so an
+        // event-driven re-blank never fires — AND the sync
+        // re-assert on the capture path (before this thread) is
+        // undone ~700 ms later by the gather's own WindowServer
+        // relayout, which re-resets the gamma. That's the "quick
+        // blink a little less than a second after the resize". So
+        // the re-assert has to run AFTER each sweep, here.
+        let reblank = || {
+            if let Some(cap) = captured_primary.as_ref() {
+                if let Some(g) = cap.lock().expect("captured_primary poisoned").as_ref() {
+                    g.reassert_blanking();
+                }
+            }
+            if let Some(sh) = shielded_primary.as_ref() {
+                if let Some(g) = sh.lock().expect("shielded_primary poisoned").as_ref() {
+                    g.reassert_blanking();
+                }
+            }
+        };
+        // TWO sweeps. The re-anchor's WindowServer relayout can
+        // still be finishing well after the first sweep (it fires
+        // during the reactivation churn, so it's slow) and would
+        // re-strand windows the first sweep just placed — the
+        // "apps flicker then disappear" symptom. A second sweep
+        // after the relayout has fully settled sticks. Robust to
+        // however long the relayout takes; a no-op second sweep is
+        // cheap when the first already stuck.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let first = crate::input::gather_windows_onto_display(vd_id);
+        reblank();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let second = crate::input::gather_windows_onto_display(vd_id);
+        reblank();
+        // One more after the relayout has fully settled, in case
+        // the second sweep's relayout also trails.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        reblank();
+        if first > 0 || second > 0 {
+            tracing::info!(
+                first,
+                second,
+                display_id = vd_id,
+                "gathered stranded windows after live resize (two sweeps)"
+            );
+        }
+    });
+}
+
+/// Re-modes a single-monitor session's virtual display to a new session size
+/// the way `sync_primary_display` does, for a live resize to run ahead of its
+/// reactivation.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct PrimaryRemode {
+    vd: Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>,
+    client_scale_percent: u32,
+    headless: bool,
+    captured_primary:
+        Option<Arc<std::sync::Mutex<Option<crate::virtual_display::CapturedPrimary>>>>,
+    shielded_primary:
+        Option<Arc<std::sync::Mutex<Option<crate::virtual_display::ShieldedPrimary>>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl PrimaryRemode {
+    /// Returns the display's id once it has the size. Blocks while the
+    /// WindowServer applies the mode.
+    fn apply(&self, width: u16, height: u16) -> Option<u32> {
+        let scale = virtual_display_scale(width, height, self.client_scale_percent);
+        let mut vd = self.vd.lock().expect("virtual display mutex poisoned");
+        if vd.size_px() == (u32::from(width), u32::from(height)) && vd.scale() == scale {
+            return Some(vd.display_id());
+        }
+        if let Err(e) = vd.resize(u32::from(width), u32::from(height), scale) {
+            tracing::warn!(error = ?e, "re-moding the virtual display ahead of a live resize failed");
+            return None;
+        }
+        tracing::info!(
+            width,
+            height,
+            scale,
+            display_id = vd.display_id(),
+            "virtual display re-moded ahead of a live resize"
+        );
+        if self.headless {
+            after_headless_remode(&mut vd, &self.captured_primary, &self.shielded_primary);
+        }
+        Some(vd.display_id())
     }
 }
 
@@ -1197,6 +1278,97 @@ mod macos {
     /// tens of ms and are filtered out. 1 second is comfortably between.
     const SUPPRESS_DEBOUNCE: Duration = Duration::from_secs(1);
 
+    /// How long the primary capture keeps its latest frame for an EGFX
+    /// channel that isn't ready yet.
+    const EGFX_READY_GRACE: Duration = Duration::from_secs(10);
+
+    /// How long a live resize waits for the resized display's first frame.
+    const RESIZE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Starts a capture of `display` at `width`×`height` pixels.
+    fn start_stream(
+        display: &screencapturekit::shareable_content::SCDisplay,
+        width: u16,
+        height: u16,
+        fps: u32,
+        preserve_aspect: bool,
+    ) -> Result<AsyncSCStream> {
+        let filter = SCContentFilter::create()
+            .with_display(display)
+            .with_excluding_windows(&[])
+            .build();
+        let config = SCStreamConfiguration::new()
+            .with_width(u32::from(width))
+            .with_height(u32::from(height))
+            .with_pixel_format(SckPixelFormat::BGRA)
+            .with_fps(fps)
+            // Hide the macOS cursor in the captured framebuffer; we forward
+            // it separately as RGBAPointer so the client renders its own
+            // (real-shape) cursor without doubling up.
+            .with_shows_cursor(false)
+            // Aspect handling on a scaling (non-native) capture:
+            //   * letterbox=false (default for explicit --width/--height, or
+            //     auto-size + --stretch): stretch the source to fill the
+            //     output exactly — no black bars, but distorts on aspect
+            //     mismatch.
+            //   * letterbox=true (auto-size default): preserve the Mac's
+            //     aspect ratio, padding with black bars. input.rs maps mouse
+            //     coords into the centered content sub-rect to keep clicks
+            //     aligned (the stretch path needs no such correction, which
+            //     is why fill used to be the only mode).
+            //
+            // Apple replaced `scalesToFit` with `preservesAspectRatio`
+            // (inverse semantics) in macOS 14; on 14+ the newer property is
+            // what takes effect. `scales_to_fit(true)` stays set so the
+            // source scales to the output either way; `preserves_aspect_ratio`
+            // is the knob that picks letterbox vs stretch.
+            .with_scales_to_fit(true)
+            .with_preserves_aspect_ratio(preserve_aspect)
+            .with_queue_depth(SCK_QUEUE_DEPTH);
+        let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
+        stream
+            .start_capture()
+            .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+        Ok(stream)
+    }
+
+    /// The stream's next frame with content, retained rather than copied.
+    async fn next_frame(stream: &AsyncSCStream) -> Option<CVPixelBuffer> {
+        loop {
+            let sample = stream.next().await?;
+            if sample.frame_status().is_some_and(|s| !s.has_content()) {
+                continue;
+            }
+            let Some(pixel_buffer) = sample.image_buffer() else {
+                continue;
+            };
+            return Some(pixel_buffer);
+        }
+    }
+
+    /// A capture opened ahead of a live resize's reactivation, with its first
+    /// frame, for the capture the reactivation starts to take over.
+    struct PreparedStream {
+        display_id: u32,
+        size: (u16, u16),
+        stream: AsyncSCStream,
+        first_frame: Option<CVPixelBuffer>,
+    }
+
+    static PREPARED_STREAM: std::sync::Mutex<Option<PreparedStream>> = std::sync::Mutex::new(None);
+
+    fn take_prepared_stream(display_id: u32, size: (u16, u16)) -> Option<PreparedStream> {
+        let prepared = PREPARED_STREAM
+            .lock()
+            .expect("prepared stream mutex poisoned")
+            .take()?;
+        if (prepared.display_id, prepared.size) == (display_id, size) {
+            return Some(prepared);
+        }
+        let _ = prepared.stream.stop_capture();
+        None
+    }
+
     /// Captures a non-primary monitor's display into its EGFX output. The
     /// primary monitor's `ScreenCaptureUpdates` keeps the session's cursor,
     /// resizes and fallbacks; this only feeds video, and stops when dropped.
@@ -1227,22 +1399,7 @@ mod macos {
                 .iter()
                 .find(|d| d.display_id() == display_id)
                 .with_context(|| format!("SCK enumeration has no display with id={display_id}"))?;
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-            let config = SCStreamConfiguration::new()
-                .with_width(u32::from(width))
-                .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
-                .with_shows_cursor(false)
-                .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(false);
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
-            stream
-                .start_capture()
-                .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let stream = start_stream(display, width, height, fps, false)?;
             let task = tokio::spawn(async move {
                 // SCK sends a frame only when the screen changes, so hold the
                 // latest one until the output takes it: the output appears with
@@ -1413,12 +1570,113 @@ mod macos {
         /// reactivation's `request_initial_size` call doesn't re-adopt
         /// whatever size the client's Confirm Active echoes.
         suppress_next_adopt: Arc<AtomicBool>,
+        /// A frame EGFX hasn't taken yet. SCK sends a frame only when the
+        /// screen changes, and its first ones come before the client opens
+        /// EGFX, so on a static screen the surfaces would wait for the next
+        /// change.
+        held_frame: Option<CVPixelBuffer>,
+        hold_until: Instant,
+        /// Re-modes the display ahead of a live resize; `None` outside
+        /// single-monitor virtual-display sessions.
+        remode: Option<super::PrimaryRemode>,
+        display_id: u32,
+        fps: u32,
     }
 
     impl ScreenCaptureUpdates {
         pub fn with_secondaries(mut self, secondaries: Vec<SecondaryCapture>) -> Self {
             self.secondaries = secondaries;
             self
+        }
+
+        /// Re-modes the display for a live resize and opens the capture that
+        /// the reactivation's `updates()` takes over, so the display settles
+        /// before the reactivation instead of after it. This capture stops
+        /// shipping meanwhile, which leaves the client on its last frame
+        /// rather than a black window.
+        async fn prepare_resize(
+            remode: Option<super::PrimaryRemode>,
+            fps: u32,
+            width: u16,
+            height: u16,
+        ) {
+            let Some(remode) = remode else {
+                return;
+            };
+            let started = Instant::now();
+            let Ok(Some(display_id)) =
+                tokio::task::spawn_blocking(move || remode.apply(width, height)).await
+            else {
+                return;
+            };
+            let stream = async {
+                let content = AsyncSCShareableContent::get()
+                    .await
+                    .map_err(|e| anyhow!("AsyncSCShareableContent::get failed: {e:?}"))?;
+                let displays = content.displays();
+                let display = displays
+                    .iter()
+                    .find(|d| d.display_id() == display_id)
+                    .with_context(|| {
+                        format!("SCK enumeration has no display with id={display_id}")
+                    })?;
+                start_stream(display, width, height, fps, false)
+            };
+            let stream = match stream.await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "opening the resized display's capture failed");
+                    return;
+                }
+            };
+            let first_frame = tokio::time::timeout(RESIZE_FIRST_FRAME_TIMEOUT, next_frame(&stream))
+                .await
+                .ok()
+                .flatten();
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                has_frame = first_frame.is_some(),
+                "resized display's capture ready"
+            );
+            *PREPARED_STREAM
+                .lock()
+                .expect("prepared stream mutex poisoned") = Some(PreparedStream {
+                display_id,
+                size: (width, height),
+                stream,
+                first_frame,
+            });
+        }
+
+        /// Ships the held frame once EGFX takes it. Returns whether it did.
+        fn ship_held_frame(&mut self) -> bool {
+            let (Some(gfx), Some(held)) = (self.gfx.as_ref(), self.held_frame.as_ref()) else {
+                return false;
+            };
+            let submitted = held
+                .lock(CVPixelBufferLockFlags::READ_ONLY)
+                .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))
+                .and_then(|g| gfx.submit_bgra(g.as_slice(), g.bytes_per_row(), true));
+            match submitted {
+                Ok(true) => {
+                    self.last_frame = self.held_frame.take();
+                    self.flush_remaining = self.flush_frames;
+                    self.seeded = true;
+                    self.first_egfx_frame_sent = true;
+                    true
+                }
+                Ok(false) => {
+                    if Instant::now() >= self.hold_until {
+                        self.held_frame = None;
+                    }
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "EGFX submit of a held frame failed");
+                    self.held_frame = None;
+                    false
+                }
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -1440,6 +1698,7 @@ mod macos {
             desktop_size: SharedDesktopSize,
             pending_resize: PendingResize,
             suppress_next_adopt: Arc<AtomicBool>,
+            remode: Option<super::PrimaryRemode>,
         ) -> Result<Self> {
             let content = AsyncSCShareableContent::get()
                 .await
@@ -1532,44 +1791,12 @@ mod macos {
                 );
             }
 
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-
-            let config = SCStreamConfiguration::new()
-                .with_width(u32::from(width))
-                .with_height(u32::from(height))
-                .with_pixel_format(SckPixelFormat::BGRA)
-                .with_fps(fps)
-                // Hide the macOS cursor in the captured framebuffer; we forward
-                // it separately as RGBAPointer so the client renders its own
-                // (real-shape) cursor without doubling up.
-                .with_shows_cursor(false)
-                // Aspect handling on a scaling (non-native) capture:
-                //   * letterbox=false (default for explicit --width/--height, or
-                //     auto-size + --stretch): stretch the source to fill the
-                //     output exactly — no black bars, but distorts on aspect
-                //     mismatch.
-                //   * letterbox=true (auto-size default): preserve the Mac's
-                //     aspect ratio, padding with black bars. input.rs maps mouse
-                //     coords into the centered content sub-rect to keep clicks
-                //     aligned (the stretch path needs no such correction, which
-                //     is why fill used to be the only mode).
-                //
-                // Apple replaced `scalesToFit` with `preservesAspectRatio`
-                // (inverse semantics) in macOS 14; on 14+ the newer property is
-                // what takes effect. `scales_to_fit(true)` stays set so the
-                // source scales to the output either way; `preserves_aspect_ratio`
-                // is the knob that picks letterbox vs stretch.
-                .with_scales_to_fit(true)
-                .with_preserves_aspect_ratio(letterbox)
-                .with_queue_depth(SCK_QUEUE_DEPTH);
-
-            let stream = AsyncSCStream::new(&filter, &config, 4, SCStreamOutputType::Screen);
-            stream
-                .start_capture()
-                .map_err(|e| anyhow!("SCStream::start_capture failed: {e:?}"))?;
+            let display_id = display.display_id();
+            let (stream, held_frame) =
+                match take_prepared_stream(display_id, (width, height)).filter(|_| !letterbox) {
+                    Some(prepared) => (prepared.stream, prepared.first_frame),
+                    None => (start_stream(display, width, height, fps, letterbox)?, None),
+                };
 
             // Cursor scale = session framebuffer px ÷ display backing px.
             // SkyLight hands the cursor back at the display's backing pixels;
@@ -1634,6 +1861,11 @@ mod macos {
                 pending_resize,
                 desktop_size,
                 suppress_next_adopt,
+                held_frame,
+                hold_until: Instant::now() + EGFX_READY_GRACE,
+                remode,
+                display_id,
+                fps,
             })
         }
     }
@@ -1679,7 +1911,12 @@ mod macos {
             // client), so without intervention the local cursor is stranded and
             // invisible after disconnect. Warp it back to the center of the
             // primary physical display so the Mac stays usable. Best-effort.
-            if self.warp_cursor_home {
+            // When the captured display is the main one (the headless modes),
+            // the cursor is on a visible display already, and this also runs on
+            // every live-resize reactivation, where a warp would yank it.
+            if self.warp_cursor_home
+                && core_graphics::display::CGDisplay::main().id != self.display_id
+            {
                 use core_graphics::display::CGDisplay;
                 use core_graphics::geometry::CGPoint;
                 let b = CGDisplay::main().bounds();
@@ -1769,6 +2006,7 @@ mod macos {
                 // MonitorLayout PDU) — silently snapping the resize back
                 // before the next frame ships.
                 if let Some((w, h)) = self.pending_resize.take_settled(RESIZE_DEBOUNCE) {
+                    Self::prepare_resize(self.remode.clone(), self.fps, w, h).await;
                     self.desktop_size.set(w, h);
                     self.suppress_next_adopt.store(true, Ordering::Relaxed);
                     if let Some(gfx) = self.gfx.as_ref() {
@@ -1779,6 +2017,10 @@ mod macos {
                         width: w,
                         height: h,
                     })));
+                }
+
+                if self.ship_held_frame() {
+                    continue;
                 }
 
                 // Poll cursor at loop top — preempts queued bitmap rects so
@@ -1861,7 +2103,10 @@ mod macos {
                 // last frame, and a settled resize gets picked up promptly
                 // instead of stalling until the next real desktop change).
                 // (Neither pending — the common idle case — blocks normally.)
-                let sample = if self.flush_remaining > 0 || self.pending_resize.has_pending() {
+                let sample = if self.flush_remaining > 0
+                    || self.pending_resize.has_pending()
+                    || self.held_frame.is_some()
+                {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
                         Ok(None) => return Ok(None),
@@ -2035,9 +2280,14 @@ mod macos {
                             // buffer. A retain, not a copy (see `last_frame`).
                             self.last_frame = Some(pixel_buffer.clone());
                             self.flush_remaining = self.flush_frames;
+                            self.held_frame = None;
                             continue;
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            if !self.first_egfx_frame_sent && Instant::now() < self.hold_until {
+                                self.held_frame = Some(pixel_buffer.clone());
+                            }
+                        }
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
                     }
                 }
