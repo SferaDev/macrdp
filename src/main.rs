@@ -1586,10 +1586,9 @@ fn attempt_auto_unlock(password: &str) -> AutoUnlockOutcome {
     // consumed waking/focusing the lock screen instead of entering text.
     // Round 1's mistake was using RETURN as that wake (it submitted an empty
     // password); a bare SHIFT tap cannot insert text and cannot submit, so
-    // it wakes the field harmlessly. Posted as FlagsChanged on BOTH event
-    // sources, the pattern `input.rs::post_flags_changed` established —
-    // `[NSEvent modifierFlags]` and the HID-level state are backed by
-    // different sources and both need to see it.
+    // it wakes the field harmlessly. Posted as FlagsChanged on both event
+    // sources, as live-tested; the lock screen ignores the doubled tap that
+    // `input.rs::post_flags_changed` now avoids for apps.
     const VK_SHIFT: u16 = 0x38;
     let post_flags = |flags: CGEventFlags| {
         for src in [&source, &source_hid] {
