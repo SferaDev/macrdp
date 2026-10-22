@@ -1720,7 +1720,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-egfx"
 version = "0.3.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?rev=a5d1c682fd1f65287f6f5727bdead2aef7a2bea7#a5d1c682fd1f65287f6f5727bdead2aef7a2bea7"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
