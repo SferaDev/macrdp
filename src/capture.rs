@@ -1580,6 +1580,7 @@ mod macos {
         /// Re-modes the display ahead of a live resize; `None` outside
         /// single-monitor virtual-display sessions.
         remode: Option<super::PrimaryRemode>,
+        display_id: u32,
         fps: u32,
     }
 
@@ -1849,6 +1850,7 @@ mod macos {
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
                 remode,
+                display_id,
                 fps,
             })
         }
@@ -1895,7 +1897,12 @@ mod macos {
             // client), so without intervention the local cursor is stranded and
             // invisible after disconnect. Warp it back to the center of the
             // primary physical display so the Mac stays usable. Best-effort.
-            if self.warp_cursor_home {
+            // When the captured display is the main one (the headless modes),
+            // the cursor is on a visible display already, and this also runs on
+            // every live-resize reactivation, where a warp would yank it.
+            if self.warp_cursor_home
+                && core_graphics::display::CGDisplay::main().id != self.display_id
+            {
                 use core_graphics::display::CGDisplay;
                 use core_graphics::geometry::CGPoint;
                 let b = CGDisplay::main().bounds();
