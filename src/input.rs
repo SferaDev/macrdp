@@ -724,6 +724,8 @@ pub fn init_focus_observer() {
 pub fn init_focus_observer() {}
 
 #[cfg(target_os = "macos")]
+mod repeat;
+#[cfg(target_os = "macos")]
 mod scancodes;
 
 // Re-export the gather-windows sweep so the capture path can trigger it
@@ -735,11 +737,12 @@ pub(crate) use macos::gather_windows_onto_display;
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     use super::is_remappable_shortcut;
+    use super::repeat::{RepeatTiming, Repeater, CLIENT_SILENCE_LIMIT};
     use super::scancodes::{is_numeric_pad_vk, scancode_to_cgkeycode};
     use super::DisplayRect;
 
@@ -1074,6 +1077,11 @@ mod macos {
         klid_handle: Option<super::SharedKeyboardLayout>,
         last_klid: u32,
         auto_layout: bool,
+        // Non-modifier keys the client holds down and when it last sent a
+        // key-down for each, so a second key-down is recognised as the
+        // client's own auto-repeat.
+        held_keys: HashMap<u16, Instant>,
+        key_repeat: KeyRepeat,
         // Whether the Mac translates with an ISO keyboard type, and when that
         // was read; see `iso_keyboard`.
         iso_keyboard: Option<(bool, Instant)>,
@@ -1155,6 +1163,8 @@ mod macos {
                 klid_handle,
                 last_klid: 0,
                 auto_layout,
+                held_keys: HashMap::new(),
+                key_repeat: KeyRepeat::start(),
                 iso_keyboard: None,
             })
         }
@@ -1338,6 +1348,8 @@ mod macos {
                 // key-down or a latch left by a Down whose Up never came.
                 self.remapped_keys.clear();
                 self.left_click_remapped = false;
+                self.held_keys.clear();
+                self.key_repeat.reset_connection();
             }
 
             // Only bother macOS when a modifier was actually released: our
@@ -1447,6 +1459,7 @@ mod macos {
                     "key post (modifier)"
                 );
                 if changed {
+                    self.key_repeat.stop();
                     self.post_flags_changed(vk);
                 }
                 // Commit any active Cmd+Tab session the moment both
@@ -1480,15 +1493,48 @@ mod macos {
                 return;
             }
 
+            // A key-down for a key the client already holds is the client's
+            // own auto-repeat. With server repeat on, the repeat timer already
+            // covers it, so it is dropped rather than doubling the rate. One
+            // after a long silence is a fresh press whose key-up got lost.
+            let now = Instant::now();
+            let client_repeat = down
+                && self
+                    .held_keys
+                    .get(&vk)
+                    .is_some_and(|&at| now.duration_since(at) < CLIENT_SILENCE_LIMIT);
+            if down {
+                self.held_keys.insert(vk, now);
+            } else {
+                self.held_keys.remove(&vk);
+                self.key_repeat.release(vk);
+            }
+
             tracing::debug!(
                 scancode = format!("0x{scancode:02X}"),
                 extended,
                 down,
+                client_repeat,
                 vk = format!("0x{vk:02X}"),
                 is_modifier = false,
                 flags = format!("0x{:08X}", self.mods.cg_flags().bits()),
                 "key post"
             );
+
+            if client_repeat {
+                self.key_repeat.client_repeat(vk);
+                if self.consumed_keys.contains(&vk) {
+                    // Holding Tab under Cmd keeps stepping the switcher, as on
+                    // a Mac; a held screenshot or Spotlight chord fires once.
+                    if matches!(vk, VK_TAB | VK_GRAVE | VK_LEFT | VK_RIGHT) {
+                        self.try_symbolic_hotkey(vk);
+                    }
+                    return;
+                }
+                if server_key_repeat() {
+                    return;
+                }
+            }
 
             // Symbolic-hotkey interception: WindowServer's internal hotkey
             // dispatcher (which fires Cmd+Tab, Cmd+Space, Cmd+Shift+3/4/5,
@@ -1499,8 +1545,9 @@ mod macos {
             // keystroke. Triggers on key-down; the matching key-up is
             // tracked in `consumed_keys` so the bare key-up doesn't reach
             // the focused app either.
-            if down && self.try_symbolic_hotkey(vk) {
+            if down && !client_repeat && self.try_symbolic_hotkey(vk) {
                 self.consumed_keys.insert(vk);
+                self.key_repeat.press(vk, None);
                 return;
             }
             if !down && self.consumed_keys.remove(&vk) {
@@ -1529,6 +1576,13 @@ mod macos {
             {
                 self.post_ctrl_as_cmd(vk, true);
                 self.remapped_keys.insert(vk);
+                self.key_repeat.press(
+                    vk,
+                    Some(RepeatAction::Key {
+                        vk,
+                        flags: self.ctrl_to_cmd_flags(),
+                    }),
+                );
                 return;
             }
 
@@ -1549,6 +1603,7 @@ mod macos {
                     let shift = self.mods.has_shift();
                     let option = self.mods.has_alt();
                     let caps = self.mods.caps_lock;
+                    let mut repeat = None;
                     if let Some(text) = self
                         .layout
                         .as_mut()
@@ -1564,7 +1619,11 @@ mod macos {
                                 ev.set_string_from_utf16_unchecked(&utf16);
                                 ev.post(CGEventTapLocation::HID);
                             }
+                            repeat = Some(RepeatAction::Text(utf16));
                         }
+                    }
+                    if !client_repeat {
+                        self.key_repeat.press(vk, repeat);
                     }
                 }
                 return;
@@ -1582,7 +1641,14 @@ mod macos {
                 flags |= CGEventFlags::CGEventFlagNumericPad;
             }
             ev.set_flags(flags);
+            if client_repeat {
+                ev.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+            }
             ev.post(CGEventTapLocation::HID);
+            if down && !client_repeat {
+                self.key_repeat
+                    .press(vk, Some(RepeatAction::Key { vk, flags }));
+            }
         }
 
         /// Emit one FlagsChanged event for `vk` from the HID source. The
@@ -2122,6 +2188,262 @@ mod macos {
             // hijack a system binding.
             ev.set_flags(self.mods.cg_flags());
             ev.post(CGEventTapLocation::HID);
+        }
+    }
+
+    /// What a server-side repeat posts: the key-down again, or for a key the
+    /// layout translation turned into text, that text again.
+    #[derive(Clone)]
+    enum RepeatAction {
+        Key { vk: u16, flags: CGEventFlags },
+        Text(Vec<u16>),
+    }
+
+    /// `MACRDP_KEY_REPEAT=client` forwards the client's repeats instead of
+    /// repeating on the server. Read once.
+    fn server_key_repeat() -> bool {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            let client = std::env::var("MACRDP_KEY_REPEAT")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("client"));
+            if client {
+                tracing::info!("key repeat follows the client (MACRDP_KEY_REPEAT=client)");
+            }
+            !client
+        })
+    }
+
+    /// The Mac's repeat delay and rate, as AppKit applies them (defaults
+    /// included). `NSUserDefaults` picks up System Settings changes live.
+    fn mac_repeat_timing() -> Option<RepeatTiming> {
+        use objc2::runtime::AnyClass;
+        use objc2::{class, msg_send};
+        let cls: &AnyClass = class!(NSEvent);
+        let (delay, interval): (f64, f64) = unsafe {
+            (
+                msg_send![cls, keyRepeatDelay],
+                msg_send![cls, keyRepeatInterval],
+            )
+        };
+        RepeatTiming::from_secs(delay, interval)
+    }
+
+    struct RepeatState {
+        repeater: Repeater<RepeatAction>,
+        timing: Option<RepeatTiming>,
+        timing_read_at: Option<Instant>,
+        shutdown: bool,
+    }
+
+    /// Owns the repeat thread. Repeats are posted with the state lock held and
+    /// a key-up takes the lock before it is posted, so no repeat can land
+    /// after the key-up it belongs to.
+    struct KeyRepeat {
+        shared: std::sync::Arc<(std::sync::Mutex<RepeatState>, std::sync::Condvar)>,
+    }
+
+    impl KeyRepeat {
+        const TIMING_TTL: Duration = Duration::from_secs(5);
+
+        fn start() -> Self {
+            let shared = std::sync::Arc::new((
+                std::sync::Mutex::new(RepeatState {
+                    repeater: Repeater::default(),
+                    timing: None,
+                    timing_read_at: None,
+                    shutdown: false,
+                }),
+                std::sync::Condvar::new(),
+            ));
+            if server_key_repeat() {
+                let thread_shared = shared.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("macrdp-key-repeat".into())
+                    .spawn(move || Self::run(&thread_shared));
+                if let Err(e) = spawned {
+                    warn!(error = %e, "key repeat thread failed to start; holding a key types once");
+                }
+            }
+            Self { shared }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, RepeatState> {
+            self.shared.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn press(&self, vk: u16, action: Option<RepeatAction>) {
+            if !server_key_repeat() {
+                return;
+            }
+            let mut st = self.lock();
+            if st
+                .timing_read_at
+                .is_none_or(|at| at.elapsed() >= Self::TIMING_TTL)
+            {
+                st.timing = mac_repeat_timing();
+                st.timing_read_at = Some(Instant::now());
+            }
+            let timing = st.timing;
+            st.repeater.press(vk, action, timing, Instant::now());
+            drop(st);
+            self.shared.1.notify_one();
+        }
+
+        fn client_repeat(&self, vk: u16) {
+            self.lock().repeater.client_repeat(vk, Instant::now());
+        }
+
+        fn release(&self, vk: u16) {
+            self.lock().repeater.release(vk);
+        }
+
+        fn stop(&self) {
+            self.lock().repeater.stop();
+        }
+
+        fn reset_connection(&self) {
+            self.lock().repeater.reset_connection();
+        }
+
+        fn run(shared: &(std::sync::Mutex<RepeatState>, std::sync::Condvar)) {
+            let (lock, wake) = shared;
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                warn!("key repeat: CGEventSource::new failed; holding a key types once");
+                return;
+            };
+            if let Err(kr) = make_time_constraint_thread() {
+                warn!(kr, "key repeat: no real-time timer; repeats may run slow");
+            }
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if st.shutdown {
+                    return;
+                }
+                let (Some(at), Some(timing)) = (st.repeater.deadline(), st.timing) else {
+                    st = wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                };
+                let now = Instant::now();
+                if at > now {
+                    st = wake
+                        .wait_timeout(st, at - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                    continue;
+                }
+                if let Some(action) = st.repeater.fire(now, timing) {
+                    post_repeat(&source, &action);
+                }
+            }
+        }
+    }
+
+    /// Exempt the calling thread from timer coalescing. launchd clamps an agent
+    /// without a ProcessType to utility QoS, where a 30 ms condvar wait wakes
+    /// 50 to 90 ms late; a time-constraint thread wakes within microseconds.
+    /// The thread sleeps between repeats, so the budget only bounds one post.
+    fn make_time_constraint_thread() -> Result<(), i32> {
+        #[repr(C)]
+        struct TimeConstraintPolicy {
+            period: u32,
+            computation: u32,
+            constraint: u32,
+            preemptible: i32,
+        }
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+        unsafe extern "C" {
+            fn mach_timebase_info(info: *mut Timebase) -> i32;
+            fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+            fn thread_policy_set(thread: u32, flavor: u32, policy: *const i32, count: u32) -> i32;
+        }
+        let mut tb = Timebase { numer: 0, denom: 0 };
+        let kr = unsafe { mach_timebase_info(&mut tb) };
+        if kr != 0 || tb.numer == 0 {
+            return Err(kr);
+        }
+        let abs = |d: Duration| (d.as_nanos() as u64 * tb.denom as u64 / tb.numer as u64) as u32;
+        let policy = TimeConstraintPolicy {
+            period: 0,
+            computation: abs(Duration::from_millis(2)),
+            constraint: abs(Duration::from_millis(10)),
+            preemptible: 1,
+        };
+        let kr = unsafe {
+            thread_policy_set(
+                pthread_mach_thread_np(libc::pthread_self()),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const TimeConstraintPolicy as *const i32,
+                (std::mem::size_of::<TimeConstraintPolicy>() / 4) as u32,
+            )
+        };
+        if kr == 0 {
+            Ok(())
+        } else {
+            Err(kr)
+        }
+    }
+
+    #[cfg(test)]
+    mod time_constraint_tests {
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn a_time_constraint_thread_wakes_on_time() {
+            std::thread::spawn(|| {
+                super::make_time_constraint_thread().expect("thread_policy_set");
+                let (lock, cv) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+                let mut guard = lock.lock().unwrap();
+                let mut worst = Duration::ZERO;
+                for _ in 0..10 {
+                    let due = Instant::now() + Duration::from_millis(30);
+                    while Instant::now() < due {
+                        guard = cv.wait_timeout(guard, due - Instant::now()).unwrap().0;
+                    }
+                    worst = worst.max(Instant::now() - due);
+                }
+                // Coalesced timers miss by 5 ms at default QoS, 50+ under launchd.
+                assert!(worst < Duration::from_millis(3), "woke {worst:?} late");
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    impl Drop for KeyRepeat {
+        fn drop(&mut self) {
+            self.lock().shutdown = true;
+            self.shared.1.notify_one();
+        }
+    }
+
+    fn post_repeat(source: &CGEventSource, action: &RepeatAction) {
+        match action {
+            RepeatAction::Key { vk, flags } => {
+                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), *vk, true) else {
+                    return;
+                };
+                ev.set_flags(*flags);
+                // Marks it as a repeat, as the HID system does for a held key,
+                // so press-and-hold accents and games behave as they do locally.
+                ev.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+                ev.post(CGEventTapLocation::HID);
+            }
+            // Not flagged as a repeat: these carry keycode 0 with the text
+            // attached, and a flagged repeat of keycode 0 can open the accent
+            // menu for "a" instead of typing the text.
+            RepeatAction::Text(utf16) => {
+                let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), 0, true) else {
+                    return;
+                };
+                ev.set_string_from_utf16_unchecked(utf16);
+                ev.post(CGEventTapLocation::HID);
+            }
         }
     }
 
