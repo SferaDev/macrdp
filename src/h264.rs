@@ -2980,7 +2980,10 @@ impl Gfx {
                         f.encoded_ns,
                         now,
                     );
-                    crate::latency_trace::record_us(&format!("m{label}.frame_bytes"), f.data.len() as u64);
+                    crate::latency_trace::record_us(
+                        &format!("m{label}.frame_bytes"),
+                        f.data.len() as u64,
+                    );
                 }
             }
             Ok(())

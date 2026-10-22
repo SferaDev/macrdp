@@ -726,7 +726,11 @@ mod ffi {
     #[cfg(test)]
     pub(super) fn max_frame_delay_count(guard: &SessionGuard) -> Option<i32> {
         extern "C" {
-            fn CFNumberGetValue(number: CFNumberRef, the_type: i32, value_ptr: *mut c_void) -> Boolean;
+            fn CFNumberGetValue(
+                number: CFNumberRef,
+                the_type: i32,
+                value_ptr: *mut c_void,
+            ) -> Boolean;
         }
         unsafe {
             let mut value: CFTypeRef = ptr::null();
@@ -740,7 +744,11 @@ mod ffi {
                 return None;
             }
             let mut out: i32 = -1;
-            CFNumberGetValue(value, KCF_NUMBER_INT32_TYPE, &mut out as *mut i32 as *mut c_void);
+            CFNumberGetValue(
+                value,
+                KCF_NUMBER_INT32_TYPE,
+                &mut out as *mut i32 as *mut c_void,
+            );
             CFRelease(value);
             Some(out)
         }
@@ -1801,13 +1809,20 @@ mod tests {
                 super::ffi::K_CV_PIXEL_FORMAT_TYPE_420F,
                 low_latency,
             );
-            assert!(guard.is_ok(), "low_latency={low_latency}: {:?}", guard.err());
+            assert!(
+                guard.is_ok(),
+                "low_latency={low_latency}: {:?}",
+                guard.err()
+            );
             let guard = guard.unwrap();
             // Low-latency rate control has no frame delay and doesn't expose
             // the property at all.
             // The low-latency encoder is hardware-only and doesn't report it.
             let hw = super::ffi::using_hardware(&guard);
-            assert!(hw == Some(true) || (low_latency && hw.is_none()), "low_latency={low_latency}: {hw:?}");
+            assert!(
+                hw == Some(true) || (low_latency && hw.is_none()),
+                "low_latency={low_latency}: {hw:?}"
+            );
             let expected = if low_latency { None } else { Some(0) };
             assert_eq!(
                 super::ffi::max_frame_delay_count(&guard),
@@ -1852,7 +1867,10 @@ mod tests {
                 }
             }
             let mut enc = Encoder::new(w, h, FPS, 20_000_000, 2.0).unwrap();
-            println!("  {w}x{h}: hardware={:?}", super::ffi::using_hardware(&enc.inner));
+            println!(
+                "  {w}x{h}: hardware={:?}",
+                super::ffi::using_hardware(&enc.inner)
+            );
             let rx = enc.take_receiver().unwrap();
             let submits: Arc<Mutex<HashMap<i64, Instant>>> = Arc::default();
             let collector = {
@@ -1862,7 +1880,11 @@ mod tests {
                     while let Ok(f) = rx.recv() {
                         let at = Instant::now();
                         if let Some(t) = submits.lock().unwrap().remove(&f.pts) {
-                            out.push((at.duration_since(t).as_secs_f64() * 1e3, f.is_keyframe, f.data.len()));
+                            out.push((
+                                at.duration_since(t).as_secs_f64() * 1e3,
+                                f.is_keyframe,
+                                f.data.len(),
+                            ));
                         }
                     }
                     out
@@ -1875,7 +1897,10 @@ mod tests {
                 if i % 30 == 29 {
                     frame.rotate_left(stride * 24);
                 } else {
-                    let (bx, by) = ((i * 37) % (usize::from(w) - 200), (i * 13) % (usize::from(h) - 40));
+                    let (bx, by) = (
+                        (i * 37) % (usize::from(w) - 200),
+                        (i * 13) % (usize::from(h) - 40),
+                    );
                     for y in by..by + 40 {
                         for b in &mut frame[y * stride + bx * 4..y * stride + (bx + 200) * 4] {
                             *b = b.wrapping_add(97);
