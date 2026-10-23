@@ -162,12 +162,22 @@ impl Damage {
 /// of changed pixels: clipped, grown to whole macroblocks, merged to at most
 /// [`MAX_REGION_RECTS`]. `None` means the whole surface.
 pub fn region_rects(rects: &[Rect], width: u16, height: u16) -> Option<Vec<Rect>> {
+    region_rects_with_margin(rects, width, height, MARGIN)
+}
+
+/// [`region_rects`] growing each rect by `margin` instead of [`MARGIN`].
+pub fn region_rects_with_margin(
+    rects: &[Rect],
+    width: u16,
+    height: u16,
+    margin: u32,
+) -> Option<Vec<Rect>> {
     let (w, h) = (u32::from(width), u32::from(height));
     let mut out: Vec<Rect> = rects
         .iter()
         .map(|r| r.clip(w, h))
         .filter(|r| !r.is_empty())
-        .map(|r| r.aligned(MARGIN, w, h))
+        .map(|r| r.aligned(margin, w, h))
         .collect();
     if out.is_empty() {
         return None;
@@ -254,6 +264,12 @@ impl DamageTracker {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// The same policy without the periodic whole-surface frame.
+    pub fn without_full_refresh(mut self) -> Self {
+        self.full_refresh = None;
+        self
     }
 
     /// Records the damage of the frame submitted with presentation time `pts`.
@@ -475,6 +491,17 @@ mod tests {
         assert_eq!(t.regions(pts, false, 1920, 1080, now), None);
         t.submitted(pts + 1, Damage::Full);
         assert_eq!(t.regions(pts + 1, false, 1920, 1080, now), None);
+    }
+
+    #[test]
+    fn lazy_chroma_policy_has_no_periodic_refresh() {
+        let start = Instant::now();
+        let mut t = DamageTracker::new(true, Some(Duration::from_secs(1))).without_full_refresh();
+        let pts = settled(&mut t, start);
+        t.submitted(pts, Damage::Rects(vec![r(0, 0, 4, 4)]));
+        assert!(t
+            .regions(pts, false, 1920, 1080, start + Duration::from_secs(5))
+            .is_some());
     }
 
     #[test]

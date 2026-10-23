@@ -609,6 +609,23 @@ MACRDP_EGFX_DIRTY_RECTS=1         # 0/off = always the whole surface (the old wi
 MACRDP_EGFX_FULL_REFRESH_MS=1000  # ship a frame whole when the last whole one is older (0 = never)
 ```
 
+Lazy chroma (env only, opt-in, `src/lazy_chroma.rs`). For a client that negotiates
+AVC444 (a V10 capability set without `AVC_DISABLED`), the primary monitor's motion
+frames ship as AVC444 LC=1 (the same H.264 frame as AVC420) and, once the screen
+has been idle, one LC=2 frame carries the auxiliary view (the chroma 4:2:0 drops)
+for every rect that changed since the last one, so coloured text sharpens at
+rest. The frame after it predicts from an acknowledged long-term reference, so
+it costs what it would have without the auxiliary picture. Turning it on also
+turns on VideoToolbox low-latency rate control (LTR needs it), turns off the
+periodic whole-surface frame (`MACRDP_EGFX_FULL_REFRESH_MS`) and stretches the
+periodic IDR, since every whole-surface frame drops the refined chroma
+everywhere until the next pause. Secondary monitors stay AVC420.
+```
+MACRDP_AVC444=lazy               # off unless set
+MACRDP_AVC444_IDLE_MS=250        # idle time before the auxiliary view ships
+MACRDP_AVC444_KEYFRAME_SECS=30   # shortest periodic IDR interval (--keyframe-interval wins if longer)
+```
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.

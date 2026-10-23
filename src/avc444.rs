@@ -34,7 +34,8 @@
 //! - All planes are tightly packed with `stride = plane_width` in the test
 //!   helpers; the production API takes explicit strides.
 
-#![allow(dead_code)] // wired into the h264 pipeline in a follow-up commit
+// Production sends only the aux view (`pack_aux_v1_nv12`); the split and combine are test references.
+#![allow(dead_code)]
 
 /// Height the auxiliary Y plane must be allocated to. Matches FreeRDP's
 /// `padHeigth = height + 16 - height % 16`. Adds 16 when already aligned, which
@@ -139,6 +140,48 @@ pub fn split_yuv444_to_yuv420_v1(
             let col = (2 * x + 1).min(width - 1);
             dst_u_row[x] = src_u_row[col];
             dst_v_row[x] = src_v_row[col];
+        }
+    }
+}
+
+/// The aux view (B4 to B7) of `u` and `v` as NV12 with `aux_rows` luma rows, which may cut off the last odd V rows.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_aux_v1_nv12(
+    u: &[u8],
+    v: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    aux_y: &mut [u8],
+    aux_y_stride: usize,
+    aux_uv: &mut [u8],
+    aux_uv_stride: usize,
+    aux_rows: usize,
+) {
+    debug_assert!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "dimensions must be even"
+    );
+    for row in 0..aux_rows {
+        let (plane, i) = if row % 16 < 8 {
+            (u, row / 16 * 8 + row % 16)
+        } else {
+            (v, row / 16 * 8 + row % 16 - 8)
+        };
+        let src_row = 2 * i + 1;
+        let dst = &mut aux_y[row * aux_y_stride..row * aux_y_stride + width];
+        if src_row < height {
+            dst.copy_from_slice(&plane[src_row * src_stride..src_row * src_stride + width]);
+        } else {
+            dst.fill(128);
+        }
+    }
+    for y in 0..(aux_rows / 2).min(height / 2) {
+        let (su, sv) = (&u[2 * y * src_stride..], &v[2 * y * src_stride..]);
+        let dst = &mut aux_uv[y * aux_uv_stride..y * aux_uv_stride + width];
+        for x in 0..width / 2 {
+            dst[2 * x] = su[2 * x + 1];
+            dst[2 * x + 1] = sv[2 * x + 1];
         }
     }
 }
@@ -435,6 +478,88 @@ mod tests {
         roundtrip(1920, 1088);
         roundtrip(2560, 1440);
         roundtrip(3840, 2160);
+    }
+
+    /// Odd samples come back exactly through FreeRDP's combine; a short height cuts only odd V rows.
+    #[test]
+    fn pack_aux_v1_nv12_feeds_the_combine() {
+        for (width, height) in [(64, 48), (64, 52), (1920, 1080)] {
+            let (_, src_u, src_v) = synthetic_yuv444(width, height);
+            let (hw, hh) = (width / 2, height / 2);
+            let pad_h = padded_aux_height(height);
+            let mut aux_y = vec![0u8; width * pad_h];
+            let mut aux_uv = vec![0u8; width * hh];
+            pack_aux_v1_nv12(
+                &src_u,
+                &src_v,
+                width,
+                width,
+                height,
+                &mut aux_y,
+                width,
+                &mut aux_uv,
+                width,
+                height,
+            );
+            let aux_u: Vec<u8> = aux_uv.iter().step_by(2).copied().collect();
+            let aux_v: Vec<u8> = aux_uv.iter().skip(1).step_by(2).copied().collect();
+            let mut dst_u = vec![0u8; width * height];
+            let mut dst_v = vec![0u8; width * height];
+            combine_chroma_v1_to_yuv444(
+                &aux_y, &aux_u, &aux_v, width, hw, hw, &mut dst_u, &mut dst_v, width, width, width,
+                height,
+            );
+            for j in 0..height {
+                for i in 0..width {
+                    if i % 2 == 0 && j % 2 == 0 {
+                        continue;
+                    }
+                    let idx = j * width + i;
+                    assert_eq!(dst_u[idx], src_u[idx], "U at ({i},{j}) {width}x{height}");
+                    // Odd V row r sits at aux row (r/2)/8*16 + 8 + (r/2)%8.
+                    let cut = j % 2 == 1 && (j / 2) / 8 * 16 + 8 + (j / 2) % 8 >= height;
+                    if !cut {
+                        assert_eq!(dst_v[idx], src_v[idx], "V at ({i},{j}) {width}x{height}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Same pattern and checksums as enhanced-rdp `LazyChromaTests.auxPackingMatchesMacrdp`.
+    #[test]
+    fn pack_aux_v1_nv12_known_answer() {
+        let (width, height) = (32, 20);
+        let u: Vec<u8> = (0..width * height)
+            .map(|k| ((k % width) * 7 + (k / width) * 13) as u8)
+            .collect();
+        let v: Vec<u8> = (0..width * height)
+            .map(|k| ((k % width) * 11 + (k / width) * 5 + 3) as u8)
+            .collect();
+        let mut aux_y = vec![0u8; width * height];
+        let mut aux_uv = vec![0u8; width * height / 2];
+        pack_aux_v1_nv12(
+            &u,
+            &v,
+            width,
+            width,
+            height,
+            &mut aux_y,
+            width,
+            &mut aux_uv,
+            width,
+            height,
+        );
+        let fnv = |b: &[u8]| {
+            b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| {
+                (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3)
+            })
+        };
+        assert_eq!(
+            (fnv(&aux_y), fnv(&aux_uv)),
+            (12_771_686_213_120_186_853, 1_933_696_412_089_527_653),
+            "update the client's LazyChromaTests if this changes"
+        );
     }
 
     #[test]

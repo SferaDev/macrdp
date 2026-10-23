@@ -22,7 +22,7 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -44,6 +44,19 @@ pub struct EncodedFrame {
     /// tracing is off.
     pub submitted_ns: u64,
     pub encoded_ns: u64,
+    /// The token to acknowledge for VT to use this frame as a long-term reference.
+    pub ltr_token: Option<i64>,
+}
+
+/// Writes full-range NV12 into the encoder's buffer: Y, Y stride, CbCr, CbCr stride.
+pub type Nv12Fill<'a> = dyn FnMut(&mut [u8], usize, &mut [u8], usize) + 'a;
+
+/// Per-frame encoder options beyond the picture itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameOptions {
+    pub force_keyframe: bool,
+    /// Predict from an acknowledged long-term reference (`kVTEncodeFrameOptionKey_ForceLTRRefresh`).
+    pub ltr_refresh: bool,
 }
 
 pub struct Encoder {
@@ -70,6 +83,8 @@ pub struct Encoder {
     /// blacks there. FreeRDP honors the range flag so it stays correct either
     /// way. Opt back out to video-range with `MACRDP_H264_FULL_RANGE=0`.
     full_range: bool,
+    /// LTR tokens to acknowledge on the next frame; only lazy chroma pushes any.
+    ltr_acks: Arc<Mutex<Vec<i64>>>,
 }
 
 impl Encoder {
@@ -82,6 +97,23 @@ impl Encoder {
         fps: u32,
         bitrate_bps: u32,
         keyframe_secs: f32,
+    ) -> Result<Self> {
+        // Lazy chroma needs long-term references, which VT offers only with low-latency rate control.
+        let low_latency = matches!(
+            std::env::var("MACRDP_VT_LOW_LATENCY").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) || crate::lazy_chroma::LazyChromaConfig::from_env().is_some();
+        Self::with_low_latency(width, height, fps, bitrate_bps, keyframe_secs, low_latency)
+    }
+
+    /// [`Self::new`] with the rate control chosen here instead of from the env.
+    pub fn with_low_latency(
+        width: u16,
+        height: u16,
+        fps: u32,
+        bitrate_bps: u32,
+        keyframe_secs: f32,
+        low_latency: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<EncodedFrame>();
         // The callback receives the raw `*mut Sender` and clones it per
@@ -100,10 +132,6 @@ impl Encoder {
         // Keyframe interval is a frame count; derive it from the requested
         // seconds and the frame rate. At least 1 (every frame an IDR).
         let keyframe_frames = (f64::from(fps) * f64::from(keyframe_secs)).round().max(1.0) as u32;
-        let low_latency = matches!(
-            std::env::var("MACRDP_VT_LOW_LATENCY").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE")
-        );
         let session = ffi::create_session(
             width,
             height,
@@ -127,7 +155,13 @@ impl Encoder {
             next_pts: 0,
             fps,
             full_range,
+            ltr_acks: Arc::default(),
         })
+    }
+
+    /// Where the ship thread queues the LTR tokens of frames the client got.
+    pub fn ltr_acks(&self) -> Arc<Mutex<Vec<i64>>> {
+        self.ltr_acks.clone()
     }
 
     /// Take the VideoToolbox output receiver, to run it on a dedicated ship
@@ -171,6 +205,23 @@ impl Encoder {
     /// the channel decouples producer and consumer cleanly. Returns the
     /// frame's presentation timestamp, which its `EncodedFrame::pts` carries.
     pub fn encode_bgra(&mut self, bgra: &[u8], stride: usize, force_keyframe: bool) -> Result<i64> {
+        self.encode_bgra_with(
+            bgra,
+            stride,
+            FrameOptions {
+                force_keyframe,
+                ..FrameOptions::default()
+            },
+        )
+    }
+
+    /// [`Self::encode_bgra`] with every [`FrameOptions`].
+    pub fn encode_bgra_with(
+        &mut self,
+        bgra: &[u8],
+        stride: usize,
+        options: FrameOptions,
+    ) -> Result<i64> {
         let expected = stride
             .checked_mul(self.height.into())
             .ok_or_else(|| anyhow!("stride*height overflows usize"))?;
@@ -185,18 +236,53 @@ impl Encoder {
         }
         let pts = self.next_pts;
         self.next_pts = self.next_pts.wrapping_add(1);
+        let acks = std::mem::take(&mut *self.ltr_acks.lock().unwrap());
         ffi::encode_frame(
             &self.inner,
-            bgra,
+            ffi::Source::Bgra(bgra, stride),
             self.width,
             self.height,
-            stride,
             pts,
             self.fps,
-            force_keyframe,
+            options,
+            &acks,
             self.full_range,
         )?;
         Ok(pts)
+    }
+
+    /// Submit a full-range NV12 picture that `fill` writes: lazy chroma's aux view.
+    pub fn encode_nv12_with(
+        &mut self,
+        fill: &mut Nv12Fill<'_>,
+        options: FrameOptions,
+    ) -> Result<i64> {
+        if !self.full_range {
+            bail!("NV12 input needs the full-range encoder (MACRDP_H264_FULL_RANGE)");
+        }
+        let pts = self.next_pts;
+        self.next_pts = self.next_pts.wrapping_add(1);
+        let acks = std::mem::take(&mut *self.ltr_acks.lock().unwrap());
+        ffi::encode_frame(
+            &self.inner,
+            ffi::Source::Nv12(fill),
+            self.width,
+            self.height,
+            pts,
+            self.fps,
+            options,
+            &acks,
+            self.full_range,
+        )?;
+        Ok(pts)
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn height(&self) -> u16 {
+        self.height
     }
 
     /// Pull every encoded frame the callback has produced so far.
@@ -223,13 +309,25 @@ impl Encoder {
     }
 }
 
+/// Full-resolution BT.709 full-range Cb and Cr planes of a BGRA frame, `width` bytes per row.
+pub fn bgra_to_cbcr444(
+    bgra: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    cb: &mut [u8],
+    cr: &mut [u8],
+) -> Result<()> {
+    ffi::bgra_to_cbcr444_vimage(bgra, stride, width, height, cb, cr)
+}
+
 // VT's compression session is thread-safe according to Apple's docs
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
 unsafe impl Send for Encoder {}
 
 mod ffi {
-    use super::EncodedFrame;
+    use super::{EncodedFrame, FrameOptions};
     use anyhow::{anyhow, bail, Result};
     use std::ffi::c_void;
     use std::ptr;
@@ -275,6 +373,7 @@ mod ffi {
     pub(super) const K_CM_TIME_FLAGS_VALID: u32 = 1;
 
     pub(super) const KCF_NUMBER_INT32_TYPE: i32 = 3;
+    pub(super) const KCF_NUMBER_SINT64_TYPE: i32 = 4;
 
     /// Opaque stand-in for `CFDictionaryKeyCallBacks` /
     /// `CFDictionaryValueCallBacks`. We never read these structs — we
@@ -325,6 +424,21 @@ mod ffi {
         pub(super) static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
         pub(super) static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         pub(super) static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
+        pub(super) static kVTEncodeFrameOptionKey_ForceLTRRefresh: CFStringRef;
+        pub(super) static kVTEncodeFrameOptionKey_AcknowledgedLTRTokens: CFStringRef;
+        pub(super) static kVTSampleAttachmentKey_RequireLTRAcknowledgementToken: CFStringRef;
+        pub(super) static kCFTypeArrayCallBacks: CFCallbacksOpaque;
+        pub(super) fn CFArrayCreate(
+            allocator: CFAllocatorRef,
+            values: *const CFTypeRef,
+            num_values: isize,
+            callbacks: *const c_void,
+        ) -> CFArrayRef;
+        pub(super) fn CFNumberGetValue(
+            number: CFNumberRef,
+            the_type: i32,
+            value_ptr: *mut c_void,
+        ) -> Boolean;
         // Color-space signaling so the encoded SPS VUI describes its color
         // space explicitly instead of leaving the decoder to guess (which is
         // why mstsc washed the image lighter while FreeRDP guessed right).
@@ -726,13 +840,6 @@ mod ffi {
     /// Reads back `MaxFrameDelayCount`, to confirm VT took the zero.
     #[cfg(test)]
     pub(super) fn max_frame_delay_count(guard: &SessionGuard) -> Option<i32> {
-        extern "C" {
-            fn CFNumberGetValue(
-                number: CFNumberRef,
-                the_type: i32,
-                value_ptr: *mut c_void,
-            ) -> Boolean;
-        }
         unsafe {
             let mut value: CFTypeRef = ptr::null();
             let st = VTSessionCopyProperty(
@@ -1020,11 +1127,7 @@ mod ffi {
     // Two reference implementations of full-resolution chroma conversion, kept
     // side-by-side for an A/B perf decision before committing to AVC444's
     // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
-    // Neither is wired into encode_frame; they exist for the bench in
-    // videotoolbox::tests::bench_yuv444_full_range.
-    //
-    // Gated behind cfg(test) until AVC444 is actually wired up — they're
-    // dead code in a production build today.
+    // The full planes serve bench_yuv444_full_range; lazy chroma uses Cb and Cr only.
 
     /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
     /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
@@ -1065,7 +1168,6 @@ mod ffi {
         }
     }
 
-    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -1089,7 +1191,6 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
-    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
@@ -1099,15 +1200,11 @@ mod ffi {
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
-    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
-    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
-    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
-    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
@@ -1161,16 +1258,65 @@ mod ffi {
         Ok(())
     }
 
+    /// Cb and Cr planes, `width` stride, with the matrix of [`bgra_to_yuv444_planar_vimage`].
+    pub(super) fn bgra_to_cbcr444_vimage(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        cb_plane: &mut [u8],
+        cr_plane: &mut [u8],
+    ) -> Result<()> {
+        if bgra.len() < src_stride * height
+            || cb_plane.len() < width * height
+            || cr_plane.len() < width * height
+        {
+            bail!("BGRA to CbCr444: buffers too small for {width}x{height}");
+        }
+        let src = VImageBuffer {
+            data: bgra.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: src_stride,
+        };
+        for (plane, matrix, post_bias) in [
+            (&mut *cb_plane, &CB_MATRIX, CB_POST_BIAS),
+            (&mut *cr_plane, &CR_MATRIX, CR_POST_BIAS),
+        ] {
+            let dest = VImageBuffer {
+                data: plane.as_mut_ptr() as *mut c_void,
+                height,
+                width,
+                row_bytes: width,
+            };
+            let err = unsafe {
+                vImageMatrixMultiply_ARGB8888ToPlanar8(
+                    &src,
+                    &dest,
+                    matrix.as_ptr(),
+                    DIVISOR,
+                    std::ptr::null(),
+                    post_bias,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            if err != 0 {
+                bail!("vImageMatrixMultiply_ARGB8888ToPlanar8 failed: {err}");
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // internal FFI helper; grouping into a struct adds no clarity
     pub(super) fn encode_frame(
         guard: &SessionGuard,
-        bgra: &[u8],
+        source: Source<'_>,
         width: u16,
         height: u16,
-        stride: usize,
         pts: i64,
         fps: u32,
-        force_keyframe: bool,
+        options: FrameOptions,
+        ltr_acks: &[i64],
         full_range: bool,
     ) -> Result<()> {
         // Full-range path feeds VT a `420f` (full-range NV12) buffer we fill
@@ -1210,7 +1356,20 @@ mod ffi {
         // success/failure so we don't leak on errors.
         let result = unsafe {
             CVPixelBufferLockBaseAddress(pbuf, 0);
-            if full_range {
+            if let Source::Nv12(fill) = source {
+                let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
+                let cbcr_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 1);
+                let y_plane = std::slice::from_raw_parts_mut(
+                    CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8,
+                    y_stride * usize::from(height),
+                );
+                let cbcr_plane = std::slice::from_raw_parts_mut(
+                    CVPixelBufferGetBaseAddressOfPlane(pbuf, 1) as *mut u8,
+                    cbcr_stride * (usize::from(height) / 2),
+                );
+                fill(y_plane, y_stride, cbcr_plane, cbcr_stride);
+            } else if let (true, Source::Bgra(bgra, stride)) = (full_range, &source) {
+                let (bgra, stride) = (*bgra, *stride);
                 // Two planes: Y (full size) + interleaved CbCr (half size).
                 let y_base = CVPixelBufferGetBaseAddressOfPlane(pbuf, 0) as *mut u8;
                 let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, 0);
@@ -1249,7 +1408,7 @@ mod ffi {
                         cbcr_stride,
                     );
                 }
-            } else {
+            } else if let Source::Bgra(bgra, stride) = source {
                 let dst = CVPixelBufferGetBaseAddress(pbuf) as *mut u8;
                 let dst_stride = CVPixelBufferGetBytesPerRow(pbuf);
                 let row_bytes = usize::from(width) * 4;
@@ -1279,20 +1438,7 @@ mod ffi {
                 flags: K_CM_TIME_FLAGS_VALID,
                 epoch: 0,
             };
-            let frame_props: CFDictionaryRef = if force_keyframe {
-                let key = kVTEncodeFrameOptionKey_ForceKeyFrame;
-                let value = kCFBooleanTrue;
-                CFDictionaryCreate(
-                    ptr::null(),
-                    &key as *const *const c_void,
-                    &value as *const *const c_void,
-                    1,
-                    &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                    &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-                )
-            } else {
-                ptr::null()
-            };
+            let frame_props = frame_properties(options, ltr_acks);
 
             let mut info_flags: VTEncodeInfoFlags = 0;
             let submitted_ns = if crate::latency_trace::enabled() {
@@ -1322,6 +1468,60 @@ mod ffi {
         };
         unsafe { CFRelease(pbuf) };
         result
+    }
+
+    /// What `encode_frame` reads the picture from.
+    pub(super) enum Source<'a> {
+        /// BGRA rows and their stride in bytes.
+        Bgra(&'a [u8], usize),
+        /// Fills the full-range NV12 buffer.
+        Nv12(&'a mut super::Nv12Fill<'a>),
+    }
+
+    /// The frame-properties dictionary for `options` and `ltr_acks`, null when empty.
+    unsafe fn frame_properties(options: FrameOptions, ltr_acks: &[i64]) -> CFDictionaryRef {
+        let mut keys: Vec<CFTypeRef> = Vec::new();
+        let mut values: Vec<CFTypeRef> = Vec::new();
+        if options.force_keyframe {
+            keys.push(kVTEncodeFrameOptionKey_ForceKeyFrame);
+            values.push(kCFBooleanTrue);
+        }
+        if options.ltr_refresh {
+            keys.push(kVTEncodeFrameOptionKey_ForceLTRRefresh);
+            values.push(kCFBooleanTrue);
+        }
+        let mut array: CFArrayRef = ptr::null();
+        if !ltr_acks.is_empty() {
+            let numbers: Vec<CFNumberRef> = ltr_acks
+                .iter()
+                .map(|t| {
+                    CFNumberCreate(
+                        ptr::null(),
+                        KCF_NUMBER_SINT64_TYPE,
+                        t as *const i64 as *const c_void,
+                    )
+                })
+                .collect();
+            array = CFArrayCreate(
+                ptr::null(),
+                numbers.as_ptr(),
+                numbers.len() as isize,
+                &kCFTypeArrayCallBacks as *const _ as *const c_void,
+            );
+            for n in numbers {
+                CFRelease(n);
+            }
+            keys.push(kVTEncodeFrameOptionKey_AcknowledgedLTRTokens);
+            values.push(array);
+        }
+        if keys.is_empty() {
+            return ptr::null();
+        }
+        let dict = cf_dict(&keys, &values);
+        if !array.is_null() {
+            CFRelease(array);
+        }
+        dict
     }
 
     #[allow(dead_code)] // only reached via Encoder::flush (shutdown / tests)
@@ -1387,10 +1587,25 @@ mod ffi {
         // sample-attachments array. Per Apple docs, if the attachments
         // array is missing or empty, the sample is a sync (keyframe).
         let mut is_keyframe = true;
+        let mut ltr_token = None;
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, 0);
         if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
             let dict = CFArrayGetValueAtIndex(attachments, 0) as CFDictionaryRef;
             if !dict.is_null() {
+                let token = CFDictionaryGetValue(
+                    dict,
+                    kVTSampleAttachmentKey_RequireLTRAcknowledgementToken,
+                );
+                let mut value: i64 = 0;
+                if !token.is_null()
+                    && CFNumberGetValue(
+                        token,
+                        KCF_NUMBER_SINT64_TYPE,
+                        &mut value as *mut i64 as *mut c_void,
+                    ) != 0
+                {
+                    ltr_token = Some(value);
+                }
                 let not_sync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
                 if !not_sync.is_null() {
                     // A present "NotSync" attachment means this is a
@@ -1442,6 +1657,7 @@ mod ffi {
             parameter_sets,
             submitted_ns: 0,
             encoded_ns: 0,
+            ltr_token,
         })
     }
 }
@@ -2022,6 +2238,66 @@ mod tests {
                 cr_v[0]
             );
         }
+    }
+
+    /// After an aux picture, the same frame stays tiny with an LTR refresh and costs nearly an aux picture without.
+    #[test]
+    fn ltr_refresh_after_an_aux_picture() -> Result<()> {
+        let (w, h) = (640u16, 368u16);
+        let (wu, hu) = (usize::from(w), usize::from(h));
+        let stride = wu * 4;
+        // Coloured strokes on white, so the auxiliary view has detail to code.
+        let mut frame = vec![0xffu8; stride * hu];
+        for y in 0..hu {
+            for x in 0..wu {
+                if (x / 3 + y / 5) % 4 == 0 && y % 12 < 9 {
+                    let p = &mut frame[y * stride + x * 4..][..4];
+                    p.copy_from_slice(&[(x * 7) as u8, (y * 3) as u8, 0xc0, 0xff]);
+                }
+            }
+        }
+        let mut cb = vec![0u8; wu * hu];
+        let mut cr = vec![0u8; wu * hu];
+        bgra_to_cbcr444(&frame, stride, wu, hu, &mut cb, &mut cr)?;
+
+        let mut after = Vec::new();
+        let mut aux_bytes = 0;
+        for refresh in [false, true] {
+            let mut enc = Encoder::with_low_latency(w, h, 60, 8_000_000, 100.0, true)?;
+            let acks = enc.ltr_acks();
+            let mut tokens = 0;
+            for i in 0..3 {
+                enc.encode_bgra(&frame, stride, i == 0)?;
+                for f in enc.flush()? {
+                    if let Some(t) = f.ltr_token {
+                        acks.lock().unwrap().push(t);
+                        tokens += 1;
+                    }
+                }
+            }
+            assert!(tokens > 0, "low-latency rate control emits LTR tokens");
+            let mut fill = |y: &mut [u8], ys: usize, uv: &mut [u8], uvs: usize| {
+                crate::avc444::pack_aux_v1_nv12(&cb, &cr, wu, wu, hu, y, ys, uv, uvs, hu);
+            };
+            enc.encode_nv12_with(&mut fill, FrameOptions::default())?;
+            aux_bytes = enc.flush()?.iter().map(|f| f.data.len()).sum::<usize>();
+            let options = FrameOptions {
+                force_keyframe: false,
+                ltr_refresh: refresh,
+            };
+            enc.encode_bgra_with(&frame, stride, options)?;
+            let out = enc.flush()?;
+            assert!(out.iter().all(|f| !f.is_keyframe));
+            after.push(out.iter().map(|f| f.data.len()).sum::<usize>());
+        }
+        eprintln!(
+            "aux picture {aux_bytes} B; next frame {} B predicting from it, {} B with an LTR refresh",
+            after[0], after[1]
+        );
+        assert!(aux_bytes > 0);
+        assert!(after[1] * 10 < aux_bytes, "{after:?} vs aux {aux_bytes}");
+        assert!(after[1] * 4 < after[0], "{after:?}");
+        Ok(())
     }
 
     #[test]

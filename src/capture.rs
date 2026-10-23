@@ -1721,6 +1721,10 @@ mod macos {
         /// The frame EGFX dropped last (busy encoder); offered again a frame
         /// later until it is encoded. Lives in `last_frame`.
         resubmit: bool,
+        /// When EGFX last took a changed frame, for lazy chroma's idle wait.
+        last_change_at: Instant,
+        /// Lazy chroma may still owe an auxiliary view, so the loop keeps waking.
+        aux_waiting: bool,
         /// The last captured frame, for telling real changes from redraws.
         last_frame_kept: LastFrame,
         /// What changed since EGFX last took a frame: the regions the next
@@ -1821,6 +1825,30 @@ mod macos {
                 Err(e) => {
                     tracing::warn!(error = ?e, "EGFX resubmit failed");
                     self.resubmit = false;
+                }
+            }
+        }
+
+        /// Lazy chroma: offers the aux view once idle after the flush burst; true while one may still be due.
+        fn offer_aux(&mut self) -> bool {
+            let Some(gfx) = self.gfx.as_ref() else {
+                return false;
+            };
+            let Some(idle) = gfx.lazy_chroma_idle() else {
+                return false;
+            };
+            if self.flush_remaining > 0 || self.resubmit || self.last_change_at.elapsed() < idle {
+                return true;
+            }
+            if self.last_frame.is_empty() || !gfx.lazy_chroma_due() {
+                return false;
+            }
+            match gfx.submit_aux_bgra(&self.last_frame, self.last_stride) {
+                Ok(crate::h264::OutputSubmit::Busy) => true,
+                Ok(_) => false,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "EGFX lazy chroma: auxiliary view submit failed");
+                    false
                 }
             }
         }
@@ -2028,6 +2056,8 @@ mod macos {
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
                 resubmit: false,
+                last_change_at: Instant::now(),
+                aux_waiting: false,
                 last_frame_kept: LastFrame::default(),
                 damage: Damage::default(),
                 last_damage: Damage::Full,
@@ -2275,6 +2305,7 @@ mod macos {
                     || self.pending_resize.has_pending()
                     || self.held_frame.is_some()
                     || self.resubmit
+                    || self.aux_waiting
                 {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
@@ -2296,6 +2327,9 @@ mod macos {
                                         }
                                     }
                                 }
+                            }
+                            if self.aux_waiting {
+                                self.aux_waiting = self.offer_aux();
                             }
                             continue;
                         }
@@ -2362,6 +2396,9 @@ mod macos {
                                     tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                                 }
                             }
+                        }
+                        if self.aux_waiting {
+                            self.aux_waiting = self.offer_aux();
                         }
                         continue;
                     }
@@ -2532,11 +2569,14 @@ mod macos {
                             // it enough times to drain mstsc's presentation
                             // buffer. Reuse the buffer to avoid a per-frame
                             // realloc; clear keeps the capacity.
-                            if self.flush_frames > 0 || self.resubmit {
+                            let lazy = gfx.lazy_chroma_idle().is_some();
+                            if self.flush_frames > 0 || self.resubmit || lazy {
                                 self.last_frame.clear();
                                 self.last_frame.extend_from_slice(src);
                                 self.last_stride = stride_bytes;
                             }
+                            self.last_change_at = Instant::now();
+                            self.aux_waiting = lazy;
                             self.flush_remaining = self.flush_frames;
                             self.held_frame = None;
                             continue;

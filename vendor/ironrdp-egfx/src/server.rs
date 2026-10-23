@@ -1569,6 +1569,66 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// macrdp divergence (2): AVC444 v1 with any LC and an explicit destination; `stream2` only with LC 0.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the two AVC420 streams of the PDU")]
+    pub fn send_avc444_frame_to_rect(
+        &mut self,
+        surface_id: u16,
+        encoding: Encoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2: Option<(&[u8], &[Avc420Region])>,
+        destination: ExclusiveRectangle,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() || !self.supports_avc444() {
+            return None;
+        }
+        if (encoding == Encoding::LUMA_AND_CHROMA) != stream2.is_some() {
+            return None;
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return None;
+        }
+
+        let surface = self.surfaces.get(surface_id)?;
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        let stream = |data, regions: &[Avc420Region]| Avc420BitmapStream {
+            rectangles: regions.iter().map(Avc420Region::to_rectangle).collect(),
+            quant_qual_vals: regions.iter().map(Avc420Region::to_quant_quality).collect(),
+            data,
+        };
+        let avc444_stream = Avc444BitmapStream {
+            encoding,
+            stream1: stream(stream1_data, stream1_regions),
+            stream2: stream2.map(|(data, regions)| stream(data, regions)),
+        };
+        let mut encoded_stream = encode_avc444_bitmap_stream(&avc444_stream);
+        // cbAvc420EncodedBitstream1 MUST be zero when LC is CHROMA (MS-RDPEGFX 2.2.4.5).
+        if encoding == Encoding::CHROMA {
+            encoded_stream[..4].copy_from_slice(&(u32::from(encoding.bits()) << 30).to_le_bytes());
+        }
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+
+        self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+            surface_id,
+            codec_id: Codec1Type::Avc444,
+            pixel_format: surface.pixel_format,
+            destination_rectangle: destination,
+            bitmap_data: encoded_stream,
+        }));
+
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Some(frame_id)
+    }
+
     /// Queue an H.264 AVC444 frame for transmission
     ///
     /// AVC444 uses two streams: luma (Y) and chroma (UV). Set `chroma_data` to

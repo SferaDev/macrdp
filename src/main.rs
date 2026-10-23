@@ -35,6 +35,8 @@ mod health;
 mod input;
 mod keyboard_layout;
 mod latency_trace;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod lazy_chroma;
 mod lock_activity;
 mod logging;
 mod monitor_layout;
