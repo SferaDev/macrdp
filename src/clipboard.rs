@@ -225,6 +225,45 @@ struct RemoteFetch {
 /// bounds a misbehaving client.
 const STALE_REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often the pasteboard poller samples `changeCount`, also while it waits
+/// for the remote to answer a format list.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RetryWait {
+    /// The remote accepted the current wave's format list.
+    Accepted,
+    /// The pasteboard changed again; the newer copy supersedes the wave.
+    Changed,
+    /// Neither happened within the delay.
+    Elapsed,
+}
+
+/// Waits up to `delay` for the remote to accept the current advertise wave,
+/// checking every `step`. A pasteboard change wins over an acceptance, since
+/// the newer copy has to be announced either way.
+async fn wait_for_answer(
+    delay: Duration,
+    step: Duration,
+    accepted: impl Fn() -> bool,
+    mut changed: impl FnMut() -> bool,
+) -> RetryWait {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return RetryWait::Elapsed;
+        }
+        tokio::time::sleep(step.min(deadline - now)).await;
+        if changed() {
+            return RetryWait::Changed;
+        }
+        if accepted() {
+            return RetryWait::Accepted;
+        }
+    }
+}
+
 /// Shared state coordinating the Mac-side advertise poller with the cliprdr
 /// backend's `on_format_list_response` hook. Lets us retry on Fail while
 /// guaranteeing we STOP re-advertising the instant the remote accepts an
@@ -361,6 +400,8 @@ impl ServerEventSender for MacCliprdr {
             // value so we don't fire an event for whatever was already on
             // the clipboard when macrdp launched.
             let mut last_seen = pb::change_count();
+            // Set when a retry wait saw the pasteboard change, so the next copy goes out now.
+            let mut recheck_now = false;
             loop {
                 // Park while no client has a clipboard channel: there is
                 // nobody to advertise to, so the NSPasteboard IPC 4×/s is
@@ -374,7 +415,9 @@ impl ServerEventSender for MacCliprdr {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if !std::mem::take(&mut recheck_now) {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
                 let current = pb::change_count();
                 if current == last_seen {
                     continue;
@@ -409,24 +452,33 @@ impl ServerEventSender for MacCliprdr {
                 // `local_file_list` inside cliprdr and silently breaks an
                 // otherwise-working paste. The delays are sized to give each
                 // response time to arrive before the next retry decision.
-                // Supersede check handles a newer copy starting mid-wave.
+                // The wait keeps sampling changeCount, so a newer copy ends the
+                // wave and is announced on the next pass instead of after it.
                 for delay in [
                     std::time::Duration::from_millis(1000),
                     std::time::Duration::from_millis(2500),
                     std::time::Duration::from_millis(5000),
                 ] {
-                    tokio::time::sleep(delay).await;
-                    if advertise_state.generation.load(Ordering::Relaxed) != my_gen {
-                        // A newer Mac-side copy started a new wave; let the
-                        // main loop handle it on its next tick.
-                        break;
-                    }
-                    if advertise_state.locked_gen.load(Ordering::Relaxed) == my_gen {
-                        // Remote acknowledged our advertise. Do NOT send
-                        // another format list — a rejection of that one would
-                        // wipe the accepted state.
-                        debug!(my_gen, "format list accepted; retry loop done");
-                        break;
+                    let answer = wait_for_answer(
+                        delay,
+                        POLL_INTERVAL,
+                        || advertise_state.locked_gen.load(Ordering::Relaxed) == my_gen,
+                        || pb::change_count() != last_seen,
+                    )
+                    .await;
+                    match answer {
+                        RetryWait::Changed => {
+                            recheck_now = true;
+                            break;
+                        }
+                        RetryWait::Accepted => {
+                            // Remote acknowledged our advertise. Do NOT send
+                            // another format list: a rejection of that one would
+                            // wipe the accepted state.
+                            debug!(my_gen, "format list accepted; retry loop done");
+                            break;
+                        }
+                        RetryWait::Elapsed => {}
                     }
                     if !advertise_pasteboard(&sender_arc, &paths_arc, rich) {
                         return;
@@ -1718,6 +1770,61 @@ mod tests {
         let got = read_file_range(&f.0, 0, 8 * 1024 * 1024).unwrap();
         assert_eq!(got.len(), MAX_FILE_RANGE_BYTES as usize);
         assert!(got.iter().all(|&b| b == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn a_retry_wait_ends_as_soon_as_the_remote_accepts() {
+        let started = std::time::Instant::now();
+        let answer = wait_for_answer(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || started.elapsed() >= Duration::from_millis(20),
+            || false,
+        )
+        .await;
+        assert_eq!(answer, RetryWait::Accepted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn a_new_copy_cuts_a_retry_wait_short() {
+        let started = std::time::Instant::now();
+        let both = std::cell::Cell::new(false);
+        let answer = wait_for_answer(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || both.get(),
+            || {
+                both.set(started.elapsed() >= Duration::from_millis(20));
+                both.get()
+            },
+        )
+        .await;
+        assert_eq!(
+            answer,
+            RetryWait::Changed,
+            "a change must win over an acceptance"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_retry_wait_runs_out_on_time() {
+        let started = std::time::Instant::now();
+        let mut checks = 0;
+        let answer = wait_for_answer(
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+            || false,
+            || {
+                checks += 1;
+                false
+            },
+        )
+        .await;
+        assert_eq!(answer, RetryWait::Elapsed);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(checks, 3, "steps of 20, 20 and the 10 left");
     }
 
     #[cfg(target_os = "macos")]
