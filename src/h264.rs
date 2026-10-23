@@ -2017,6 +2017,7 @@ impl Gfx {
                 .load(Ordering::Relaxed)
                 .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
             if outstanding >= u64::from(self.max_in_flight) {
+                crate::latency_trace::record_us("m0.busy_drop", 0);
                 trace!(
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
@@ -2027,6 +2028,7 @@ impl Gfx {
             // queues what it reads (FreeRDP) paces us, so without this the
             // client's decode queue runs away and video and input lag by seconds.
             if self.client_backlogged(ctx) {
+                crate::latency_trace::record_us("m0.lag_drop", 0);
                 trace!("EGFX frame-ack lag high; dropping capture");
                 return Ok(OutputSubmit::Busy);
             }
@@ -2712,6 +2714,7 @@ impl Gfx {
             .last_shipped_frame_id
             .load(Ordering::Relaxed)
             .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed));
+        crate::latency_trace::record_us("ack_lag", lag);
         if lag <= limit {
             return false;
         }
@@ -2740,10 +2743,12 @@ impl Gfx {
             .load(Ordering::Relaxed)
             .saturating_sub(o.shipped.load(Ordering::Relaxed));
         if outstanding >= u64::from(self.max_in_flight) {
+            crate::latency_trace::record_us(&format!("m{}.busy_drop", output + 1), 0);
             return Ok(OutputSubmit::Busy);
         }
         let ctx = guard.as_mut().expect("checked above");
         if self.client_backlogged(ctx) {
+            crate::latency_trace::record_us(&format!("m{}.lag_drop", output + 1), 0);
             return Ok(OutputSubmit::Busy);
         }
         let o = &mut ctx.outputs[output];
@@ -2952,6 +2957,16 @@ impl Gfx {
                     })
                     .collect()
             };
+            if crate::latency_trace::enabled() {
+                let label = output.map_or(0, |i| i + 1);
+                for r in regions.iter().flatten() {
+                    let px: u64 = r
+                        .iter()
+                        .map(|r| u64::from(r.right - r.left) * u64::from(r.bottom - r.top))
+                        .sum();
+                    crate::latency_trace::record_us(&format!("m{label}.region_px"), px);
+                }
+            }
             // The WireToSurface1 destination stays the whole surface; only
             // the regions narrow.
             let surface_rect = ExclusiveRectangle {
@@ -3060,6 +3075,36 @@ impl Gfx {
                     messages: svc_messages,
                 }))
                 .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+            if crate::latency_trace::enabled() {
+                let label = output.map_or(0, |i| i + 1);
+                let now = crate::latency_trace::now_ns();
+                for f in frames {
+                    crate::latency_trace::record_since_key(
+                        &format!("m{label}.key_to_submit"),
+                        label * 3 + 1,
+                        f.submitted_ns,
+                    );
+                    crate::latency_trace::record_since_key(
+                        &format!("m{label}.key_to_queued"),
+                        label * 3 + 2,
+                        now,
+                    );
+                    crate::latency_trace::record_ns_delta(
+                        &format!("m{label}.vt_encode"),
+                        f.submitted_ns,
+                        f.encoded_ns,
+                    );
+                    crate::latency_trace::record_ns_delta(
+                        &format!("m{label}.encoded_to_queued"),
+                        f.encoded_ns,
+                        now,
+                    );
+                    crate::latency_trace::record_us(
+                        &format!("m{label}.frame_bytes"),
+                        f.data.len() as u64,
+                    );
+                }
+            }
             Ok(())
         }
     }

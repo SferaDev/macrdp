@@ -35,6 +35,7 @@ mod h264;
 mod health;
 mod input;
 mod keyboard_layout;
+mod latency_trace;
 mod lock_activity;
 mod logging;
 mod monitor_layout;
@@ -2653,6 +2654,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_BLANK_RECOVERY_MAX_RTT_MS",
         ),
         ("BLANK_RECOVERY_MIN_QOE", "MACRDP_BLANK_RECOVERY_MIN_QOE"),
+        // Per-stage latency histograms in the log; see src/latency_trace.rs.
+        ("LATENCY_TRACE", "MACRDP_LATENCY_TRACE"),
         ("VT_LOW_LATENCY", "MACRDP_VT_LOW_LATENCY"),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         (
