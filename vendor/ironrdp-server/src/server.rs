@@ -484,6 +484,34 @@ pub fn tcp_srtt_ms(_stream: &tokio::net::TcpStream) -> Option<u32> {
     None
 }
 
+/// (vendored, divergence 31) Time spent writing EGFX frames to the socket,
+/// logged as p50/p95/max every 5 s under `MACRDP_LATENCY_TRACE=1`.
+fn trace_egfx_write(took: core::time::Duration) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static WINDOW: std::sync::Mutex<Option<(std::time::Instant, Vec<u32>)>> = std::sync::Mutex::new(None);
+    if !*ENABLED.get_or_init(|| std::env::var("MACRDP_LATENCY_TRACE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))) {
+        return;
+    }
+    let mut window = WINDOW.lock().unwrap();
+    let (since, samples) = window.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+    samples.push(u32::try_from(took.as_micros()).unwrap_or(u32::MAX));
+    if since.elapsed() >= core::time::Duration::from_secs(5) {
+        samples.sort_unstable();
+        let n = samples.len();
+        info!(
+            target: "macrdp::latency",
+            stage = "egfx_socket_write",
+            n,
+            p50_us = samples[(n - 1) / 2],
+            p95_us = samples[(n - 1) * 95 / 100],
+            max_us = samples[n - 1],
+            "latency trace"
+        );
+        samples.clear();
+        *since = std::time::Instant::now();
+    }
+}
+
 /// (vendored, divergence 27) Otherwise Nagle holds each frame's short tail segment until the last one is acked.
 fn set_nodelay(stream: &tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
@@ -2799,7 +2827,9 @@ impl RdpServer {
                             .get_channel_id_by_type::<dvc::DrdynvcServer>()
                             .context("DRDYNVC channel not found")?;
                         let data = server_encode_svc_messages(messages, drdynvc_channel_id, user_channel_id)?;
+                        let write_started = std::time::Instant::now();
                         writer.write_all(&data).await?;
+                        trace_egfx_write(write_started.elapsed());
                         // (M5c) Now that EGFX is actively shipping (its DVC channel
                         // is open) AND the UDP tunnel is bound, fire the Soft-Sync
                         // request once — the cue to migrate EGFX onto the tunnel.

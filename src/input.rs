@@ -66,7 +66,25 @@ impl MacInputHandler {
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
         #[cfg(target_os = "macos")]
-        self.inner.keyboard(event);
+        {
+            let t = std::time::Instant::now();
+            if matches!(
+                event,
+                KeyboardEvent::Pressed { .. } | KeyboardEvent::UnicodePressed(_)
+            ) {
+                crate::latency_trace::mark_key();
+            }
+            let pressed = matches!(
+                event,
+                KeyboardEvent::Pressed { .. } | KeyboardEvent::UnicodePressed(_)
+            );
+            self.inner.keyboard(event);
+            crate::latency_trace::record_since("input.keyboard_post", t);
+            if pressed && crate::latency_trace::enabled() {
+                let us = t.elapsed().as_micros() as u64;
+                tracing::info!(target: "macrdp::latency", stage = "input.keyboard_post", us, "key stage");
+            }
+        }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "keyboard event (stub)");
     }
@@ -87,7 +105,9 @@ impl RdpServerInputHandler for MacInputHandler {
         {
             let (width, height) = self.desktop_size.get();
             let letterbox = self.desktop_size.letterbox();
+            let t = std::time::Instant::now();
             self.inner.mouse(event, width, height, letterbox);
+            crate::latency_trace::record_since("input.mouse_post", t);
         }
         #[cfg(not(target_os = "macos"))]
         trace!(?event, "mouse event (stub)");
