@@ -2237,6 +2237,9 @@ mod macos {
                 warn!("key repeat: CGEventSource::new failed; holding a key types once");
                 return;
             };
+            if let Err(kr) = make_time_constraint_thread() {
+                warn!(kr, "key repeat: no real-time timer; repeats may run slow");
+            }
             let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if st.shutdown {
@@ -2258,6 +2261,82 @@ mod macos {
                     post_repeat(&source, &action);
                 }
             }
+        }
+    }
+
+    /// Exempt the calling thread from timer coalescing. launchd clamps an agent
+    /// without a ProcessType to utility QoS, where a 30 ms condvar wait wakes
+    /// 50 to 90 ms late; a time-constraint thread wakes within microseconds.
+    /// The thread sleeps between repeats, so the budget only bounds one post.
+    fn make_time_constraint_thread() -> Result<(), i32> {
+        #[repr(C)]
+        struct TimeConstraintPolicy {
+            period: u32,
+            computation: u32,
+            constraint: u32,
+            preemptible: i32,
+        }
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+        unsafe extern "C" {
+            fn mach_timebase_info(info: *mut Timebase) -> i32;
+            fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+            fn thread_policy_set(thread: u32, flavor: u32, policy: *const i32, count: u32) -> i32;
+        }
+        let mut tb = Timebase { numer: 0, denom: 0 };
+        let kr = unsafe { mach_timebase_info(&mut tb) };
+        if kr != 0 || tb.numer == 0 {
+            return Err(kr);
+        }
+        let abs = |d: Duration| (d.as_nanos() as u64 * tb.denom as u64 / tb.numer as u64) as u32;
+        let policy = TimeConstraintPolicy {
+            period: 0,
+            computation: abs(Duration::from_millis(2)),
+            constraint: abs(Duration::from_millis(10)),
+            preemptible: 1,
+        };
+        let kr = unsafe {
+            thread_policy_set(
+                pthread_mach_thread_np(libc::pthread_self()),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const TimeConstraintPolicy as *const i32,
+                (std::mem::size_of::<TimeConstraintPolicy>() / 4) as u32,
+            )
+        };
+        if kr == 0 {
+            Ok(())
+        } else {
+            Err(kr)
+        }
+    }
+
+    #[cfg(test)]
+    mod time_constraint_tests {
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn a_time_constraint_thread_wakes_on_time() {
+            std::thread::spawn(|| {
+                super::make_time_constraint_thread().expect("thread_policy_set");
+                let (lock, cv) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+                let mut guard = lock.lock().unwrap();
+                let mut worst = Duration::ZERO;
+                for _ in 0..10 {
+                    let due = Instant::now() + Duration::from_millis(30);
+                    while Instant::now() < due {
+                        guard = cv.wait_timeout(guard, due - Instant::now()).unwrap().0;
+                    }
+                    worst = worst.max(Instant::now() - due);
+                }
+                // Coalesced timers miss by 5 ms at default QoS, 50+ under launchd.
+                assert!(worst < Duration::from_millis(3), "woke {worst:?} late");
+            })
+            .join()
+            .unwrap();
         }
     }
 

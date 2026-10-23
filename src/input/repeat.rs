@@ -48,6 +48,11 @@ pub(crate) const CLIENT_SILENCE_LIMIT: Duration = Duration::from_secs(2);
 /// up. Thirty seconds of a held key is far past any real use.
 const MAX_UNCONFIRMED_RUN: Duration = Duration::from_secs(30);
 
+/// How far behind its grid the repeat may fall and still catch up: a few
+/// repeats at the fastest setting, so ordinary timer slack never lowers the
+/// rate while a real stall (sleep, a hung post) does not type a burst.
+const CATCH_UP_LIMIT: Duration = Duration::from_millis(100);
+
 struct Held<A> {
     vk: u16,
     action: A,
@@ -126,7 +131,9 @@ impl<A: Clone> Repeater<A> {
     }
 
     /// The action to post if a repeat is due at `now`, scheduling the next one.
-    /// A late wake-up posts one repeat, not a burst.
+    /// Repeats stay on the press's grid, so a wake-up that is late by less than
+    /// `CATCH_UP_LIMIT` costs no repeats: the missed ones are due at once. A
+    /// longer stall posts one repeat and restarts the grid, not a burst.
     pub(crate) fn fire(&mut self, now: Instant, timing: RepeatTiming) -> Option<A> {
         let held = self.held.as_mut()?;
         if now < held.next_fire {
@@ -141,7 +148,11 @@ impl<A: Clone> Repeater<A> {
             self.held = None;
             return None;
         }
-        held.next_fire = (held.next_fire + timing.interval).max(now + timing.interval / 2);
+        held.next_fire = if now.duration_since(held.next_fire) > CATCH_UP_LIMIT {
+            now + timing.interval / 2
+        } else {
+            held.next_fire + timing.interval
+        };
         Some(held.action.clone())
     }
 }
@@ -299,8 +310,72 @@ mod tests {
         assert!(r.deadline().unwrap() >= t0 + ms(515));
     }
 
+    /// What tycho reads for KeyRepeat=2, InitialKeyRepeat=15: NSEvent and the
+    /// HID system both count the defaults in 1/60 s ticks.
+    fn tycho() -> RepeatTiming {
+        RepeatTiming::from_secs(15.0 / 60.0, 2.0 / 60.0).unwrap()
+    }
+
+    /// Drive the repeater like the repeat thread, with a timer that wakes
+    /// `slack` after each deadline, and count the repeats posted while the key
+    /// is held for `hold`.
+    fn repeats_while_held(timing: RepeatTiming, slack: Duration, hold: Duration) -> usize {
+        let t0 = Instant::now();
+        let mut r = Repeater::default();
+        r.press(0x26, Some(0x26), Some(timing), t0);
+        let mut now = t0;
+        let mut posted = 0;
+        while let Some(at) = r.deadline() {
+            if at > now {
+                now = at + slack;
+            }
+            if now > t0 + hold {
+                break;
+            }
+            if r.fire(now, timing).is_some() {
+                posted += 1;
+            }
+        }
+        posted
+    }
+
+    #[test]
+    fn a_held_key_types_at_the_macs_rate() {
+        // A 1.5 s hold: the key-down, then repeats at 250 ms + k * 33.3 ms.
+        let hold = ms(1500);
+        let expected = 38;
+        assert_eq!(repeats_while_held(tycho(), Duration::ZERO, hold), expected);
+        // Timer slack: 5 ms is the default-QoS leeway, 56 ms what a
+        // utility-clamped launchd agent measured on tycho. Without catching up,
+        // 56 ms of slack posted one repeat per wake-up, under half the rate.
+        for slack in [ms(1), ms(5), ms(20), ms(56), ms(90)] {
+            let n = repeats_while_held(tycho(), slack, hold);
+            assert!(
+                (expected - 3..=expected).contains(&n),
+                "{n} repeats with {slack:?} of timer slack, want about {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_wake_up_catches_up_on_the_grid() {
+        let t0 = Instant::now();
+        let mut r = Repeater::default();
+        r.press(0x00, Some(0x00), Some(T), t0);
+        let now = t0 + ms(285);
+        assert!(r.fire(now, T).is_some());
+        assert_eq!(r.deadline(), Some(t0 + ms(255)), "the missed repeat is due");
+        assert!(r.fire(now, T).is_some());
+        assert_eq!(r.deadline(), Some(t0 + ms(285)));
+        assert!(r.fire(now, T).is_some());
+        assert_eq!(r.deadline(), Some(t0 + ms(315)), "back on time");
+    }
+
     #[test]
     fn timing_from_settings() {
+        let t = tycho();
+        assert_eq!(t.delay.as_micros(), 250_000);
+        assert_eq!(t.interval.as_micros(), 33_333);
         let t = RepeatTiming::from_secs(0.225, 0.03).unwrap();
         assert_eq!(t.delay, ms(225));
         assert_eq!(t.interval, ms(30));
