@@ -31,4 +31,13 @@ ironrdp-dvc needs isn't required here.
     candidate: let the caller pass the destination, or make `Avc420Region`
     exclusive.
 
+(2) `GraphicsPipelineServer::send_bitmap_tiles_frame` (NOT upstreamed): one
+    StartFrame / WireToSurface1... / EndFrame with a caller-chosen codec and
+    destination per tile. Upstream's `send_planar_frame` and
+    `send_uncompressed_frame` always draw one tile at the surface origin, and
+    `MixedTilePayload` has no Planar or Uncompressed variant. macrdp's EGFX
+    fast path (`src/egfx_fast_path.rs`) sends small changed rects this way
+    ahead of the H.264 frame. Upstream candidate: a destination on the
+    planar/uncompressed sends, or the two variants on `MixedTilePayload`.
+
 Retire this vendor dir once upstream offers an equivalent and the pin moves past it.

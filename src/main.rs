@@ -25,6 +25,8 @@ mod cursor;
 // Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod damage;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod egfx_fast_path;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
@@ -2570,6 +2572,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // getenv() in stats::default_port(); bridged like the USB/camera knobs
         // above so STATS_PORT can be set from config.env.
         ("STATS_PORT", "MACRDP_STATS_PORT"),
+        // Small-change fast path (h264.rs); env-read when each EGFX encoder starts.
+        ("EGFX_FAST_PATH", "MACRDP_EGFX_FAST_PATH"),
+        ("EGFX_FAST_PATH_MAX_PX", "MACRDP_EGFX_FAST_PATH_MAX_PX"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {

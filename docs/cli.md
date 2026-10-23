@@ -609,6 +609,25 @@ MACRDP_EGFX_DIRTY_RECTS=1         # 0/off = always the whole surface (the old wi
 MACRDP_EGFX_FULL_REFRESH_MS=1000  # ship a frame whole when the last whole one is older (0 = never)
 ```
 
+EGFX small-change fast path (off by default; `EGFX_FAST_PATH` and
+`EGFX_FAST_PATH_MAX_PX` in config.env set the same variables). When a capture's changed
+pixels are few (at most 8 rects, `MAX_PX` in total) and the encoder has no frame in
+flight, the rects ship at once as Planar (RLE, or raw planes when smaller) or
+Uncompressed WireToSurface1 tiles in their own EGFX frame, then the same capture
+goes to H.264 as always, its region rects covering the same pixels. Saves the
+hardware encode time (about 12 ms at 3440x1440) on typing and caret blinks. The
+fast-path frame is frame-acked and counted in the ack-lag gate like any other.
+Repeats of a frame already sent (the flush burst) never take it:
+```
+MACRDP_EGFX_FAST_PATH=1             # 1/planar, or uncompressed; unset/0 = off
+MACRDP_EGFX_FAST_PATH_MAX_PX=32768  # changed-pixel budget per capture
+```
+Trace stages (with `MACRDP_LATENCY_TRACE=1`): `mN.fastpath_px`, `mN.fastpath_bytes`,
+`mN.fastpath_encode` (tile encoding, µs), `mN.key_to_fastpath` (key event to the
+tiles being queued for the socket, compare with `mN.key_to_queued`) and
+`mN.fastpath_inflight_skip` (small changes that waited because a frame was in the
+encoder).
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.

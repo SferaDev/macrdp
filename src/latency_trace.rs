@@ -49,8 +49,12 @@ pub fn now_ns() -> u64 {
 }
 
 static LAST_KEY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static KEY_SEEN: [std::sync::atomic::AtomicU64; 12] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+static KEY_SEEN: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+/// First key slot of the per-monitor fast-path stage; the frame stages use
+/// three slots per monitor below it, for up to 16 monitors.
+pub const FAST_PATH_SLOT: usize = 48;
 
 /// Marks a key event, so the first frame each monitor ships after it can be
 /// timed against it.

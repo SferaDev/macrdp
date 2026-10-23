@@ -1569,6 +1569,53 @@ impl GraphicsPipelineServer {
         Some(frame_id)
     }
 
+    /// macrdp divergence (2): one frame of `(codec, destination, bitmap_data)`
+    /// WireToSurface1 tiles at arbitrary surface positions, where
+    /// [`Self::send_planar_frame`] and [`Self::send_uncompressed_frame`] only
+    /// draw a single tile at the surface origin. Each destination must lie
+    /// within the surface; `None` (nothing queued) otherwise.
+    pub fn send_bitmap_tiles_frame(
+        &mut self,
+        surface_id: u16,
+        tiles: Vec<(Codec1Type, ExclusiveRectangle, Vec<u8>)>,
+        timestamp_ms: u32,
+    ) -> Option<u32> {
+        if !self.is_ready() || tiles.is_empty() {
+            return None;
+        }
+        if self.should_backpressure() {
+            self.qoe.record_backpressure();
+            return None;
+        }
+
+        let surface = self.surfaces.get(surface_id)?;
+        let pixel_format = surface.pixel_format;
+        let inside = |r: &ExclusiveRectangle| {
+            r.left < r.right && r.top < r.bottom && r.right <= surface.width && r.bottom <= surface.height
+        };
+        if !tiles.iter().all(|(_, r, _)| inside(r)) {
+            return None;
+        }
+
+        let timestamp = Self::make_timestamp(timestamp_ms);
+        let frame_id = self.frames.begin_frame(timestamp);
+
+        self.output_queue
+            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
+        for (codec_id, destination_rectangle, bitmap_data) in tiles {
+            self.output_queue.push_back(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                surface_id,
+                codec_id,
+                pixel_format,
+                destination_rectangle,
+                bitmap_data,
+            }));
+        }
+        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
+
+        Some(frame_id)
+    }
+
     /// Queue an H.264 AVC444 frame for transmission
     ///
     /// AVC444 uses two streams: luma (Y) and chroma (UV). Set `chroma_data` to
