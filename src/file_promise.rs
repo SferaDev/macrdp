@@ -535,28 +535,33 @@ async fn chunk_task(
     file: Arc<std::fs::File>,
 ) -> Result<(), String> {
     use std::os::unix::fs::FileExt;
-    let bytes = fetch_range(index, position, requested_size, &router, &sender).await?;
-    if bytes.is_empty() {
-        return Err(format!(
-            "short read at {position}; expected {requested_size} bytes, got 0"
-        ));
-    }
-    // pwrite (write_at) is positional — no shared offset on the fd, so
-    // concurrent chunk tasks writing to disjoint byte ranges are safe
-    // on the same Arc<File>. A short write here means the underlying
-    // pwrite returned fewer bytes than requested; loop until done.
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let n = file
-            .write_at(&bytes[written..], position + written as u64)
-            .map_err(|e| format!("write_at @ {}: {e}", position + written as u64))?;
-        if n == 0 {
+    // A RANGE answer may be short (MS-RDPECLIP 2.2.5.4): ask for the rest, never leave a hole.
+    let mut got = 0u32;
+    while got < requested_size {
+        let at = position + u64::from(got);
+        let bytes = fetch_range(index, at, requested_size - got, &router, &sender).await?;
+        if bytes.is_empty() || bytes.len() > (requested_size - got) as usize {
             return Err(format!(
-                "write_at @ {} returned 0 bytes",
-                position + written as u64
+                "range at {at}: expected up to {} bytes, got {}",
+                requested_size - got,
+                bytes.len()
             ));
         }
-        written += n;
+        // write_at is positional, so chunk tasks sharing the Arc<File> never race.
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let n = file
+                .write_at(&bytes[written..], at + written as u64)
+                .map_err(|e| format!("write_at @ {}: {e}", at + written as u64))?;
+            if n == 0 {
+                return Err(format!(
+                    "write_at @ {} returned 0 bytes",
+                    at + written as u64
+                ));
+            }
+            written += n;
+        }
+        got += bytes.len() as u32;
     }
     Ok(())
 }
@@ -627,6 +632,47 @@ fn push_request(sender: &EventSender, req: FileContentsRequest) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn short_range_answers_are_completed_not_left_as_holes() {
+        let body: Vec<u8> = (0..1_300_000u32).map(|i| (i ^ (i >> 9)) as u8).collect();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender: EventSender = Arc::new(Mutex::new(Some(tx)));
+        let router = DownloadRouter::default();
+        let peer_router = router.clone();
+        let peer_body = body.clone();
+        // A client that answers at most 100 KiB of whatever it is asked.
+        tokio::spawn(async move {
+            while let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(r))) =
+                rx.recv().await
+            {
+                let start = r.position as usize;
+                let end =
+                    (start + (r.requested_size as usize).min(100 * 1024)).min(peer_body.len());
+                peer_router.deliver(FileContentsResponse::new_data_response(
+                    r.stream_id,
+                    peer_body[start..end].to_vec(),
+                ));
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("macrdp-short-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("f.bin");
+        fetch_one_file(
+            0,
+            Some(body.len() as u64),
+            &dst,
+            &router,
+            &sender,
+            4,
+            512 * 1024,
+        )
+        .await
+        .unwrap();
+        let got = std::fs::read(&dst).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got == body, "the file has holes or misplaced bytes");
+    }
 
     fn entry(name: &str, rp: Option<&str>) -> RemoteEntry {
         RemoteEntry {
