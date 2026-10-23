@@ -1335,7 +1335,9 @@ mod macos {
     fn latest_sample(
         stream: &CaptureStream,
         mut sample: screencapturekit::cm::CMSampleBuffer,
+        label: &str,
     ) -> (screencapturekit::cm::CMSampleBuffer, Option<Vec<Dirty>>) {
+        let mut skipped = 0u64;
         let mut dirty = dirty_rects(&sample);
         while let Some(newer) = stream.try_next() {
             if newer.frame_status().is_none_or(|s| s.has_content()) {
@@ -1347,6 +1349,28 @@ mod macos {
                     _ => None,
                 };
                 sample = newer;
+                skipped += 1;
+            }
+        }
+        if crate::latency_trace::enabled() {
+            log_dirty_rects(&sample, label);
+            crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
+            let area = dirty
+                .as_ref()
+                .map_or(u64::MAX, |d| d.iter().map(|r| (r.2 * r.3) as u64).sum());
+            crate::latency_trace::record_us(&format!("{label}.dirty_px"), area);
+            let pts = sample.presentation_timestamp();
+            if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
+                crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
+                let slot = label[1..].parse::<usize>().unwrap_or(0) * 3;
+                let at = crate::latency_trace::now_ns().saturating_sub(age * 1000);
+                if dirty.as_ref().is_none_or(|d| !d.is_empty()) {
+                    crate::latency_trace::record_since_key(
+                        &format!("{label}.key_to_sck"),
+                        slot,
+                        at,
+                    );
+                }
             }
         }
         (sample, dirty)
@@ -1429,6 +1453,29 @@ mod macos {
         }
     }
 
+    /// Logs one sample's dirty rects per monitor every 5 s, to find what keeps
+    /// a static screen dirty.
+    fn log_dirty_rects(sample: &screencapturekit::cm::CMSampleBuffer, label: &str) {
+        static LAST: std::sync::Mutex<Vec<(String, Instant)>> = std::sync::Mutex::new(Vec::new());
+        let mut last = LAST.lock().unwrap();
+        match last.iter_mut().find(|(l, _)| l == label) {
+            Some((_, t)) if t.elapsed() < Duration::from_secs(5) => return,
+            Some((_, t)) => *t = Instant::now(),
+            None => last.push((label.to_owned(), Instant::now())),
+        }
+        let rects: Vec<String> = sample
+            .dirty_rects()
+            .unwrap_or_default()
+            .iter()
+            .take(8)
+            .map(|r| {
+                let (o, s) = (r.origin(), r.size());
+                format!("{}x{}+{}+{}", s.width, s.height, o.x, o.y)
+            })
+            .collect();
+        tracing::info!(target: "macrdp::latency", label, ?rects, "dirty rects sample");
+    }
+
     /// Captures a non-primary monitor's display into its EGFX output. The
     /// primary monitor's `ScreenCaptureUpdates` keeps the session's cursor,
     /// resizes and fallbacks; this only feeds video, and stops when dropped.
@@ -1461,6 +1508,7 @@ mod macos {
                 .with_context(|| format!("SCK enumeration has no display with id={display_id}"))?;
             let stream = start_stream(display, width, height, fps, false)?;
             let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+            let label = format!("m{}", output + 1);
             let task = tokio::spawn(async move {
                 // SCK sends a frame only when the screen changes, so a frame the
                 // output can't take yet (not set up, or its encoder still busy)
@@ -1478,7 +1526,7 @@ mod macos {
                     };
                     match next {
                         Ok(Some(sample)) => {
-                            let (sample, dirty) = latest_sample(&stream, sample);
+                            let (sample, dirty) = latest_sample(&stream, sample, &label);
                             if sample.frame_status().is_some_and(|s| !s.has_content()) {
                                 continue;
                             }
@@ -1499,6 +1547,10 @@ mod macos {
                                 && !pending
                                 && !gfx.output_keyframe_pending(output)
                             {
+                                crate::latency_trace::record_us(
+                                    &format!("{label}.unchanged_skip"),
+                                    0,
+                                );
                                 continue;
                             }
                             damage.add_rects(
@@ -1514,6 +1566,7 @@ mod macos {
                     if last.pixels.is_empty() {
                         continue;
                     }
+                    let t = Instant::now();
                     let frame_damage = if damage.is_empty() {
                         Damage::Full
                     } else {
@@ -1521,6 +1574,7 @@ mod macos {
                     };
                     match gfx.submit_output_bgra(output, &last.pixels, last.stride, frame_damage) {
                         Ok(crate::h264::OutputSubmit::Encoded) => {
+                            crate::latency_trace::record_since(&format!("{label}.submit"), t);
                             pending = false;
                             damage = Damage::default();
                         }
@@ -1759,6 +1813,7 @@ mod macos {
             match gfx.submit_bgra_status(&self.last_frame, self.last_stride, false, Damage::Full) {
                 Ok(crate::h264::OutputSubmit::Busy) => {}
                 Ok(_) => {
+                    crate::latency_trace::record_us("m0.held_resubmit", 0);
                     self.resubmit = false;
                     self.damage = Damage::default();
                     self.last_damage = Damage::Full;
@@ -2255,7 +2310,7 @@ mod macos {
                 // Only once EGFX owns the display: the legacy bitmap path needs
                 // every sample's dirty rects.
                 let sample = if self.first_egfx_frame_sent {
-                    let (sample, dirty) = latest_sample(&self.stream, sample);
+                    let (sample, dirty) = latest_sample(&self.stream, sample, "m0");
                     if sample.frame_status().is_some_and(|s| !s.has_content()) {
                         continue;
                     }
@@ -2292,6 +2347,7 @@ mod macos {
                         && !self.was_suppressed
                         && self.gfx.as_ref().is_some_and(|g| !g.keyframe_pending())
                     {
+                        crate::latency_trace::record_us("m0.unchanged_skip", 0);
                         // SCK keeps sending these, so the flush burst's
                         // idle timeout never fires; run it from here.
                         if self.flush_remaining > 0 && !self.last_frame.is_empty() {
@@ -2434,6 +2490,10 @@ mod macos {
                     } else {
                         false
                     };
+                    let submit_started = Instant::now();
+                    if crate::latency_trace::enabled() && src.len() > stride_bytes * 351 {
+                        tracing::info!(target: "macrdp::latency", px = src[stride_bytes * 350 + 400 * 4], "m0 submit probe pixel");
+                    }
                     // Nothing recorded (before the first EGFX frame, or a frame
                     // offered again without a change) ships the whole surface.
                     let damage = if self.damage.is_empty() {
@@ -2457,6 +2517,7 @@ mod macos {
                             status != crate::h264::OutputSubmit::NotReady
                         }) {
                         Ok(true) => {
+                            crate::latency_trace::record_since("m0.submit", submit_started);
                             self.seeded = true;
                             // First-EGFX-frame milestone: arms the suppress
                             // gate (see `first_egfx_frame_sent` in the struct).

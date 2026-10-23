@@ -582,10 +582,21 @@ MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = unca
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
 ```
 
-Encoder mode (env, **settable through `config.env`** as `VT_LOW_LATENCY`):
+Latency tracing and encoder mode (env, **settable through `config.env`** as
+`LATENCY_TRACE` / `VT_LOW_LATENCY`):
 ```
+MACRDP_LATENCY_TRACE=1   # log per-stage p50/p95/max (µs) every 5 s, target macrdp::latency
 MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
 ```
+Trace stages, per monitor `mN` (`m0` = primary): `sck_age` (host clock now minus
+the SCK sample's presentation time, at dequeue), `skipped_stale` (older queued
+samples skipped), `submit` (BGRA→NV12 + VT submit), `busy_drop` (count of frames
+dropped because `--h264-frames-in-flight` were outstanding), `held_resubmit`
+(secondary frames retried after a busy drop), `vt_encode` (VT submit to output
+callback), `encoded_to_queued` (callback to the frame being queued for the
+socket), `frame_bytes`, `region_px` (pixels the frame's AVC420 region rects
+cover); plus `egfx_socket_write` (EGFX `write_all` time) and
+`input.keyboard_post` / `input.mouse_post` (input handler, PDU to CGEventPost).
 
 EGFX changed regions (env only). Each AVC420 frame still encodes the whole
 surface, but its metablock lists only the rects that changed (from SCK's dirty

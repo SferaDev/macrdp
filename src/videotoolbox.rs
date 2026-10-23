@@ -40,6 +40,10 @@ pub struct EncodedFrame {
     /// SPS / PPS NAL units (raw, no length prefix and no start code).
     /// Populated only on keyframes — empty on non-keyframes.
     pub parameter_sets: Vec<Vec<u8>>,
+    /// `latency_trace::now_ns` at submit and at VT's output callback; 0 when
+    /// tracing is off.
+    pub submitted_ns: u64,
+    pub encoded_ns: u64,
 }
 
 pub struct Encoder {
@@ -1291,13 +1295,18 @@ mod ffi {
             };
 
             let mut info_flags: VTEncodeInfoFlags = 0;
+            let submitted_ns = if crate::latency_trace::enabled() {
+                crate::latency_trace::now_ns().max(1)
+            } else {
+                0
+            };
             let encode_status = VTCompressionSessionEncodeFrame(
                 guard.session,
                 pbuf,
                 presentation,
                 duration,
                 frame_props,
-                ptr::null_mut(),
+                submitted_ns as usize as *mut c_void,
                 &mut info_flags,
             );
             if !frame_props.is_null() {
@@ -1338,7 +1347,7 @@ mod ffi {
     /// lifetime is tied to the Encoder, not the callback.
     unsafe extern "C" fn output_callback(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: OSStatus,
         _info_flags: VTEncodeInfoFlags,
         sample_buffer: CMSampleBufferRef,
@@ -1351,9 +1360,13 @@ mod ffi {
             return;
         }
         let tx = &*(output_callback_ref_con as *const mpsc::Sender<EncodedFrame>);
-        let Ok(frame) = extract_frame(sample_buffer) else {
+        let Ok(mut frame) = extract_frame(sample_buffer) else {
             return;
         };
+        frame.submitted_ns = source_frame_ref_con as usize as u64;
+        if frame.submitted_ns != 0 {
+            frame.encoded_ns = crate::latency_trace::now_ns();
+        }
         let _ = tx.send(frame);
     }
 
@@ -1427,6 +1440,8 @@ mod ffi {
             is_keyframe,
             pts,
             parameter_sets,
+            submitted_ns: 0,
+            encoded_ns: 0,
         })
     }
 }
