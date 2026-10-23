@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
 use crate::damage::{Damage, DamageTracker};
+use crate::egfx_fast_path::FastPath;
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
@@ -1204,6 +1205,17 @@ pub enum OutputSubmit {
     Busy,
 }
 
+/// What [`Gfx::ship_fast_path`] needs from the connection, taken under `ctx`
+/// and used after it is released.
+struct FastShip {
+    server_handle: GfxServerHandle,
+    surface_id: u16,
+    epoch: Instant,
+    last_shipped: Arc<AtomicU64>,
+    ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    rects: Vec<crate::damage::Rect>,
+}
+
 /// Cloneable factory + frame-submit handle. One clone is boxed into
 /// `RdpServer::builder().with_gfx_factory(...)`; another lives on the capture
 /// side as the `submit_bgra` entry point.
@@ -1371,6 +1383,9 @@ pub struct Gfx {
     reactivate_request: Arc<AtomicU32>,
     /// Region policy each new encoder's [`DamageTracker`] starts from.
     damage_policy: DamageTracker,
+    /// Small changes ship as Planar/Uncompressed tiles ahead of H.264
+    /// (`MACRDP_EGFX_FAST_PATH`); `None` leaves the path unchanged.
+    fast_path: Option<FastPath>,
 }
 
 impl Gfx {
@@ -1559,6 +1574,10 @@ impl Gfx {
         if !damage_policy.enabled() {
             info!("EGFX changed-region rects DISABLED (MACRDP_EGFX_DIRTY_RECTS) — every frame updates the whole surface");
         }
+        let fast_path = FastPath::from_env();
+        if let Some(fp) = fast_path {
+            info!(codec = ?fp.codec, max_px = fp.max_px, "EGFX small-change fast path ENABLED (MACRDP_EGFX_FAST_PATH)");
+        }
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1626,6 +1645,7 @@ impl Gfx {
             adaptive_seed_rtt_ms,
             reactivate_request: Arc::new(AtomicU32::new(0)),
             damage_policy,
+            fast_path,
         }
     }
 
@@ -1678,7 +1698,7 @@ impl Gfx {
         request_keyframe: bool,
         damage: Damage,
     ) -> Result<bool> {
-        self.submit_bgra_status(bgra, stride, request_keyframe, damage)
+        self.submit(bgra, stride, request_keyframe, damage, false)
             .map(|s| s != OutputSubmit::NotReady)
     }
 
@@ -1697,13 +1717,26 @@ impl Gfx {
     /// or the change stays off screen on a static desktop.
     ///
     /// `damage` is what changed since the last frame this returned `Encoded`
-    /// for; the frame's AVC420 region rects come from it.
+    /// for; the frame's AVC420 region rects come from it. A small change may
+    /// also ship ahead of H.264 on the fast path; [`Self::submit_bgra`], used
+    /// to repeat frames already sent, never takes it.
     pub fn submit_bgra_status(
         &self,
         bgra: &[u8],
         stride: usize,
         request_keyframe: bool,
         damage: Damage,
+    ) -> Result<OutputSubmit> {
+        self.submit(bgra, stride, request_keyframe, damage, true)
+    }
+
+    fn submit(
+        &self,
+        bgra: &[u8],
+        stride: usize,
+        request_keyframe: bool,
+        damage: Damage,
+        allow_fast_path: bool,
     ) -> Result<OutputSubmit> {
         // Push pipeline: this (capture) thread only converts + submits to VT and
         // returns immediately; a dedicated ship thread (spawned in setup_locked)
@@ -1716,7 +1749,7 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        let force_keyframe = {
+        let (force_keyframe, fast_ship) = {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(OutputSubmit::NotReady); // no active connection
@@ -2032,7 +2065,13 @@ impl Gfx {
                 trace!("EGFX frame-ack lag high; dropping capture");
                 return Ok(OutputSubmit::Busy);
             }
-            std::mem::replace(&mut ctx.need_keyframe, false)
+            let fast_ship = if allow_fast_path {
+                ctx.surface_id
+                    .and_then(|sid| self.fast_ship(ctx, sid, ctx.dims, outstanding, &damage, 0))
+            } else {
+                None
+            };
+            (std::mem::replace(&mut ctx.need_keyframe, false), fast_ship)
         };
 
         // Run the armed recovery action now that ctx is released (lock order).
@@ -2050,6 +2089,12 @@ impl Gfx {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
             return Ok(OutputSubmit::Busy);
+        }
+
+        // Ahead of the encode, with ctx released (lock order); the H.264 frame
+        // below still carries the same rects.
+        if let Some(ship) = fast_ship {
+            self.ship_fast_path(ship, bgra, stride, 0);
         }
 
         // Submit to VideoToolbox (async). The ship thread delivers + ships the
@@ -2726,6 +2771,105 @@ impl Gfx {
         false
     }
 
+    /// The fast-path send for this capture of surface `surface_id`, when the
+    /// change is small and its encoder has nothing in flight. Caller holds `ctx`.
+    fn fast_ship(
+        &self,
+        ctx: &ConnectionContext,
+        surface_id: u16,
+        (width, height): (u16, u16),
+        outstanding: u64,
+        damage: &Damage,
+        label: usize,
+    ) -> Option<FastShip> {
+        let rects = self.fast_path?.rects(damage, width, height)?;
+        // An earlier capture still in the encoder would land after the tiles
+        // and paint its older pixels over them.
+        if outstanding > 0 {
+            crate::latency_trace::record_us(&format!("m{label}.fastpath_inflight_skip"), 0);
+            return None;
+        }
+        Some(FastShip {
+            server_handle: ctx.server_handle.clone(),
+            surface_id,
+            epoch: ctx.epoch,
+            last_shipped: ctx.last_shipped_frame_id.clone(),
+            ship_times: ctx.ship_times.clone(),
+            rects,
+        })
+    }
+
+    /// Sends the fast-path tiles as an EGFX frame of their own. Failures only
+    /// log: the H.264 frame that follows carries the change anyway.
+    fn ship_fast_path(&self, ship: FastShip, bgra: &[u8], stride: usize, label: usize) {
+        let Some(fast_path) = self.fast_path else {
+            return;
+        };
+        let started = Instant::now();
+        let Some(tiles) = fast_path.tiles(bgra, stride, &ship.rects) else {
+            debug!(rects = ?ship.rects, "EGFX fast path: rect outside the frame buffer");
+            return;
+        };
+        let encode_us = started.elapsed().as_micros() as u64;
+        let bytes: usize = tiles.iter().map(|t| t.2.len()).sum();
+        let ts_ms =
+            u32::try_from(ship.epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+        let mut server = ship.server_handle.lock().unwrap();
+        let Some(channel_id) = server.channel_id() else {
+            return;
+        };
+        let Some(frame_id) = server.send_bitmap_tiles_frame(ship.surface_id, tiles, ts_ms) else {
+            debug!("EGFX fast path: send_bitmap_tiles_frame returned None");
+            return;
+        };
+        // Counted like any shipped frame: ack lag, RTT ring and stats.
+        ship.last_shipped
+            .store(u64::from(frame_id), Ordering::Relaxed);
+        if let Some(s) = crate::stats::global() {
+            s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
+        }
+        ship.ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+            (u64::from(frame_id), Instant::now());
+        let dvc_messages = server.drain_output();
+        let sent = encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
+            .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))
+            .and_then(|messages| {
+                let sender = self.sender.lock().unwrap().clone();
+                sender
+                    .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages,
+                    }))
+                    .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))
+            });
+        drop(server);
+        if let Err(e) = sent {
+            warn!(error = ?e, "EGFX fast path send failed");
+            return;
+        }
+        trace!(
+            frame_id,
+            rects = ship.rects.len(),
+            bytes,
+            "EGFX shipped fast-path frame"
+        );
+        if crate::latency_trace::enabled() {
+            let px: u64 = ship
+                .rects
+                .iter()
+                .map(|r| u64::from(r.right - r.left) * u64::from(r.bottom - r.top))
+                .sum();
+            crate::latency_trace::record_us(&format!("m{label}.fastpath_px"), px);
+            crate::latency_trace::record_us(&format!("m{label}.fastpath_bytes"), bytes as u64);
+            crate::latency_trace::record_us(&format!("m{label}.fastpath_encode"), encode_us);
+            crate::latency_trace::record_since_key(
+                &format!("m{label}.key_to_fastpath"),
+                crate::latency_trace::FAST_PATH_SLOT + label,
+                crate::latency_trace::now_ns(),
+            );
+        }
+    }
+
     /// Encodes a frame of a non-primary monitor.
     pub fn submit_output_bgra(
         &self,
@@ -2751,6 +2895,17 @@ impl Gfx {
             crate::latency_trace::record_us(&format!("m{}.lag_drop", output + 1), 0);
             return Ok(OutputSubmit::Busy);
         }
+        let o = &ctx.outputs[output];
+        if let Some(ship) =
+            self.fast_ship(ctx, o.surface_id, o.dims, outstanding, &damage, output + 1)
+        {
+            drop(guard);
+            self.ship_fast_path(ship, bgra, stride, output + 1);
+            guard = self.ctx.lock().unwrap();
+        }
+        let Some(ctx) = guard.as_mut().filter(|ctx| output < ctx.outputs.len()) else {
+            return Ok(OutputSubmit::NotReady);
+        };
         let o = &mut ctx.outputs[output];
         let keyframe = std::mem::replace(&mut o.need_keyframe, false);
         let pts = o.encoder.encode_bgra(bgra, stride, keyframe)?;
@@ -5348,5 +5503,187 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
         assert_eq!(clocks(ctx), [built; 11]);
+    }
+
+    fn decode_gfx(messages: Vec<ironrdp_dvc::DvcMessage>) -> Vec<ironrdp_egfx::pdu::GfxPdu> {
+        messages
+            .iter()
+            .map(|m| {
+                let bytes = ironrdp_core::encode_vec(m.as_ref()).unwrap();
+                assert_eq!(&bytes[..2], &[0xE0, 0x04]);
+                ironrdp_core::decode::<ironrdp_egfx::pdu::GfxPdu>(&bytes[2..]).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fast_path_tiles_ship_as_one_frame_at_their_positions() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, Codec1Type, GfxPdu};
+        use ironrdp_graphics::rdp6::BitmapStreamDecoder;
+
+        struct Handler;
+        impl GraphicsPipelineHandler for Handler {
+            fn capabilities_advertise(&mut self, _pdu: &CapabilitiesAdvertisePdu) {}
+            fn on_ready(&mut self, _negotiated: &CapabilitySet) {}
+        }
+        let mut server = GraphicsPipelineServer::new(Box::new(Handler));
+        server.start(7).unwrap();
+        let advertise =
+            GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[avc_ready()]));
+        server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+        let sid = server
+            .create_surface_with_format(64, 48, PixelFormat::XRgb)
+            .unwrap();
+        server.drain_output();
+
+        let (w, h) = (64usize, 48usize);
+        let bgra: Vec<u8> = (0..w * h * 4).map(|i| ((i / 4) % 7 * 30) as u8).collect();
+        let rects = [
+            crate::damage::Rect {
+                left: 10,
+                top: 20,
+                right: 18,
+                bottom: 36,
+            },
+            crate::damage::Rect {
+                left: 60,
+                top: 0,
+                right: 64,
+                bottom: 2,
+            },
+        ];
+        let fast_path = FastPath {
+            codec: crate::egfx_fast_path::Codec::Planar,
+            max_px: 32768,
+        };
+        let tiles = fast_path.tiles(&bgra, w * 4, &rects).unwrap();
+        let frame_id = server.send_bitmap_tiles_frame(sid, tiles, 0).unwrap();
+
+        let pdus = decode_gfx(server.drain_output());
+        assert_eq!(pdus.len(), 4);
+        assert!(matches!(&pdus[0], GfxPdu::StartFrame(p) if p.frame_id == frame_id));
+        assert!(matches!(&pdus[3], GfxPdu::EndFrame(p) if p.frame_id == frame_id));
+        for (pdu, r) in pdus[1..3].iter().zip(rects) {
+            let GfxPdu::WireToSurface1(wts) = pdu else {
+                panic!("expected WireToSurface1, got {pdu:?}");
+            };
+            assert_eq!(wts.codec_id, Codec1Type::Planar);
+            let d = &wts.destination_rectangle;
+            assert_eq!(
+                (
+                    u32::from(d.left),
+                    u32::from(d.top),
+                    u32::from(d.right),
+                    u32::from(d.bottom)
+                ),
+                (r.left, r.top, r.right, r.bottom)
+            );
+            let (rw, rh) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
+            let mut rgb = Vec::new();
+            BitmapStreamDecoder::default()
+                .decode_bitmap_stream_to_rgb24(&wts.bitmap_data, &mut rgb, rw, rh)
+                .unwrap();
+            let mut want = Vec::new();
+            for y in r.top as usize..r.bottom as usize {
+                for x in r.left as usize..r.right as usize {
+                    let p = &bgra[(y * w + x) * 4..];
+                    want.extend_from_slice(&[p[2], p[1], p[0]]);
+                }
+            }
+            assert_eq!(rgb, want);
+        }
+
+        // A tile reaching past the surface queues nothing.
+        let outside = ExclusiveRectangle {
+            left: 60,
+            top: 0,
+            right: 65,
+            bottom: 1,
+        };
+        assert!(server
+            .send_bitmap_tiles_frame(
+                sid,
+                vec![(Codec1Type::Uncompressed, outside, vec![0; 20])],
+                0
+            )
+            .is_none());
+        assert!(server.drain_output().is_empty());
+    }
+
+    #[test]
+    fn fast_path_frame_is_counted_as_shipped_and_waits_for_the_encoder() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, GfxPdu};
+
+        let mut gfx = gfx_with_context();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        gfx.set_sender(tx);
+        let small = Damage::Rects(vec![crate::damage::Rect {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 16,
+        }]);
+        let (bgra, stride) = (vec![0x80u8; 64 * 48 * 4], 64 * 4);
+
+        let handle = gfx
+            .ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .server_handle
+            .clone();
+        let sid = {
+            let mut server = handle.lock().unwrap();
+            server.start(7).unwrap();
+            let advertise =
+                GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[avc_ready()]));
+            server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+            let sid = server
+                .create_surface_with_format(64, 48, PixelFormat::XRgb)
+                .unwrap();
+            server.drain_output();
+            sid
+        };
+
+        let ship = |gfx: &Gfx, outstanding: u64| {
+            let guard = gfx.ctx.lock().unwrap();
+            gfx.fast_ship(
+                guard.as_ref().unwrap(),
+                sid,
+                (64, 48),
+                outstanding,
+                &small,
+                0,
+            )
+        };
+        gfx.fast_path = None;
+        assert!(ship(&gfx, 0).is_none(), "off unless MACRDP_EGFX_FAST_PATH");
+        gfx.fast_path = Some(FastPath {
+            codec: crate::egfx_fast_path::Codec::Planar,
+            max_px: 32768,
+        });
+        assert!(ship(&gfx, 1).is_none(), "an encoder frame in flight");
+        let full = {
+            let guard = gfx.ctx.lock().unwrap();
+            gfx.fast_ship(guard.as_ref().unwrap(), sid, (64, 48), 0, &Damage::Full, 0)
+        };
+        assert!(full.is_none());
+
+        let before = handle.lock().unwrap().frames_in_flight();
+        gfx.ship_fast_path(ship(&gfx, 0).unwrap(), &bgra, stride, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Egfx(EgfxServerMessage::SendMessages { .. }))
+        ));
+        assert_eq!(handle.lock().unwrap().frames_in_flight(), before + 1);
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        let id = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
+        assert_eq!(ctx.ship_times.lock().unwrap()[id as usize % RTT_RING].0, id);
     }
 }
