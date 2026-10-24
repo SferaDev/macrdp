@@ -2886,7 +2886,13 @@ impl Gfx {
             .submitted
             .load(Ordering::Relaxed)
             .saturating_sub(o.shipped.load(Ordering::Relaxed));
-        if outstanding >= u64::from(self.max_in_flight) {
+        let ctx = guard.as_ref().expect("checked above");
+        let primary_outstanding = ctx
+            .submitted
+            .load(Ordering::Relaxed)
+            .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
+        let limit = output_in_flight_limit(u64::from(self.max_in_flight), primary_outstanding);
+        if outstanding >= limit {
             crate::latency_trace::record_us(&format!("m{}.busy_drop", output + 1), 0);
             return Ok(OutputSubmit::Busy);
         }
@@ -3405,6 +3411,15 @@ impl GfxServerFactory for Gfx {
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
             handle,
         ))
+    }
+}
+
+/// The outputs share one hardware encoder that serves sessions frame by frame, so secondaries yield to a busy primary.
+pub(crate) fn output_in_flight_limit(max_in_flight: u64, primary_outstanding: u64) -> u64 {
+    if primary_outstanding > 0 {
+        max_in_flight.min(1)
+    } else {
+        max_in_flight
     }
 }
 
@@ -5253,6 +5268,14 @@ mod tests {
             min
         ));
         assert!(frame_drop_at_floor(true, true, Duration::ZERO, min));
+    }
+
+    #[test]
+    fn secondaries_take_one_slot_while_the_primary_encodes() {
+        assert_eq!(output_in_flight_limit(2, 0), 2);
+        assert_eq!(output_in_flight_limit(2, 1), 1);
+        assert_eq!(output_in_flight_limit(3, 2), 1);
+        assert_eq!(output_in_flight_limit(1, 1), 1);
     }
 
     #[test]
