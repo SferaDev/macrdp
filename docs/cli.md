@@ -33,7 +33,8 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   silently ignored) — resize needs the client-resolution
                           #   auto-adopt path, which --hidpi pins off, same as it
                           #   pins the initial connect-time size.
---fps N                   # default 60 with --enable-h264, else 15
+--fps N                   # default 60 with --enable-h264 (the virtual display's
+                          #   refresh when VD_REFRESH_HZ is higher), else 15
 --cursor-scale MULT       # pointer size multiplier (default 1.0 = native macOS
                           #   size, hotspot-exact). Bump (e.g. 1.5/2.0) if your
                           #   client upscales the desktop but draws the pointer
@@ -594,8 +595,21 @@ Latency tracing and encoder mode (env, **settable through `config.env`** as
 MACRDP_LATENCY_TRACE=1   # log per-stage p50/p95/max (µs) every 5 s, target macrdp::latency
 MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
 ```
+
+Capture rate (env, settable through `config.env` as `VD_REFRESH_HZ` / `SCK_PACED`).
+A capture runs uncapped when its display refreshes no faster than `--fps`: SCK
+then hands over each composite as soon as it is ready instead of pacing it toward
+its presentation time, which measured 2.4 ms sooner at 120 Hz and 8 ms sooner at
+60 Hz. A faster display, or one whose refresh rate is unknown, keeps the 1/fps cap:
+```
+MACRDP_VD_REFRESH_HZ=60  # virtual display refresh, 24-240; above 60 it is also the H.264 --fps default
+MACRDP_SCK_PACED=1       # cap every capture at 1/fps again
+```
 Trace stages, per monitor `mN` (`m0` = primary): `sck_age` (host clock now minus
-the SCK sample's presentation time, at dequeue), `skipped_stale` (older queued
+the SCK sample's presentation time, at dequeue, when positive), `sck_lead` (the same
+when the sample arrives ahead of its presentation time, as SCK delivers it early),
+`sck_queue` (sample arrival to the capture loop taking it), `key_to_sck` (key event
+to the arrival of the first sample with a change after it), `skipped_stale` (older queued
 samples skipped), `submit` (BGRA→NV12 + VT submit), `busy_drop` (count of frames
 dropped because `--h264-frames-in-flight` were outstanding), `held_resubmit`
 (secondary frames retried after a busy drop), `vt_encode` (VT submit to output

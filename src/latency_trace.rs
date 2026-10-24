@@ -137,9 +137,10 @@ fn summarize(v: &mut [u32]) -> (usize, u32, u32, u32) {
 }
 
 /// Age of a ScreenCaptureKit sample: host-clock now minus its presentation
-/// timestamp, which SCK stamps on the host time clock.
+/// timestamp, which SCK stamps on the host time clock. Negative while the
+/// frame is still ahead of its presentation time, as SCK delivers it early.
 #[cfg(target_os = "macos")]
-pub fn host_clock_age_us(pts_value: i64, pts_timescale: i32) -> Option<u64> {
+pub fn host_clock_age_us(pts_value: i64, pts_timescale: i32) -> Option<i64> {
     #[repr(C)]
     struct CMTime {
         value: i64,
@@ -161,8 +162,7 @@ pub fn host_clock_age_us(pts_value: i64, pts_timescale: i32) -> Option<u64> {
     }
     let now_s = now.value as f64 / f64::from(now.timescale);
     let pts_s = pts_value as f64 / f64::from(pts_timescale);
-    let age = now_s - pts_s;
-    (age >= 0.0).then_some((age * 1e6) as u64)
+    Some(((now_s - pts_s) * 1e6) as i64)
 }
 
 #[cfg(test)]
