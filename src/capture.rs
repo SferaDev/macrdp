@@ -1339,8 +1339,10 @@ mod macos {
     ) -> (screencapturekit::cm::CMSampleBuffer, Option<Vec<Dirty>>) {
         let mut skipped = 0u64;
         let mut dirty = dirty_rects(&sample);
+        let mut arrived = stream.taken_arrival_ns();
         while let Some(newer) = stream.try_next() {
             if newer.frame_status().is_none_or(|s| s.has_content()) {
+                arrived = stream.taken_arrival_ns();
                 dirty = match (dirty, dirty_rects(&newer)) {
                     (Some(mut a), Some(b)) => {
                         a.extend(b);
@@ -1352,7 +1354,8 @@ mod macos {
                 skipped += 1;
             }
         }
-        if crate::latency_trace::enabled() {
+        if crate::latency_trace::enabled() && sample.frame_status().is_none_or(|s| s.has_content())
+        {
             log_dirty_rects(&sample, label);
             crate::latency_trace::record_us(&format!("{label}.skipped_stale"), skipped);
             let area = dirty
@@ -1360,15 +1363,30 @@ mod macos {
                 .map_or(u64::MAX, |d| d.iter().map(|r| (r.2 * r.3) as u64).sum());
             crate::latency_trace::record_us(&format!("{label}.dirty_px"), area);
             let pts = sample.presentation_timestamp();
-            if let Some(age) = crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
-                crate::latency_trace::record_us(&format!("{label}.sck_age"), age);
-                let slot = label[1..].parse::<usize>().unwrap_or(0) * 3;
-                let at = crate::latency_trace::now_ns().saturating_sub(age * 1000);
+            match crate::latency_trace::host_clock_age_us(pts.value, pts.timescale) {
+                Some(age) if age >= 0 => {
+                    crate::latency_trace::record_us(&format!("{label}.sck_age"), age as u64);
+                }
+                Some(age) => {
+                    crate::latency_trace::record_us(
+                        &format!("{label}.sck_lead"),
+                        age.unsigned_abs(),
+                    );
+                }
+                None => {}
+            }
+            if arrived != 0 {
+                crate::latency_trace::record_ns_delta(
+                    &format!("{label}.sck_queue"),
+                    arrived,
+                    crate::latency_trace::now_ns(),
+                );
                 if dirty.as_ref().is_none_or(|d| !d.is_empty()) {
+                    let slot = label[1..].parse::<usize>().unwrap_or(0) * 3;
                     crate::latency_trace::record_since_key(
                         &format!("{label}.key_to_sck"),
                         slot,
-                        at,
+                        arrived,
                     );
                 }
             }

@@ -2503,6 +2503,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("LATENCY_TRACE", "MACRDP_LATENCY_TRACE"),
         ("VT_LOW_LATENCY", "MACRDP_VT_LOW_LATENCY"),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
+        ("SCK_PACED", "MACRDP_SCK_PACED"),
         (
             "BLANK_RECOVERY_MIN_RENDER_REPORTS",
             "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
@@ -3163,7 +3164,9 @@ async fn async_main() -> Result<()> {
     // Frame rate: explicit --fps wins; otherwise 60 for H.264 (mstsc holds a
     // ~2-frame presentation buffer, so 60fps keeps typing latency low) or 15 for
     // the legacy bitmap path (which has no such buffer and is bandwidth-heavier).
-    let fps = args.fps.unwrap_or(if args.enable_h264 { 60 } else { 15 });
+    let fps = args
+        .fps
+        .unwrap_or_else(|| default_fps(args.enable_h264, virtual_display::refresh_hz()));
 
     // Live session desktop size, shared by capture, input scaling, and the
     // H.264 pipeline. Starts at the size resolved above; when `auto_size`
@@ -3762,6 +3765,29 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// The H.264 default follows a virtual display refreshing above 60 Hz, since a
+/// lower capture rate would throw away the refreshes asked for.
+fn default_fps(enable_h264: bool, vd_refresh_hz: u32) -> u32 {
+    if enable_h264 {
+        vd_refresh_hz.max(60)
+    } else {
+        15
+    }
+}
+
+#[cfg(test)]
+mod default_fps_tests {
+    use super::default_fps;
+
+    #[test]
+    fn h264_follows_a_faster_virtual_display() {
+        assert_eq!(default_fps(true, 60), 60);
+        assert_eq!(default_fps(true, 120), 120);
+        assert_eq!(default_fps(true, 30), 60);
+        assert_eq!(default_fps(false, 120), 15);
     }
 }
 
