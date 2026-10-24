@@ -41,6 +41,20 @@ How it behaves:
 - **Reconnecting `mstsc` to a still-running macrdp can show a black screen** (with a live cursor). This is an mstsc-specific quirk: it retains EGFX surfaces for the lifetime of its process and mis-composites on reconnect. It is *not* a server bug — FreeRDP reconnects cleanly over the same stream. **The server now self-heals it in place** (default, with `--enable-h264`): on a detected blank it sends a bare core RDP Deactivation–Reactivation that preserves the EGFX channel/surface, and mstsc re-maps its retained surface and presents again in ~1–2 s with no disconnect (see the blank-recovery notes in [known-quirks.md](known-quirks.md)). If the automatic recovery ever fails to heal, **close + reopen the mstsc window** — quitting the client clears its surface cache, so the desktop renders every time (no Windows reboot needed). (A server-side fresh-surface-id workaround, and an earlier fork-a-fresh-worker-process-per-connection model, were both tried before the in-place reactivation superseded them.)
 - H.264 is **macOS-only** (VideoToolbox) and still maturing — bitrate and keyframe behavior are tunable (above), but dirty-region *encoding* is not yet done: every frame is a full encode (dirty rects are used only to time on-demand keyframes, not to encode sub-regions). H.264's own inter-prediction keeps unchanged regions cheap regardless.
 
+### Encoder throughput and multi-monitor motion
+
+Every output's VideoToolbox session shares the one hardware encoder, and it serves the sessions a frame at a time: with three displays in full motion each gets the same frame rate whatever its size, and frames in flight beyond two add only queueing latency. Measured offline on an M1 Pro with full-frame scrolling content (`cargo test --release encode_bench -- --ignored --nocapture`; `MACRDP_BENCH_SIZES=3440x1440,3024x1898,1080x1920` for the multi-monitor case):
+
+| Case | 3440x1440 primary | Secondaries | Primary VT latency p50 |
+| --- | --- | --- | --- |
+| Primary alone, 2 in flight | 88 fps (11.3 ms/frame) | none | 18 ms |
+| Three outputs, 2 in flight each | 35 fps | 34-36 fps | 53 ms |
+| Three outputs, secondaries yield to the primary | 49 fps | 25-27 fps | 37 ms |
+
+The engine is saturated at about 450 Mpx/s, so pipelining deeper, encoder speed properties (`PrioritizeEncodingSpeedOverQuality`, `MaximizePowerEfficiency=false`) and low-latency rate control change nothing. So a secondary monitor takes one frame in flight while the primary's encoder is busy (`output_in_flight_limit`), which gives the primary the larger share and cuts everyone's queueing latency.
+
+**Next step, not built: half resolution during fast motion.** Encoder time scales with pixels, so encoding a 1720x720 frame while the primary scrolls would cut its per-frame cost about 4x. Sketch: at connect create a second, half-size surface per output and a second VT session at that size; when the damage tracker reports a full-frame change for N consecutive frames (scroll, drag), downscale BGRA to the half size with vImage while converting to NV12, encode on the half session (first frame an IDR) and switch the output to it with `MapSurfaceToScaledOutput` (targetWidth/Height = the monitor size) so the client upscales it. On settle (no change for ~100 ms, or a small damage area) force an IDR on the full-size session and map the full surface back with `MapSurfaceToOutput`; the settle frame restores full sharpness. Costs: one extra IDR per motion burst at each switch (the full-size one is large, ~100-200 KB at 3440x1440), a second encoder session per output, the PDU needs a client that advertises RDPGFX_CAPVERSION_107 or later (check each client, IronRDP's included, before relying on it), and the fast path and damage regions must target whichever surface is mapped. Estimated, not measured: with three outputs in motion the primary would reach the single-output rate or better.
+
 ### Color conversion: scalar vs vImage
 
 *(Implementation detail — skip unless you're profiling CPU or porting the encoder.)*

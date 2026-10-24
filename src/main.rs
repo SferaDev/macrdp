@@ -28,6 +28,8 @@ mod cursor;
 mod damage;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod egfx_fast_path;
+#[cfg(all(test, target_os = "macos"))]
+mod encode_bench;
 #[cfg(target_os = "macos")]
 mod file_promise;
 #[cfg(target_os = "macos")]
@@ -512,7 +514,8 @@ struct Args {
     /// higher buffers more (smoother video) but lets a backlog build up. This
     /// throttles at capture, before encoding — encoded frames are never dropped
     /// (that would break the H.264 reference chain). Default 2; raise to 3–4 if
-    /// video looks too skippy under heavy motion.
+    /// video looks too skippy under heavy motion. A secondary monitor takes
+    /// one while the primary's encoder is busy, since they share the encoder.
     #[arg(long, default_value_t = 2)]
     h264_frames_in_flight: u32,
 
