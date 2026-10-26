@@ -2509,6 +2509,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // Per-stage latency histograms in the log; see src/latency_trace.rs.
         ("LATENCY_TRACE", "MACRDP_LATENCY_TRACE"),
         ("VT_LOW_LATENCY", "MACRDP_VT_LOW_LATENCY"),
+        ("TCP_NOTSENT_LOWAT", "MACRDP_TCP_NOTSENT_LOWAT"),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         ("SCK_PACED", "MACRDP_SCK_PACED"),
         (
@@ -4187,5 +4188,47 @@ mod tls_tests {
         assert!(cert_dir.join("cert.pem").exists());
         assert!(cert_dir.join("key.pem").exists());
         fs::remove_dir_all(&cert_dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    #[test]
+    fn notsent_lowat_env_parsing() {
+        use ironrdp_server::{notsent_lowat_bytes, DEFAULT_NOTSENT_LOWAT};
+        assert_eq!(notsent_lowat_bytes(None), Some(DEFAULT_NOTSENT_LOWAT));
+        assert_eq!(
+            notsent_lowat_bytes(Some("garbage")),
+            Some(DEFAULT_NOTSENT_LOWAT)
+        );
+        assert_eq!(notsent_lowat_bytes(Some("0")), None);
+        assert_eq!(notsent_lowat_bytes(Some(" 65536 ")), Some(65536));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn notsent_lowat_is_accepted_by_the_kernel() {
+        use std::os::fd::AsRawFd;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let (stream, _) = accepted.unwrap();
+        drop(client);
+        ironrdp_server::apply_notsent_lowat(&stream, 65536).unwrap();
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: reading an int socket option into a correctly sized buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                0x201,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(value, 65536);
     }
 }

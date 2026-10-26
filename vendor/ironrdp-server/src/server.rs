@@ -521,6 +521,58 @@ fn set_nodelay(stream: &tokio::net::TcpStream) {
     }
 }
 
+/// (vendored, divergence 29) Unsent-byte cap; macOS otherwise autotunes the send buffer to seconds of WAN video.
+pub const DEFAULT_NOTSENT_LOWAT: u32 = 128 * 1024;
+
+/// `MACRDP_TCP_NOTSENT_LOWAT` in bytes: unset or unparsable is the default, 0 disables.
+pub fn notsent_lowat_bytes(env: Option<&str>) -> Option<u32> {
+    match env.map(|v| v.trim().parse::<u32>()) {
+        Some(Ok(0)) => None,
+        Some(Ok(n)) => Some(n),
+        _ => Some(DEFAULT_NOTSENT_LOWAT),
+    }
+}
+
+/// `TCP_NOTSENT_LOWAT` from <netinet/tcp.h>; the libc crate does not export it for Apple targets.
+#[cfg(target_os = "macos")]
+pub const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+
+#[cfg(target_os = "macos")]
+pub fn apply_notsent_lowat(stream: &tokio::net::TcpStream, bytes: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+    // SAFETY: the fd is a live TCP socket owned by `stream`; `value` is a c_int option value.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            core::ptr::from_ref(&value).cast(),
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn apply_notsent_lowat(_stream: &tokio::net::TcpStream, _bytes: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn set_notsent_lowat(stream: &tokio::net::TcpStream) {
+    let Some(bytes) = notsent_lowat_bytes(std::env::var("MACRDP_TCP_NOTSENT_LOWAT").ok().as_deref()) else {
+        return;
+    };
+    match apply_notsent_lowat(stream, bytes) {
+        Ok(()) => debug!(bytes, "TCP_NOTSENT_LOWAT set on the RDP socket"),
+        Err(error) => warn!(%error, "TCP_NOTSENT_LOWAT on the RDP socket failed"),
+    }
+}
+
 pub struct RdpServer {
     opts: RdpServerOptions,
     // FIXME: replace with a channel and poll/process the handler?
@@ -2006,6 +2058,7 @@ impl RdpServer {
                         Ok((stream, peer)) = listener.accept() => {
                             drop(ev_receiver);
                             set_nodelay(&stream);
+                            set_notsent_lowat(&stream);
                             (stream, peer)
                         },
                         else => break,
@@ -2157,6 +2210,7 @@ impl RdpServer {
                             }
                             PreemptRace::Accepted(Ok((next_stream, next_peer))) => {
                                 set_nodelay(&next_stream);
+                                set_notsent_lowat(&next_stream);
                                 // Gate the candidate through `on_accept`
                                 // (the AuthGuardHandler's per-source-IP
                                 // rate-limit/lockout) BEFORE it's allowed to
