@@ -647,6 +647,31 @@ Trace stages (with `MACRDP_LATENCY_TRACE=1`): `mN.fastpath_px`, `mN.fastpath_byt
 tiles being queued for the socket, compare with `mN.key_to_queued`) and
 `mN.fastpath_inflight_skip` (small changes that waited because a frame was in the
 encoder).
+Lazy chroma (env only, opt-in, `src/lazy_chroma.rs`, `src/aux_coder.rs`). For a client
+that negotiates AVC444 (a V10 capability set without `AVC_DISABLED`), the primary
+monitor's motion frames ship as AVC444 LC=1 (the same H.264 frame as AVC420). Once the
+screen and input have been idle, the auxiliary view (the chroma 4:2:0 drops) ships as
+LC=2 bands covering only the macroblocks changed since they were last refined, so
+coloured text sharpens at rest. Each band is a non-reference P picture coded in
+software into VideoToolbox's stream (band macroblocks Intra16x16, the rest skipped),
+so the encoder, its rate control and the frames after it never see it. A band stops
+at `BAND_BYTES` (12 kB: 4.8 ms on a 20 Mbit/s link), goes only into an empty encoder,
+waits until the previous band has had time to leave at `PACE_KBPS` and the client has
+acknowledged every earlier frame, and is dropped if input arrives while it is coded: a
+key after a pause waits for at most one band, on a link of any rate. Needs
+the default Baseline CAVLC stream (not `MACRDP_VT_LOW_LATENCY`). Turning it on also
+turns off the periodic whole-surface frame (`MACRDP_EGFX_FULL_REFRESH_MS`) and stretches
+the periodic IDR, since every whole-surface frame makes all chroma 4:2:0 again.
+Secondary monitors stay AVC420.
+```
+MACRDP_AVC444=lazy               # off unless set
+MACRDP_AVC444_IDLE_MS=250        # screen and input idle time before bands start
+MACRDP_AVC444_KEYFRAME_SECS=30   # shortest periodic IDR interval (--keyframe-interval wins if longer)
+MACRDP_AVC444_BAND_BYTES=12000   # bytes a band stops at
+MACRDP_AVC444_PACE_KBPS=20000    # link rate bands are paced for
+MACRDP_AVC444_QP=24              # band QP: 24 gives about 39 dB chroma on coloured text, 4:2:0 about 29
+```
+Trace stages (with `MACRDP_LATENCY_TRACE=1`): `m0.aux_bytes` and `m0.aux_encode` (µs).
 
 Testing against the server:
 ```bash

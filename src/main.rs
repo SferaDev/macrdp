@@ -13,6 +13,8 @@ mod audin;
 mod audio;
 mod auth;
 mod auth_guard;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod aux_coder;
 mod avc444;
 mod camera;
 mod capture;
@@ -40,6 +42,8 @@ mod health;
 mod input;
 mod keyboard_layout;
 mod latency_trace;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod lazy_chroma;
 mod lock_activity;
 mod logging;
 mod monitor_layout;
@@ -2736,6 +2740,8 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // Small-change fast path (h264.rs); env-read when each EGFX encoder starts.
         ("EGFX_FAST_PATH", "MACRDP_EGFX_FAST_PATH"),
         ("EGFX_FAST_PATH_MAX_PX", "MACRDP_EGFX_FAST_PATH_MAX_PX"),
+        // Lazy AVC444 chroma (lazy_chroma.rs); env-read when each EGFX encoder starts.
+        ("AVC444", "MACRDP_AVC444"),
     ] {
         if let Some(val) = cfg.get(cfg_key) {
             if !val.is_empty() {
