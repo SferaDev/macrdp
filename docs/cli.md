@@ -591,6 +591,17 @@ MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
 MACRDP_TCP_NOTSENT_LOWAT=131072  # bytes the kernel may hold unsent on the RDP socket (0 = OS default, unbounded autotuning)
 ```
 
+EGFX send window (env, settable through `config.env` without the `MACRDP_` prefix). A frame
+counts against both limits from the moment it ships until the client acknowledges decoding it;
+past either one, captures are dropped before encode (the H.264 chain stays valid):
+```
+MACRDP_EGFX_MAX_FRAME_LAG=3          # unacked frames on TCP (0 disables)
+MACRDP_EGFX_INFLIGHT_QUEUE_MS=80     # unacked BYTES: target bitrate x (base ack RTT + this), at least 256 KiB (0 disables)
+```
+The byte limit is what bounds latency on a WAN link: one keyframe can be several hundred KB,
+which a frame count lets through whole. While over it, one capture still goes through each
+time acks stall for max(100 ms, 1.5 x base RTT), for clients that ack only behind newer frames.
+
 Capture rate (env, settable through `config.env` as `VD_REFRESH_HZ` / `SCK_PACED`).
 A capture runs uncapped when its display refreshes no faster than `--fps`: SCK
 then hands over each composite as soon as it is ready instead of pacing it toward
