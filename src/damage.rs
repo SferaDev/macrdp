@@ -256,6 +256,12 @@ impl DamageTracker {
         self.enabled
     }
 
+    /// The same policy without the periodic whole-surface frame.
+    pub fn without_full_refresh(mut self) -> Self {
+        self.full_refresh = None;
+        self
+    }
+
     /// Records the damage of the frame submitted with presentation time `pts`.
     pub fn submitted(&mut self, pts: i64, damage: Damage) {
         if !self.enabled {
@@ -475,6 +481,17 @@ mod tests {
         assert_eq!(t.regions(pts, false, 1920, 1080, now), None);
         t.submitted(pts + 1, Damage::Full);
         assert_eq!(t.regions(pts + 1, false, 1920, 1080, now), None);
+    }
+
+    #[test]
+    fn lazy_chroma_policy_has_no_periodic_refresh() {
+        let start = Instant::now();
+        let mut t = DamageTracker::new(true, Some(Duration::from_secs(1))).without_full_refresh();
+        let pts = settled(&mut t, start);
+        t.submitted(pts, Damage::Rects(vec![r(0, 0, 4, 4)]));
+        assert!(t
+            .regions(pts, false, 1920, 1080, start + Duration::from_secs(5))
+            .is_some());
     }
 
     #[test]

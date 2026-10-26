@@ -2,7 +2,7 @@
 
 Local fork of ironrdp-egfx 0.3.0, **vendored 2026-10-22 from upstream
 Devolutions/IronRDP@a5d1c682** (the current pin). Upstream files are copied
-verbatim; the only change is a pure addition in `src/server.rs`. Has a standalone
+verbatim; the only changes are pure additions in `src/server.rs`. Has a standalone
 `[patch.crates-io]` (core/dvc/graphics/pdu → a5d1c682) for isolated build, ignored
 in the macrdp workspace (root `[patch]` wins). Keep that rev in sync when bumping
 the IronRDP pin. `rustfmt.toml` mirrors the IronRDP workspace config so a
@@ -39,5 +39,13 @@ ironrdp-dvc needs isn't required here.
     fast path (`src/egfx_fast_path.rs`) sends small changed rects this way
     ahead of the H.264 frame. Upstream candidate: a destination on the
     planar/uncompressed sends, or the two variants on `MixedTilePayload`.
+(3) `GraphicsPipelineServer::send_avc444_frame_to_rect` (NOT upstreamed): an
+    AVC444 v1 send that takes the LC value (`Encoding`) and the destination.
+    The vendored `send_avc444_frame` can only send LC 0 and 1 and derives the
+    destination the same inclusive way as (1). macrdp's opt-in lazy chroma
+    (`MACRDP_AVC444=lazy`, `src/lazy_chroma.rs`) sends motion as LC 1 and the
+    auxiliary view alone as LC 2 once the screen is idle; LC 2 carries a zero
+    `cbAvc420EncodedBitstream1` as the spec requires (upstream's encoder does
+    the same since `da4d45a1`, which has LC 2 only for v2).
 
 Retire this vendor dir once upstream offers an equivalent and the pin moves past it.

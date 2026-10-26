@@ -1775,6 +1775,10 @@ mod macos {
         /// The frame EGFX dropped last (busy encoder); offered again a frame
         /// later until it is encoded. Lives in `last_frame`.
         resubmit: bool,
+        /// When EGFX last took a changed frame, for lazy chroma's idle wait.
+        last_change_at: Instant,
+        /// Lazy chroma may still owe an auxiliary view, so the loop keeps waking.
+        aux_waiting: bool,
         /// The last captured frame, for telling real changes from redraws.
         last_frame_kept: LastFrame,
         /// What changed since EGFX last took a frame: the regions the next
@@ -1885,6 +1889,34 @@ mod macos {
                         gfx.submit_bgra_status(g.as_slice(), g.bytes_per_row(), false, damage)
                     }),
             )
+        }
+
+        /// Lazy chroma: offers the next aux band once idle after the flush burst; true while bands may still be due.
+        fn offer_aux(&mut self) -> bool {
+            let Some(gfx) = self.gfx.as_ref() else {
+                return false;
+            };
+            let Some(idle) = gfx.lazy_chroma_idle() else {
+                return false;
+            };
+            if self.flush_remaining > 0 || self.resubmit || self.last_change_at.elapsed() < idle {
+                return true;
+            }
+            let Some(pb) = self.last_frame.as_ref() else {
+                return false;
+            };
+            let offered = pb
+                .lock(CVPixelBufferLockFlags::READ_ONLY)
+                .map_err(|e| anyhow!("CVPixelBuffer::lock OSStatus {e}"))
+                .and_then(|g| gfx.submit_aux_bgra(g.as_slice(), g.bytes_per_row()));
+            match offered {
+                Ok(crate::h264::AuxOffer::Submitted | crate::h264::AuxOffer::Wait) => true,
+                Ok(crate::h264::AuxOffer::Done) => false,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "EGFX lazy chroma: band submit failed");
+                    false
+                }
+            }
         }
 
         /// Ships the held frame once EGFX takes it. Returns whether it did.
@@ -2105,6 +2137,8 @@ mod macos {
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
                 resubmit: false,
+                last_change_at: Instant::now(),
+                aux_waiting: false,
                 last_frame_kept: LastFrame::default(),
                 damage: Damage::default(),
                 last_damage: Damage::Full,
@@ -2352,6 +2386,7 @@ mod macos {
                     || self.pending_resize.has_pending()
                     || self.held_frame.is_some()
                     || self.resubmit
+                    || self.aux_waiting
                 {
                     match tokio::time::timeout(self.frame_interval, self.stream.next()).await {
                         Ok(Some(sample)) => sample,
@@ -2381,6 +2416,9 @@ mod macos {
                                         }
                                     }
                                 }
+                            }
+                            if self.aux_waiting {
+                                self.aux_waiting = self.offer_aux();
                             }
                             continue;
                         }
@@ -2440,6 +2478,9 @@ mod macos {
                             if let Some(Err(e)) = self.submit_last_frame(self.last_damage.clone()) {
                                 tracing::warn!(error = ?e, "EGFX flush submit_bgra failed");
                             }
+                        }
+                        if self.aux_waiting {
+                            self.aux_waiting = self.offer_aux();
                         }
                         continue;
                     }
@@ -2610,6 +2651,8 @@ mod macos {
                             // it enough times to drain mstsc's presentation
                             // buffer. A retain, not a copy (see `last_frame`).
                             self.last_frame = Some(pixel_buffer.clone());
+                            self.last_change_at = Instant::now();
+                            self.aux_waiting = gfx.lazy_chroma_idle().is_some();
                             self.flush_remaining = self.flush_frames;
                             self.held_frame = None;
                             continue;
