@@ -96,6 +96,85 @@ const ADAPTIVE_WARMUP: Duration = Duration::from_secs(2);
 /// any realistic frames-in-flight window (even 500 ms RTT at 60 fps is ~30).
 const RTT_RING: usize = 128;
 
+/// Smallest unacked-byte budget, so a slow or unmeasured link still keeps an IDR in flight.
+const INFLIGHT_MIN_BYTES: u64 = 256 * 1024;
+
+/// A shipped frame's id, ship time, and the session's cumulative shipped bytes including it.
+#[derive(Clone, Copy, Debug)]
+struct ShipSlot {
+    id: u64,
+    at: Instant,
+    cum_bytes: u64,
+}
+
+/// The ship-time ring (`frame_id % RTT_RING`) plus the bytes shipped so far.
+struct ShipLog {
+    slots: Vec<ShipSlot>,
+    shipped_bytes: u64,
+}
+
+impl ShipLog {
+    fn new(now: Instant) -> Self {
+        let empty = ShipSlot {
+            id: u64::MAX,
+            at: now,
+            cum_bytes: 0,
+        };
+        Self {
+            slots: vec![empty; RTT_RING],
+            shipped_bytes: 0,
+        }
+    }
+
+    fn record(&mut self, id: u64, at: Instant, bytes: usize) {
+        self.shipped_bytes = self.shipped_bytes.saturating_add(bytes as u64);
+        self.slots[id as usize % RTT_RING] = ShipSlot {
+            id,
+            at,
+            cum_bytes: self.shipped_bytes,
+        };
+    }
+
+    fn slot(&self, id: u64) -> ShipSlot {
+        self.slots[id as usize % RTT_RING]
+    }
+}
+
+/// Unacked bytes allowed in flight: the target rate over the base RTT plus `queue_ms` of standing queue.
+fn inflight_byte_budget(target_bps: u32, base_rtt_ms: f64, queue_ms: u32, min_bytes: u64) -> u64 {
+    let window_s = (base_rtt_ms.max(0.0) + f64::from(queue_ms)) / 1000.0;
+    ((f64::from(target_bps) / 8.0 * window_s) as u64).max(min_bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflightGate {
+    Pass,
+    /// Over budget but acks stalled: let one capture through so a client that acks only behind newer frames recovers.
+    Release,
+    Hold,
+}
+
+fn inflight_gate(
+    unacked_bytes: u64,
+    budget: u64,
+    since_ack_advance: Duration,
+    since_release: Duration,
+    stall: Duration,
+) -> InflightGate {
+    if unacked_bytes <= budget {
+        InflightGate::Pass
+    } else if since_ack_advance >= stall && since_release >= stall {
+        InflightGate::Release
+    } else {
+        InflightGate::Hold
+    }
+}
+
+/// How long acks must stall before [`InflightGate::Release`]: one throttle floor or 1.5 base RTTs.
+fn inflight_stall(base_rtt_ms: f64) -> Duration {
+    UDP_THROTTLE_FLOOR.max(Duration::from_secs_f64(base_rtt_ms.max(0.0) * 1.5 / 1000.0))
+}
+
 /// Bucket width of the two-bucket windowed-minimum RTT filter. The min over
 /// the current + previous bucket is the base-RTT estimate the queue-delay
 /// signal subtracts; a route change (VPN reconnect) re-baselines within ~2
@@ -278,7 +357,11 @@ struct ConnectionContext {
     /// `send_avc420_frame` allocates the id (a leaf mutex held for
     /// nanoseconds; never taken while holding another lock), read in
     /// `on_frame_ack` to time each frame's ship→ack round trip.
-    ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    ship_times: Arc<Mutex<ShipLog>>,
+    /// Cumulative shipped bytes up to the newest acked frame; `ShipLog::shipped_bytes` minus this is unacked.
+    acked_bytes: u64,
+    /// When the in-flight byte gate last released a capture past its budget.
+    last_inflight_release: Instant,
     /// Windowed-minimum ack RTT (two `RTT_MIN_WINDOW` buckets, so a route
     /// change re-baselines within ~2 windows). The minimum over the window is
     /// the link's base RTT including the empty-pipe server-side path;
@@ -396,6 +479,7 @@ impl ConnectionContext {
         self.last_recovery_at = now;
         self.rtt_bucket_started = now;
         self.last_throttle_ship = now;
+        self.last_inflight_release = now;
         self.adaptive_last_control = now;
         self.last_floor_fps_pass = now;
         self.last_nonzero_qoe_at = now;
@@ -1230,7 +1314,7 @@ struct FastShip {
     surface_id: u16,
     epoch: Instant,
     last_shipped: Arc<AtomicU64>,
-    ship_times: Arc<Mutex<Vec<(u64, Instant)>>>,
+    ship_times: Arc<Mutex<ShipLog>>,
     rects: Vec<crate::damage::Rect>,
 }
 
@@ -1286,6 +1370,8 @@ pub struct Gfx {
     /// decode-bound client falls seconds behind. `MACRDP_EGFX_MAX_FRAME_LAG`
     /// (default 3, 0 disables); a healthy LAN client acks within a frame or two.
     tcp_max_frame_lag: u64,
+    /// Queue (ms) the byte budget allows over the base RTT; `MACRDP_EGFX_INFLIGHT_QUEUE_MS`, default 80, 0 disables.
+    inflight_queue_ms: u32,
     /// EGFX-over-UDP → TCP watchdog. On by default (disable with
     /// `MACRDP_UDP_EGFX_WATCHDOG=0`); only ever acts while EGFX is on the RELIABLE
     /// UDP tunnel (`egfx_on_udp && !egfx_on_lossy`), so it's a no-op unless
@@ -1434,6 +1520,10 @@ impl Gfx {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(3);
+        let inflight_queue_ms = std::env::var("MACRDP_EGFX_INFLIGHT_QUEUE_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(80);
         let watchdog_enabled = match std::env::var("MACRDP_UDP_EGFX_WATCHDOG") {
             Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
             Err(_) => true, // default on (no-op unless EGFX is on the reliable UDP tunnel)
@@ -1652,6 +1742,7 @@ impl Gfx {
             egfx_on_udp,
             max_frame_lag,
             tcp_max_frame_lag,
+            inflight_queue_ms,
             watchdog_enabled,
             watchdog_wedge_timeout,
             watchdog_active_window,
@@ -1708,10 +1799,7 @@ impl Gfx {
             return; // already on TCP for this session
         }
         ctx.need_keyframe = true;
-        ctx.last_acked_frame_id.store(
-            ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        forget_unacked(ctx);
         ctx.demigrated = true;
         self.demigrate_request.store(true, Ordering::Relaxed);
         warn!(
@@ -1845,10 +1933,7 @@ impl Gfx {
                     self.watchdog_wedge_timeout,
                 ) {
                     ctx.need_keyframe = true;
-                    ctx.last_acked_frame_id.store(
-                        ctx.last_shipped_frame_id.load(Ordering::Relaxed),
-                        Ordering::Relaxed,
-                    );
+                    forget_unacked(ctx);
                     ctx.demigrated = true;
                     self.demigrate_request.store(true, Ordering::Relaxed);
                     warn!(
@@ -2287,8 +2372,10 @@ impl Gfx {
             return Ok(AuxOffer::Wait);
         };
         last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
-        ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
-            (u64::from(frame_id), Instant::now());
+        ship_times
+            .lock()
+            .unwrap()
+            .record(u64::from(frame_id), Instant::now(), payload.len());
         let messages = encode_dvc_messages(
             channel_id,
             server.drain_output(),
@@ -2955,6 +3042,9 @@ impl Gfx {
         if !ctx.egfx_acks_seen || ctx.acks_suspended {
             return false;
         }
+        if self.inflight_bytes_over_budget(ctx) {
+            return true;
+        }
         let limit = if self.egfx_on_udp.load(Ordering::Relaxed) {
             self.max_frame_lag
         } else {
@@ -2977,6 +3067,52 @@ impl Gfx {
         }
         ctx.last_throttle_ship = now;
         false
+    }
+
+    /// Frame counts miss what matters on a WAN link: one IDR can be a second of queue, so bound the unacked bytes too.
+    fn inflight_bytes_over_budget(&self, ctx: &mut ConnectionContext) -> bool {
+        if self.inflight_queue_ms == 0 {
+            return false;
+        }
+        let measured = ctx.rtt_min_cur_ms.min(ctx.rtt_min_prev_ms);
+        let base_rtt_ms = if measured.is_finite() {
+            measured
+        } else {
+            f64::from(ctx.link_rtt_ms)
+        };
+        let target_bps = if self.adaptive_enabled {
+            ctx.adaptive_target_bps
+        } else {
+            self.bitrate_bps
+        };
+        let budget = inflight_byte_budget(
+            target_bps,
+            base_rtt_ms,
+            self.inflight_queue_ms,
+            INFLIGHT_MIN_BYTES,
+        );
+        let unacked = ctx
+            .ship_times
+            .lock()
+            .unwrap()
+            .shipped_bytes
+            .saturating_sub(ctx.acked_bytes);
+        crate::latency_trace::record_us("unacked_bytes", unacked);
+        let now = Instant::now();
+        match inflight_gate(
+            unacked,
+            budget,
+            now.saturating_duration_since(ctx.last_ack_advance_at),
+            now.saturating_duration_since(ctx.last_inflight_release),
+            inflight_stall(base_rtt_ms),
+        ) {
+            InflightGate::Pass => false,
+            InflightGate::Release => {
+                ctx.last_inflight_release = now;
+                false
+            }
+            InflightGate::Hold => true,
+        }
     }
 
     /// The fast-path send for this capture of surface `surface_id`, when the
@@ -3036,8 +3172,10 @@ impl Gfx {
         if let Some(s) = crate::stats::global() {
             s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
         }
-        ship.ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
-            (u64::from(frame_id), Instant::now());
+        ship.ship_times
+            .lock()
+            .unwrap()
+            .record(u64::from(frame_id), Instant::now(), bytes);
         let dvc_messages = server.drain_output();
         let sent = encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
             .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))
@@ -3421,8 +3559,11 @@ impl Gfx {
                     if let Some(s) = crate::stats::global() {
                         s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
                     }
-                    ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
-                        (u64::from(frame_id), Instant::now());
+                    ship_times.lock().unwrap().record(
+                        u64::from(frame_id),
+                        Instant::now(),
+                        payload.len(),
+                    );
                 }
                 match sent {
                     Some(frame_id) if f.is_keyframe => debug!(
@@ -3646,7 +3787,9 @@ impl GfxServerFactory for Gfx {
             last_shipped_frame_id: Arc::new(AtomicU64::new(0)),
             last_acked_frame_id: Arc::new(AtomicU64::new(0)),
             egfx_acks_seen: false,
-            ship_times: Arc::new(Mutex::new(vec![(u64::MAX, Instant::now()); RTT_RING])),
+            ship_times: Arc::new(Mutex::new(ShipLog::new(Instant::now()))),
+            acked_bytes: 0,
+            last_inflight_release: Instant::now(),
             rtt_min_cur_ms: f64::INFINITY,
             rtt_min_prev_ms: f64::INFINITY,
             rtt_bucket_started: Instant::now(),
@@ -3833,7 +3976,15 @@ impl GraphicsPipelineHandler for GfxHandler {
         // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
-            ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            let suspended = queue_depth == 0xFFFF_FFFF;
+            if suspended != ctx.acks_suspended {
+                // Every ack-driven limit is off while suspended, so a WAN latency report needs to know.
+                info!(
+                    suspended,
+                    frame_id, "EGFX client changed frame-ack suspension"
+                );
+            }
+            ctx.acks_suspended = suspended;
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
             // The client sends FrameAcknowledge after it DECODES a frame, so this
             // is the floor of its decode backlog. Only advance on a real ack (not
@@ -3846,8 +3997,14 @@ impl GraphicsPipelineHandler for GfxHandler {
                 ctx.last_ack_advance_at = Instant::now();
                 // Ack-RTT sample for the adaptive controller's queue-delay
                 // signal: time since this exact frame left send_avc420_frame.
-                let (slot_id, shipped_at) =
-                    ctx.ship_times.lock().unwrap()[frame_id as usize % RTT_RING];
+                let ShipSlot {
+                    id: slot_id,
+                    at: shipped_at,
+                    cum_bytes,
+                } = ctx.ship_times.lock().unwrap().slot(u64::from(frame_id));
+                if slot_id == u64::from(frame_id) {
+                    ctx.acked_bytes = ctx.acked_bytes.max(cum_bytes);
+                }
                 let sample_ms = if slot_id == u64::from(frame_id) {
                     // Exact match: the frame's true ship→ack round trip.
                     Some(shipped_at.elapsed().as_secs_f64() * 1000.0)
@@ -4011,6 +4168,15 @@ impl GraphicsPipelineHandler for StubHandler {
     fn on_ready(&mut self, _negotiated: &CapabilitySet) {
         warn!("EGFX StubHandler::on_ready — build_server_with_handle should have replaced this");
     }
+}
+
+/// Treats everything shipped as acknowledged, after a transport switch strands the unacked frames.
+fn forget_unacked(ctx: &mut ConnectionContext) {
+    ctx.last_acked_frame_id.store(
+        ctx.last_shipped_frame_id.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    ctx.acked_bytes = ctx.ship_times.lock().unwrap().shipped_bytes;
 }
 
 /// Frames the client has not acknowledged, 0 when it does not acknowledge. Bands wait for 0: at most one is ever
@@ -4372,6 +4538,92 @@ mod tests {
             aimd_bitrate(1_000_000, 9, 1_000_000, 10_000_000, 500_000, 0.7),
             1_000_000
         );
+    }
+
+    // ---- in-flight byte budget (`inflight_byte_budget` / `inflight_gate`) ----
+
+    #[test]
+    fn inflight_budget_scales_with_rate_and_rtt() {
+        // 20 Mbit/s over 70 ms base RTT + 80 ms queue = 375 000 bytes.
+        assert_eq!(inflight_byte_budget(20_000_000, 70.0, 80, 0), 375_000);
+        // A slow seed or an unmeasured link still keeps the floor.
+        assert_eq!(
+            inflight_byte_budget(1_000_000, 0.0, 80, INFLIGHT_MIN_BYTES),
+            INFLIGHT_MIN_BYTES
+        );
+        assert_eq!(inflight_byte_budget(20_000_000, -5.0, 0, 0), 0);
+    }
+
+    #[test]
+    fn inflight_gate_holds_over_budget_until_acks_stall() {
+        let stall = ms(105);
+        assert_eq!(
+            inflight_gate(100, 100, ms(0), ms(0), stall),
+            InflightGate::Pass
+        );
+        assert_eq!(
+            inflight_gate(101, 100, ms(50), ms(500), stall),
+            InflightGate::Hold
+        );
+        assert_eq!(
+            inflight_gate(101, 100, ms(105), ms(105), stall),
+            InflightGate::Release
+        );
+        // One release per stall period, even while acks stay silent.
+        assert_eq!(
+            inflight_gate(101, 100, ms(400), ms(10), stall),
+            InflightGate::Hold
+        );
+    }
+
+    #[test]
+    fn inflight_stall_tracks_rtt_above_the_throttle_floor() {
+        assert_eq!(inflight_stall(10.0), UDP_THROTTLE_FLOOR);
+        assert_eq!(inflight_stall(70.0), ms(105));
+    }
+
+    #[test]
+    fn ship_log_tracks_cumulative_bytes_per_frame() {
+        let now = Instant::now();
+        let mut log = ShipLog::new(now);
+        assert_eq!(log.slot(1).id, u64::MAX);
+        log.record(1, now, 1000);
+        log.record(2, now, 500);
+        assert_eq!(log.shipped_bytes, 1500);
+        assert_eq!(log.slot(1).cum_bytes, 1000);
+        assert_eq!(log.slot(2).cum_bytes, 1500);
+        // A wrapped slot belongs to the newer frame; the older id no longer matches.
+        log.record(1 + RTT_RING as u64, now, 10);
+        assert_eq!(log.slot(1).id, 1 + RTT_RING as u64);
+        assert_eq!(log.slot(1).cum_bytes, 1510);
+    }
+
+    #[test]
+    fn acks_release_unacked_bytes() {
+        let gfx = gfx_with_context();
+        let mut handler = GfxHandler {
+            ctx: gfx.ctx.clone(),
+        };
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            let mut log = ctx.ship_times.lock().unwrap();
+            let now = Instant::now();
+            log.record(1, now, 300_000);
+            log.record(2, now, 200_000);
+        }
+        handler.on_frame_ack(1, 0, 1);
+        {
+            let guard = gfx.ctx.lock().unwrap();
+            assert_eq!(guard.as_ref().unwrap().acked_bytes, 300_000);
+        }
+        handler.on_frame_ack(2, 0, 2);
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        assert_eq!(ctx.acked_bytes, 500_000);
+        ctx.ship_times.lock().unwrap().record(3, Instant::now(), 7);
+        forget_unacked(ctx);
+        assert_eq!(ctx.acked_bytes, 500_007);
     }
 
     // ---- IDR backoff (`idr_backoff_decision`) ----
@@ -5719,7 +5971,7 @@ mod tests {
 
     /// Every connection-start clock, so a test can't pass by checking only the
     /// one it happened to remember.
-    fn clocks(ctx: &ConnectionContext) -> [Instant; 11] {
+    fn clocks(ctx: &ConnectionContext) -> [Instant; 12] {
         [
             ctx.epoch,
             ctx.last_ack_at,
@@ -5728,6 +5980,7 @@ mod tests {
             ctx.last_recovery_at,
             ctx.rtt_bucket_started,
             ctx.last_throttle_ship,
+            ctx.last_inflight_release,
             ctx.adaptive_last_control,
             ctx.last_floor_fps_pass,
             ctx.last_nonzero_qoe_at,
@@ -5789,7 +6042,7 @@ mod tests {
         .on_ready(&avc_ready());
 
         let guard = gfx.ctx.lock().unwrap();
-        assert_eq!(clocks(guard.as_ref().unwrap()), [started; 11]);
+        assert_eq!(clocks(guard.as_ref().unwrap()), [started; 12]);
     }
 
     /// A declined (no-AVC) client never goes ready, so its clocks are left alone.
@@ -5811,7 +6064,7 @@ mod tests {
         let guard = gfx.ctx.lock().unwrap();
         let ctx = guard.as_ref().unwrap();
         assert!(!ctx.is_ready);
-        assert_eq!(clocks(ctx), [built; 11]);
+        assert_eq!(clocks(ctx), [built; 12]);
     }
 
     fn decode_gfx(messages: Vec<ironrdp_dvc::DvcMessage>) -> Vec<ironrdp_egfx::pdu::GfxPdu> {
@@ -6010,6 +6263,6 @@ mod tests {
         let guard = gfx.ctx.lock().unwrap();
         let ctx = guard.as_ref().unwrap();
         let id = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
-        assert_eq!(ctx.ship_times.lock().unwrap()[id as usize % RTT_RING].0, id);
+        assert_eq!(ctx.ship_times.lock().unwrap().slot(id).id, id);
     }
 }
