@@ -57,7 +57,7 @@ use ironrdp_dvc::encode_dvc_messages;
 use ironrdp_egfx::pdu::{
     Avc420Region, CacheImportOfferPdu, CapabilitiesAdvertisePdu, CapabilitiesV103Flags,
     CapabilitiesV104Flags, CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
-    CapabilitySet, PixelFormat,
+    CapabilitySet, Encoding, PixelFormat,
 };
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer, QoeMetrics, Surface};
 use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
@@ -72,6 +72,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::damage::{Damage, DamageTracker};
 use crate::egfx_fast_path::FastPath;
+use crate::lazy_chroma::{LazyChroma, LazyChromaConfig};
 use crate::videotoolbox::{EncodedFrame, Encoder};
 
 /// Minimum spacing between "trickle" frames let through the EGFX-on-UDP
@@ -188,6 +189,12 @@ struct ConnectionContext {
     /// The primary encoder's frame damage, shared with its ship thread and
     /// replaced along with the encoder.
     damage: Arc<Mutex<DamageTracker>>,
+    /// The primary encoder's lazy chroma state, replaced along with the encoder.
+    lazy: Option<Arc<Mutex<LazyChroma>>>,
+    /// The aux view of the still frame bands are coded from; every motion frame clears it.
+    aux_view: Option<crate::avc444::Nv12>,
+    /// Whether the negotiated EGFX capability set allows AVC444.
+    negotiated_avc444: bool,
     surface_id: Option<u16>,
     is_ready: bool,
     epoch: Instant,
@@ -1205,6 +1212,17 @@ pub enum OutputSubmit {
     Busy,
 }
 
+/// What [`Gfx::submit_aux_bgra`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxOffer {
+    /// A band went out; more may follow.
+    Submitted,
+    /// Bands are owed but not now: busy encoder, recent input, pacing, or the stream not followed yet.
+    Wait,
+    /// Nothing to refine, or lazy chroma is off for this connection.
+    Done,
+}
+
 /// What [`Gfx::ship_fast_path`] needs from the connection, taken under `ctx`
 /// and used after it is released.
 struct FastShip {
@@ -1386,6 +1404,8 @@ pub struct Gfx {
     /// Small changes ship as Planar/Uncompressed tiles ahead of H.264
     /// (`MACRDP_EGFX_FAST_PATH`); `None` leaves the path unchanged.
     fast_path: Option<FastPath>,
+    /// `MACRDP_AVC444=lazy`: see `crate::lazy_chroma`.
+    lazy_config: Option<LazyChromaConfig>,
 }
 
 impl Gfx {
@@ -1578,6 +1598,16 @@ impl Gfx {
         if let Some(fp) = fast_path {
             info!(codec = ?fp.codec, max_px = fp.max_px, "EGFX small-change fast path ENABLED (MACRDP_EGFX_FAST_PATH)");
         }
+        let lazy_config = LazyChromaConfig::from_env();
+        if let Some(c) = lazy_config {
+            info!(
+                idle_ms = c.idle.as_millis() as u64,
+                keyframe_secs = c.keyframe_secs,
+                band_bytes = c.band_bytes,
+                qp = c.qp,
+                "EGFX lazy chroma ENABLED (MACRDP_AVC444=lazy) for AVC444 clients; no periodic whole-surface refresh"
+            );
+        }
         let (width, height) = desktop_size.get();
         info!(
             ?wire_format,
@@ -1646,6 +1676,7 @@ impl Gfx {
             reactivate_request: Arc::new(AtomicU32::new(0)),
             damage_policy,
             fast_path,
+            lazy_config,
         }
     }
 
@@ -2123,10 +2154,169 @@ impl Gfx {
                 }
             }
             let pts = encoder.encode_bgra(bgra, stride, force_keyframe)?;
+            ctx.aux_view = None;
             ctx.damage.lock().unwrap().submitted(pts, damage);
             ctx.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Ok(OutputSubmit::Encoded)
+    }
+
+    /// Lazy chroma's idle time (`crate::lazy_chroma`), `None` when it is off.
+    pub fn lazy_chroma_idle(&self) -> Option<Duration> {
+        self.lazy_config.map(|c| c.idle)
+    }
+
+    /// Sends the next aux band of `bgra`, the still frame the client shows, when one is due. Runs on the capture
+    /// thread, the only one that submits frames, and only into an empty encoder: the band lands right after the
+    /// reference picture it is numbered from.
+    pub fn submit_aux_bgra(&self, bgra: &[u8], stride: usize) -> Result<AuxOffer> {
+        let Some(config) = self.lazy_config else {
+            return Ok(AuxOffer::Done);
+        };
+        let check = |ctx: &mut ConnectionContext| -> Result<(crate::lazy_chroma::BandTarget, Vec<usize>), AuxOffer> {
+            let (Some(_), Some(lazy)) = (ctx.encoder.as_ref(), ctx.lazy.clone()) else {
+                return Err(AuxOffer::Done);
+            };
+            let lazy = lazy.lock().unwrap();
+            if !ctx.is_ready || lazy.stale_mbs() == 0 {
+                return Err(AuxOffer::Done);
+            }
+            let outstanding = ctx
+                .submitted
+                .load(Ordering::Relaxed)
+                .saturating_sub(ctx.shipped.load(Ordering::Relaxed));
+            if ctx.need_keyframe
+                || outstanding > 0
+                || !crate::lazy_chroma::input_idle(config.idle)
+                || unacked_frames(ctx) > 0
+            {
+                return Err(AuxOffer::Wait);
+            }
+            let target = lazy.band_due(Instant::now()).ok_or(AuxOffer::Wait)?;
+            Ok((target, lazy.candidates()))
+        };
+        let (target, candidates, view, (width, height)) = {
+            let mut guard = self.ctx.lock().unwrap();
+            let Some(ctx) = guard.as_mut() else {
+                return Ok(AuxOffer::Done);
+            };
+            let (target, candidates) = match check(ctx) {
+                Ok(t) => t,
+                Err(offer) => return Ok(offer),
+            };
+            (target, candidates, ctx.aux_view.take(), ctx.dims)
+        };
+        let (w, h) = (usize::from(width), usize::from(height));
+        let view = match view {
+            Some(v) if (v.width, v.height) == (w, h) => v,
+            // Converted and coded outside the lock: the ship thread and acks need it.
+            _ => crate::videotoolbox::bgra_to_aux_view(bgra, stride, w, h)?,
+        };
+        let started = Instant::now();
+        // A key while coding drops the band at once: it must not hold up the capture thread.
+        let band = crate::aux_coder::encode_band(
+            &target.params,
+            target.last,
+            &view,
+            &candidates,
+            config.qp,
+            config.band_bytes,
+            &|| !crate::lazy_chroma::input_idle(config.idle),
+        );
+        let encode_us = started.elapsed().as_micros() as u64;
+        let Some(band) = band else {
+            if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+                ctx.aux_view = Some(view);
+            }
+            return Ok(AuxOffer::Wait);
+        };
+
+        let (ship, rects, lazy) = {
+            let mut guard = self.ctx.lock().unwrap();
+            let Some(ctx) = guard.as_mut() else {
+                return Ok(AuxOffer::Done);
+            };
+            match check(ctx) {
+                Ok((t, _)) if t == target => {}
+                Ok(_) => return Ok(AuxOffer::Wait),
+                Err(offer) => return Ok(offer),
+            }
+            ctx.aux_view = Some(view);
+            let Some(lazy) = ctx.lazy.clone() else {
+                return Ok(AuxOffer::Done);
+            };
+            let rects = lazy.lock().unwrap().rects_of(&band.mbs);
+            let ship = (
+                ctx.server_handle.clone(),
+                ctx.surface_id,
+                ctx.epoch,
+                ctx.last_shipped_frame_id.clone(),
+                ctx.ship_times.clone(),
+            );
+            (ship, rects, lazy)
+        };
+        let (server_handle, Some(surface_id), epoch, last_shipped, ship_times) = ship else {
+            return Ok(AuxOffer::Done);
+        };
+        let payload = self.nal_payload(&band.nals);
+        let regions = avc420_regions(Some(rects.clone()), width, height);
+        let surface_rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let ts_ms = u32::try_from(epoch.elapsed().as_millis() % u128::from(u32::MAX)).unwrap_or(0);
+        // Lock order: `server_handle` alone, as in `ship_frames`.
+        let mut server = server_handle.lock().unwrap();
+        let Some(channel_id) = server.channel_id() else {
+            return Ok(AuxOffer::Done);
+        };
+        let sent = server.send_avc444_frame_to_rect(
+            surface_id,
+            Encoding::CHROMA,
+            &payload,
+            &regions,
+            None,
+            surface_rect,
+            ts_ms,
+        );
+        let Some(frame_id) = sent else {
+            drop(server);
+            lazy.lock().unwrap().band_refused(Instant::now());
+            return Ok(AuxOffer::Wait);
+        };
+        last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+        ship_times.lock().unwrap()[frame_id as usize % RTT_RING] =
+            (u64::from(frame_id), Instant::now());
+        let messages = encode_dvc_messages(
+            channel_id,
+            server.drain_output(),
+            ChannelFlags::SHOW_PROTOCOL,
+        )
+        .map_err(|e| anyhow!("encode_dvc_messages failed: {e}"))?;
+        drop(server);
+        let sender = self.sender.lock().unwrap().clone();
+        sender
+            .ok_or_else(|| anyhow!("EGFX: server-event sender not set"))?
+            .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                messages,
+            }))
+            .map_err(|_| anyhow!("EGFX: ServerEvent send failed (event loop closed)"))?;
+        lazy.lock()
+            .unwrap()
+            .band_sent(&band.mbs, band.bytes, Instant::now(), config.pace_kbps);
+        crate::latency_trace::record_us("m0.aux_bytes", band.bytes as u64);
+        crate::latency_trace::record_us("m0.aux_encode", encode_us);
+        debug!(
+            frame_id,
+            mbs = band.mbs.len(),
+            rects = rects.len(),
+            bytes = band.bytes,
+            encode_us,
+            "EGFX lazy chroma: band sent"
+        );
+        Ok(AuxOffer::Submitted)
     }
 
     /// Congestion-responsive controller (P1 bitrate AIMD + P2a IDR backoff). Called
@@ -2384,6 +2574,7 @@ impl Gfx {
         shipped: Arc<AtomicU64>,
         damage: Arc<Mutex<DamageTracker>>,
         output: Option<usize>,
+        lazy: Option<Arc<Mutex<LazyChroma>>>,
     ) {
         while let Ok(frame) = rx.recv() {
             // Sweep up any others VT delivered alongside it (keeps order).
@@ -2392,7 +2583,7 @@ impl Gfx {
                 frames.push(f);
             }
             let n = frames.len() as u64;
-            if let Err(e) = self.ship_frames(&frames, &damage, output) {
+            if let Err(e) = self.ship_frames(&frames, &damage, output, lazy.as_deref()) {
                 warn!(error = ?e, "EGFX ship_frames failed");
             }
             shipped.fetch_add(n, Ordering::Relaxed);
@@ -2518,12 +2709,17 @@ impl Gfx {
             // ceiling: equal to the ceiling unless the RTT seed lowered it
             // (slow link) or the controller already adjusted it (encoder
             // rebuild mid-connection).
+            // Lazy chroma stretches the periodic IDR: a whole-surface frame drops the refined chroma.
+            let lazy = self.lazy_config.filter(|_| ctx.negotiated_avc444);
+            let keyframe_secs = lazy.map_or(self.keyframe_secs, |c| {
+                self.keyframe_secs.max(c.keyframe_secs)
+            });
             let mut encoder = Encoder::new(
                 width,
                 height,
                 self.fps,
                 ctx.adaptive_target_bps,
-                self.keyframe_secs,
+                keyframe_secs,
             )?;
             // Hand VT's output channel to a dedicated ship thread (push model),
             // so encoded frames are sent the instant they're ready, off the
@@ -2538,15 +2734,27 @@ impl Gfx {
             ctx.shipped.store(0, Ordering::Relaxed);
             // The new encoder restarts its timestamps; a previous ship thread
             // still draining keeps the old tracker.
-            ctx.damage = Arc::new(Mutex::new(self.damage_policy.clone()));
+            let policy = self.damage_policy.clone();
+            let policy = if lazy.is_some() {
+                policy.without_full_refresh()
+            } else {
+                policy
+            };
+            ctx.damage = Arc::new(Mutex::new(policy));
+            ctx.lazy = lazy.map(|_| Arc::new(Mutex::new(LazyChroma::new(width, height))));
+            ctx.aux_view = None;
             let gfx = self.clone();
             let shipped = ctx.shipped.clone();
             let damage = ctx.damage.clone();
+            let lazy = ctx.lazy.clone();
             std::thread::Builder::new()
                 .name("egfx-ship".into())
-                .spawn(move || gfx.ship_loop(rx, shipped, damage, None))
+                .spawn(move || gfx.ship_loop(rx, shipped, damage, None, lazy))
                 .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
-            info!("EGFX VideoToolbox encoder initialized + ship thread started");
+            info!(
+                lazy_chroma = ctx.lazy.is_some(),
+                "EGFX VideoToolbox encoder initialized + ship thread started"
+            );
         }
         // stats: publish the per-connection baseline (no-op unless --stats-endpoint).
         if let Some(s) = crate::stats::global() {
@@ -2703,7 +2911,7 @@ impl Gfx {
         let ship_damage = damage.clone();
         std::thread::Builder::new()
             .name(format!("egfx-ship-{}", index + 1))
-            .spawn(move || gfx.ship_loop(rx, ship_count, ship_damage, Some(index)))
+            .spawn(move || gfx.ship_loop(rx, ship_count, ship_damage, Some(index), None))
             .map_err(|e| anyhow!("EGFX: failed to spawn ship thread: {e}"))?;
         Ok(Output {
             surface_id,
@@ -3049,6 +3257,7 @@ impl Gfx {
         frames: &[EncodedFrame],
         damage: &Mutex<DamageTracker>,
         output: Option<usize>,
+        lazy: Option<&Mutex<LazyChroma>>,
     ) -> Result<()> {
         {
             // Phase 1: read what we need out of `ctx`, then DROP the ctx lock
@@ -3102,19 +3311,19 @@ impl Gfx {
 
             // Each frame's changed regions; `None` keeps the whole-surface
             // region the path always sent (MACRDP_EGFX_DIRTY_RECTS=0).
+            // Lazy chroma also needs the rects themselves: where the client's chroma is 4:2:0 again.
+            let mut changed: Vec<Option<Vec<crate::damage::Rect>>> = Vec::new();
             let regions: Vec<Option<Vec<Avc420Region>>> = {
                 let mut tracker = damage.lock().unwrap();
                 let now = Instant::now();
                 frames
                     .iter()
                     .map(|f| {
-                        tracker.enabled().then(|| {
-                            avc420_regions(
-                                tracker.regions(f.pts, f.is_keyframe, width, height, now),
-                                width,
-                                height,
-                            )
-                        })
+                        let rects = tracker
+                            .enabled()
+                            .then(|| tracker.regions(f.pts, f.is_keyframe, width, height, now));
+                        changed.push(rects.clone().flatten());
+                        rects.map(|r| avc420_regions(r, width, height))
                     })
                     .collect()
             };
@@ -3143,6 +3352,7 @@ impl Gfx {
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
 
+            let mut delivered = Vec::with_capacity(frames.len());
             for (f, frame_regions) in frames.iter().zip(regions) {
                 let payload = self.frame_payload(f);
                 let ts_ms =
@@ -3157,6 +3367,16 @@ impl Gfx {
                 let ps_count = f.parameter_sets.len();
                 let ps_bytes: usize = f.parameter_sets.iter().map(Vec::len).sum();
                 let sent = match frame_regions {
+                    // Lazy chroma: motion as AVC444 LC=1, the same H.264 frame.
+                    Some(regions) if lazy.is_some() => server.send_avc444_frame_to_rect(
+                        surface_id,
+                        Encoding::LUMA,
+                        &payload,
+                        &regions,
+                        None,
+                        surface_rect.clone(),
+                        ts_ms,
+                    ),
                     Some(regions) => server.send_avc420_frame_to_rect(
                         surface_id,
                         &payload,
@@ -3175,9 +3395,22 @@ impl Gfx {
                             quantization_parameter: 22,
                             quality: 100,
                         };
-                        server.send_avc420_frame(surface_id, &payload, &[region], ts_ms)
+                        if lazy.is_some() {
+                            server.send_avc444_frame_to_rect(
+                                surface_id,
+                                Encoding::LUMA,
+                                &payload,
+                                &[region],
+                                None,
+                                surface_rect.clone(),
+                                ts_ms,
+                            )
+                        } else {
+                            server.send_avc420_frame(surface_id, &payload, &[region], ts_ms)
+                        }
                     }
                 };
+                delivered.push(sent.is_some());
                 // Record the newest shipped frame id for the UDP frame-ack-lag
                 // backpressure gate (`submit_bgra`), and stamp the ship time
                 // into the RTT ring so `on_frame_ack` can time this frame's
@@ -3213,6 +3446,18 @@ impl Gfx {
                         bytes = payload.len(),
                         "send_avc420_frame returned None"
                     ),
+                }
+            }
+            // A frame the client never got leaves the band numbering unknown until the next keyframe.
+            if let Some(lazy) = lazy {
+                let mut lazy = lazy.lock().unwrap();
+                for ((f, rects), sent) in frames.iter().zip(&changed).zip(&delivered) {
+                    lazy.main_shipped(rects.as_deref());
+                    if *sent {
+                        lazy.stream_sent(&f.parameter_sets, avcc_nals(&f.data));
+                    } else {
+                        lazy.stream_lost();
+                    }
                 }
             }
             let dvc_messages = server.drain_output();
@@ -3269,6 +3514,21 @@ impl Gfx {
             }
             Ok(())
         }
+    }
+
+    /// Lazy chroma's band NAL units framed for the wire like VideoToolbox's.
+    fn nal_payload(&self, nals: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nals.iter().map(|n| n.len() + 4).sum());
+        for nal in nals {
+            match self.wire_format {
+                WireFormat::LengthPrefixed => {
+                    out.extend_from_slice(&(nal.len() as u32).to_be_bytes())
+                }
+                WireFormat::AnnexB => out.extend_from_slice(&[0, 0, 0, 1]),
+            }
+            out.extend_from_slice(nal);
+        }
+        out
     }
 
     /// Frame the encoded NALs for the wire per the selected `WireFormat`,
@@ -3366,6 +3626,9 @@ impl GfxServerFactory for Gfx {
             server_handle: handle.clone(),
             encoder: None,
             damage: Arc::new(Mutex::new(self.damage_policy.clone())),
+            lazy: None,
+            aux_view: None,
+            negotiated_avc444: false,
             surface_id: None,
             outputs: Vec::new(),
             is_ready: false,
@@ -3526,6 +3789,7 @@ impl GraphicsPipelineHandler for GfxHandler {
 
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
+            ctx.negotiated_avc444 = crate::lazy_chroma::negotiated_avc444(negotiated);
             // Only drive the H.264 path if the client advertised AVC420 decode
             // support. Otherwise leave is_ready false → submit_bgra returns
             // Ok(false) → capture.rs uses legacy BitmapUpdate. Shipping AVC420
@@ -3748,6 +4012,28 @@ impl GraphicsPipelineHandler for StubHandler {
     fn on_ready(&mut self, _negotiated: &CapabilitySet) {
         warn!("EGFX StubHandler::on_ready — build_server_with_handle should have replaced this");
     }
+}
+
+/// Frames the client has not acknowledged, 0 when it does not acknowledge. Bands wait for 0: at most one is ever
+/// queued ahead of a key, whatever the link rate, and the frame-lag gate never drops a key's frame because of bands.
+fn unacked_frames(ctx: &ConnectionContext) -> u64 {
+    if !ctx.egfx_acks_seen || ctx.acks_suspended {
+        return 0;
+    }
+    ctx.last_shipped_frame_id
+        .load(Ordering::Relaxed)
+        .saturating_sub(ctx.last_acked_frame_id.load(Ordering::Relaxed))
+}
+
+/// The NAL units of a length-prefixed (AVCC) access unit.
+fn avcc_nals(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let nal = rest.get(4..4 + len)?;
+        rest = &rest[4 + len..];
+        Some(nal)
+    })
 }
 
 /// Rewrite AVCC (4-byte length-prefixed NALs) to Annex-B (`00 00 00 01` start
@@ -5634,6 +5920,23 @@ mod tests {
             )
             .is_none());
         assert!(server.drain_output().is_empty());
+    }
+
+    #[test]
+    fn lazy_chroma_bands_wait_for_every_ack() {
+        let gfx = gfx_with_context();
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        ctx.last_shipped_frame_id.store(5, Ordering::Relaxed);
+        ctx.last_acked_frame_id.store(4, Ordering::Relaxed);
+        assert_eq!(unacked_frames(ctx), 0, "no ack seen yet: no clock");
+        ctx.egfx_acks_seen = true;
+        assert_eq!(unacked_frames(ctx), 1);
+        ctx.acks_suspended = true;
+        assert_eq!(unacked_frames(ctx), 0, "acks suspended: no clock");
+        ctx.acks_suspended = false;
+        ctx.last_acked_frame_id.store(5, Ordering::Relaxed);
+        assert_eq!(unacked_frames(ctx), 0);
     }
 
     #[test]

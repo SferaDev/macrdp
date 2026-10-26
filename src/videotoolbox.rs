@@ -223,6 +223,44 @@ impl Encoder {
     }
 }
 
+/// Full-resolution BT.709 full-range Cb and Cr planes of a BGRA frame, `width` bytes per row.
+pub fn bgra_to_cbcr444(
+    bgra: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    cb: &mut [u8],
+    cr: &mut [u8],
+) -> Result<()> {
+    ffi::bgra_to_cbcr444_vimage(bgra, stride, width, height, cb, cr)
+}
+
+/// The AVC444 v1 aux view of a BGRA frame as NV12 (`avc444::pack_aux_v1_nv12`).
+pub fn bgra_to_aux_view(
+    bgra: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<crate::avc444::Nv12> {
+    let mut cb = vec![0u8; width * height];
+    let mut cr = vec![0u8; width * height];
+    bgra_to_cbcr444(bgra, stride, width, height, &mut cb, &mut cr)?;
+    let mut aux = crate::avc444::Nv12::new(width, height);
+    crate::avc444::pack_aux_v1_nv12(
+        &cb,
+        &cr,
+        width,
+        width,
+        height,
+        &mut aux.y,
+        width,
+        &mut aux.uv,
+        width,
+        height,
+    );
+    Ok(aux)
+}
+
 // VT's compression session is thread-safe according to Apple's docs
 // (frames can be submitted from any thread). The Receiver is !Sync but
 // that's fine — we only call `drain()` from the owning thread.
@@ -1020,11 +1058,7 @@ mod ffi {
     // Two reference implementations of full-resolution chroma conversion, kept
     // side-by-side for an A/B perf decision before committing to AVC444's
     // 2-encoder pipeline. Same BT.709 full-range matrix as the NV12 path.
-    // Neither is wired into encode_frame; they exist for the bench in
-    // videotoolbox::tests::bench_yuv444_full_range.
-    //
-    // Gated behind cfg(test) until AVC444 is actually wired up — they're
-    // dead code in a production build today.
+    // The full planes serve bench_yuv444_full_range; lazy chroma uses Cb and Cr only.
 
     /// Scalar BGRA -> three full-resolution planar Y/Cb/Cr buffers. The matrix
     /// matches `bgra_to_nv12_full_range` exactly — the only difference is no
@@ -1065,7 +1099,6 @@ mod ffi {
         }
     }
 
-    #[cfg(test)]
     extern "C" {
         /// `vImageMatrixMultiply_ARGB8888ToPlanar8` (vImage Transform.h). One call
         /// per output plane. The matrix is `int16_t[4]` in source byte order; we
@@ -1089,7 +1122,6 @@ mod ffi {
     /// - Y  =  0.2126 R + 0.7152 G + 0.0722 B
     /// - Cb = -0.114572 R - 0.385428 G + 0.500000 B + 128
     /// - Cr =  0.500000 R - 0.454153 G - 0.045847 B + 128
-    #[cfg(test)]
     const DIVISOR: i32 = 16384; // 2^14
 
     // Y plane coefficients: [B, G, R, A] * Q14, no post-bias.
@@ -1099,15 +1131,11 @@ mod ffi {
     const Y_POST_BIAS: i32 = DIVISOR / 2; // rounding offset
 
     // Cb plane coefficients + 128*Q14 bias to recenter.
-    #[cfg(test)]
     const CB_MATRIX: [i16; 4] = [8192, -6315, -1877, 0]; // 0.5, -0.385428, -0.114572, 0
-    #[cfg(test)]
     const CB_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     // Cr plane.
-    #[cfg(test)]
     const CR_MATRIX: [i16; 4] = [-751, -7440, 8192, 0]; // -0.045847, -0.454153, 0.5, 0
-    #[cfg(test)]
     const CR_POST_BIAS: i32 = 128 * DIVISOR + DIVISOR / 2;
 
     /// vImage BGRA -> three full-resolution planar Y/Cb/Cr buffers via three
@@ -1142,6 +1170,55 @@ mod ffi {
                 height,
                 width,
                 row_bytes: stride,
+            };
+            let err = unsafe {
+                vImageMatrixMultiply_ARGB8888ToPlanar8(
+                    &src,
+                    &dest,
+                    matrix.as_ptr(),
+                    DIVISOR,
+                    std::ptr::null(),
+                    post_bias,
+                    K_VIMAGE_NO_FLAGS,
+                )
+            };
+            if err != 0 {
+                bail!("vImageMatrixMultiply_ARGB8888ToPlanar8 failed: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Cb and Cr planes, `width` stride, with the matrix of [`bgra_to_yuv444_planar_vimage`].
+    pub(super) fn bgra_to_cbcr444_vimage(
+        bgra: &[u8],
+        src_stride: usize,
+        width: usize,
+        height: usize,
+        cb_plane: &mut [u8],
+        cr_plane: &mut [u8],
+    ) -> Result<()> {
+        if bgra.len() < src_stride * height
+            || cb_plane.len() < width * height
+            || cr_plane.len() < width * height
+        {
+            bail!("BGRA to CbCr444: buffers too small for {width}x{height}");
+        }
+        let src = VImageBuffer {
+            data: bgra.as_ptr() as *mut c_void,
+            height,
+            width,
+            row_bytes: src_stride,
+        };
+        for (plane, matrix, post_bias) in [
+            (&mut *cb_plane, &CB_MATRIX, CB_POST_BIAS),
+            (&mut *cr_plane, &CR_MATRIX, CR_POST_BIAS),
+        ] {
+            let dest = VImageBuffer {
+                data: plane.as_mut_ptr() as *mut c_void,
+                height,
+                width,
+                row_bytes: width,
             };
             let err = unsafe {
                 vImageMatrixMultiply_ARGB8888ToPlanar8(
