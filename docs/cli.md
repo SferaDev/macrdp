@@ -584,10 +584,11 @@ MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect 
 ```
 
 Latency tracing and encoder mode (env, **settable through `config.env`** as
-`LATENCY_TRACE` / `VT_LOW_LATENCY`):
+`LATENCY_TRACE` / `VT_LOW_LATENCY` / `TCP_NOTSENT_LOWAT`):
 ```
 MACRDP_LATENCY_TRACE=1   # log per-stage p50/p95/max (µs) every 5 s, target macrdp::latency
 MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
+MACRDP_TCP_NOTSENT_LOWAT=131072  # bytes the kernel may hold unsent on the RDP socket (0 = OS default, unbounded autotuning)
 ```
 
 Capture rate (env, settable through `config.env` as `VD_REFRESH_HZ` / `SCK_PACED`).
