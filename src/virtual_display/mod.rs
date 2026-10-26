@@ -46,6 +46,49 @@ pub fn session_monitors() -> Option<SessionMonitors> {
         .clone()
 }
 
+/// The display a session captures and posts input to, shared by everything
+/// that addresses it. A virtual display created on connect can come back with
+/// a new id, so readers look it up per use instead of keeping a copy.
+#[derive(Debug, Clone, Default)]
+pub struct DisplayTarget {
+    id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    virtual_display: bool,
+}
+
+impl DisplayTarget {
+    pub fn fixed(id: Option<u32>) -> Self {
+        let target = Self::default();
+        if let Some(id) = id {
+            target.set(id);
+        }
+        target
+    }
+
+    /// A virtual display's id, which may not exist yet or may change.
+    pub fn virtual_display() -> Self {
+        Self {
+            virtual_display: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_virtual_display(&self) -> bool {
+        self.virtual_display
+    }
+
+    /// `None` until a display exists; 0 is `kCGNullDirectDisplay`.
+    pub fn get(&self) -> Option<u32> {
+        match self.id.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    pub fn set(&self, id: u32) {
+        self.id.store(id, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::time::Duration;
@@ -161,13 +204,17 @@ mod macos {
 
     pub struct VirtualDisplay {
         // RAII: dropped last so the CG handle is released after we've
-        // logged anything we want to log about it.
-        _handle: private_api::Handle,
+        // logged anything we want to log about it. `None` while detached.
+        _handle: Option<private_api::Handle>,
         display_id: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
         /// Backing pixels per point: 1, or 2 for a HiDPI mode.
         scale: u32,
+        name: String,
+        serial: u32,
+        refresh_hz: u32,
+        target: super::DisplayTarget,
     }
 
     impl VirtualDisplay {
@@ -182,6 +229,82 @@ mod macos {
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
             Self::create(width, height, refresh_hz, "macrdp", std::process::id(), 1)
+        }
+
+        /// A display that exists only once [`Self::attach`] creates it, so an
+        /// idle server leaves the Mac's display arrangement alone.
+        pub fn new_detached(width: u32, height: u32, refresh_hz: u32) -> Self {
+            Self {
+                _handle: None,
+                display_id: 0,
+                origin_pts: (0.0, 0.0),
+                size_pts: (f64::from(width), f64::from(height)),
+                scale: 1,
+                name: "macrdp".to_string(),
+                serial: std::process::id(),
+                refresh_hz,
+                target: super::DisplayTarget::virtual_display(),
+            }
+        }
+
+        pub fn is_attached(&self) -> bool {
+            self._handle.is_some()
+        }
+
+        /// Shared view of this display's current id, updated on every attach.
+        pub fn target(&self) -> super::DisplayTarget {
+            self.target.clone()
+        }
+
+        /// Creates the display at `width`×`height` pixels if it is detached,
+        /// keeping its name and serial so macOS sees the same monitor return.
+        pub fn attach(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
+            if self.is_attached() {
+                return self.resize(width, height, scale);
+            }
+            // The WindowServer can still hold the previous instance's serial
+            // for a moment after a detach.
+            let mut attempt = 0;
+            let created = loop {
+                match Self::create(
+                    width,
+                    height,
+                    self.refresh_hz,
+                    &self.name,
+                    self.serial,
+                    scale,
+                ) {
+                    Ok(vd) => break vd,
+                    Err(e) if attempt < 4 => {
+                        attempt += 1;
+                        tracing::debug!(error = ?e, attempt, "attaching virtual display; retrying");
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let target = self.target.clone();
+            *self = Self { target, ..created };
+            self.target.set(self.display_id);
+            tracing::info!(
+                display_id = self.display_id,
+                origin = ?self.origin_pts,
+                size = ?self.size_pts,
+                scale,
+                "virtual display attached for the session"
+            );
+            Ok(())
+        }
+
+        /// Destroys the display; macOS moves its windows onto the remaining
+        /// displays. Keeps the last size for the next [`Self::attach`].
+        pub fn detach(&mut self) -> bool {
+            if self._handle.take().is_none() {
+                return false;
+            }
+            self.target.set(0);
+            tracing::info!(display_id = self.display_id, "virtual display detached");
+            true
         }
 
         /// Another display for a multi-monitor session, at `width`×`height`
@@ -245,11 +368,19 @@ mod macos {
             }
 
             let mut vd = Self {
-                _handle: handle,
+                _handle: Some(handle),
                 display_id: id,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 scale,
+                name: name.to_string(),
+                serial,
+                refresh_hz,
+                target: {
+                    let target = super::DisplayTarget::virtual_display();
+                    target.set(id);
+                    target
+                },
             };
             if scale == 2 && vd.size_pts != (f64::from(width / 2), f64::from(height / 2)) {
                 vd.select_hidpi_mode(width / 2, height / 2)?;
@@ -382,6 +513,8 @@ mod macos {
         pub fn resize(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
             let (width, height) = (width / scale, height / scale);
             self._handle
+                .as_ref()
+                .ok_or_else(|| anyhow!("virtual display is detached"))?
                 .apply_mode(width, height, 60, scale == 2)
                 .context("re-applying virtual display mode")?;
 
@@ -1903,7 +2036,9 @@ mod stub {
         Some(false)
     }
 
-    pub struct VirtualDisplay;
+    pub struct VirtualDisplay {
+        target: super::DisplayTarget,
+    }
 
     impl VirtualDisplay {
         pub fn new(_width: u32, _height: u32, _refresh_hz: u32) -> Result<Self> {
@@ -1911,6 +2046,23 @@ mod stub {
                 "virtual display is macOS-only — this binary was built for a \
                  different target"
             ))
+        }
+        pub fn new_detached(_width: u32, _height: u32, _refresh_hz: u32) -> Self {
+            Self {
+                target: super::DisplayTarget::virtual_display(),
+            }
+        }
+        pub fn is_attached(&self) -> bool {
+            false
+        }
+        pub fn target(&self) -> super::DisplayTarget {
+            self.target.clone()
+        }
+        pub fn attach(&mut self, _width: u32, _height: u32, _scale: u32) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn detach(&mut self) -> bool {
+            false
         }
         pub fn display_id(&self) -> u32 {
             0

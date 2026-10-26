@@ -77,7 +77,7 @@ pub struct MacRdpsnd {
     /// then disable/capture kills the audio stream's content source. The
     /// virtual display survives both, so audio must follow it, not
     /// `displays.first()` (which is the physical primary).
-    target_display_id: Option<u32>,
+    target_display_id: crate::virtual_display::DisplayTarget,
 }
 
 impl MacRdpsnd {
@@ -86,7 +86,7 @@ impl MacRdpsnd {
         mute_on_minimize: bool,
         enable_aac: bool,
         aac_bitrate: u32,
-        target_display_id: Option<u32>,
+        target_display_id: crate::virtual_display::DisplayTarget,
     ) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
@@ -122,7 +122,7 @@ impl SoundServerFactory for MacRdpsnd {
             display_suppressed: self.display_suppressed.clone(),
             mute_on_minimize: self.mute_on_minimize,
             aac_bitrate: self.aac_bitrate,
-            target_display_id: self.target_display_id,
+            target_display_id: self.target_display_id.clone(),
         })
     }
 
@@ -193,7 +193,7 @@ struct MacRdpsndBackend {
     /// format is `WAVE_FORMAT_AAC_MS`.
     aac_bitrate: u32,
     /// Display the audio SCStream binds to — see [`MacRdpsnd::target_display_id`].
-    target_display_id: Option<u32>,
+    target_display_id: crate::virtual_display::DisplayTarget,
 }
 
 // Note: format negotiation (server-preference selection + the client-list
@@ -243,7 +243,7 @@ impl RdpsndServerHandler for MacRdpsndBackend {
         let display_suppressed = self.display_suppressed.clone();
         let mute_on_minimize = self.mute_on_minimize;
         let aac_bitrate = self.aac_bitrate;
-        let target_display_id = self.target_display_id;
+        let target_display_id = self.target_display_id.clone();
         // Dedicated OS thread at USER_INTERACTIVE QoS for the entire
         // capture / resample / channel-send pipeline. Tokio workers ride
         // USER_INITIATED (see main.rs::boost_thread_qos) which a cargo
@@ -330,16 +330,29 @@ async fn capture_loop(
     mute_on_minimize: bool,
     use_aac: bool,
     aac_bitrate: u32,
-    target_display_id: Option<u32>,
+    target_display_id: crate::virtual_display::DisplayTarget,
 ) -> anyhow::Result<()> {
     use anyhow::{anyhow, Context};
     use rubato::Resampler;
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
-    let content = AsyncSCShareableContent::get()
-        .await
-        .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
+    // An on-connect virtual display can still be coming up when audio starts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (content, target_display_id) = loop {
+        let content = AsyncSCShareableContent::get()
+            .await
+            .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
+        let id = target_display_id.get();
+        let listed = id.is_some_and(|id| content.displays().iter().any(|d| d.display_id() == id));
+        if listed
+            || !target_display_id.is_virtual_display()
+            || std::time::Instant::now() >= deadline
+        {
+            break (content, id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
     let displays = content.displays();
     // Bind to the SAME display the video path captures. With --detach-primary /
     // --capture-primary the physical primary is disabled/captured once a client
@@ -781,7 +794,7 @@ async fn capture_loop(
     _mute_on_minimize: bool,
     _use_aac: bool,
     _aac_bitrate: u32,
-    _target_display_id: Option<u32>,
+    _target_display_id: crate::virtual_display::DisplayTarget,
 ) -> anyhow::Result<()> {
     Ok(())
 }
