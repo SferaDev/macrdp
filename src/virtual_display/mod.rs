@@ -61,11 +61,13 @@ pub fn pick_display_id(
     online: &[(u32, DisplayIdentity)],
     ours: DisplayIdentity,
 ) -> Option<u32> {
+    // A virtual display's reported identity can differ from the one we created, so an online id
+    // is only disowned when it is clearly another of our displays.
     let is_ours = |id: u32| {
         id != 0
-            && online
-                .iter()
-                .any(|&(o, identity)| o == id && (identity == ours || identity.serial == 0))
+            && online.iter().any(|&(o, identity)| {
+                o == id && !(identity.vendor == ours.vendor && identity.serial != ours.serial)
+            })
     };
     if is_ours(cached) {
         return Some(cached);
@@ -512,6 +514,18 @@ mod macos {
                 model: private_api::PRODUCT_ID,
                 serial: self.serial,
             };
+            if let Some(&(_, seen)) = online.iter().find(|(o, _)| *o == self.display_id) {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if seen != ours && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        display_id = self.display_id,
+                        ?seen,
+                        ?ours,
+                        "virtual display reports a different identity than it was created with"
+                    );
+                }
+            }
             let id = super::pick_display_id(self.display_id, live, &online, ours)?;
             if id != self.display_id {
                 super::record_id_change(self.display_id, id);
@@ -2255,6 +2269,17 @@ mod tests {
         let other = DisplayIdentity { serial: 7, ..OURS };
         let online = [(17, other), (21, OURS)];
         assert_eq!(pick_display_id(17, 17, &online, OURS), Some(21));
+    }
+
+    #[test]
+    fn keeps_an_online_cached_id_whose_identity_reads_differently() {
+        let odd = DisplayIdentity {
+            vendor: 0x756e6b6e,
+            model: 1,
+            serial: 99,
+        };
+        let online = [(29, odd)];
+        assert_eq!(pick_display_id(29, 29, &online, OURS), Some(29));
     }
 
     #[test]
