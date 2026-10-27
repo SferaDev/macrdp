@@ -147,6 +147,13 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   Config: PRIMARY_MODE=shield.
                           #   Env: MACRDP_SHIELD_HELPER (path override),
                           #   MACRDP_SHIELD_PORT (default 40244). macOS-only.
+--keep-virtual-display    # Keep the --virtual-display attached for the whole
+                          #   run. By default it is created when a client
+                          #   connects (at the client's size) and destroyed
+                          #   2.5 s after the last one leaves, so a Mac used
+                          #   locally has no invisible display for new windows
+                          #   to open on. --make-primary implies it. Config:
+                          #   KEEP_VIRTUAL_DISPLAY. macOS-only.
 --restore-windows-on-disconnect  # Make windows follow you between the local
                           #   built-in screen and the remote virtual display
                           #   (opt-in; needs --detach-primary/--capture-primary).

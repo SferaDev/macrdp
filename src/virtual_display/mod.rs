@@ -111,6 +111,27 @@ fn record_id_change(old: u32, new: u32) {
     tracing::warn!(old, new, "virtual display re-registered under a new id");
 }
 
+/// Drops every remap entry leading to or from `id`, for a display destroyed or
+/// created on purpose: its id may be reused by an unrelated display.
+fn retire_id(id: u32) {
+    let mut remap = ID_REMAP.lock().unwrap_or_else(|e| e.into_inner());
+    let chain: Vec<u32> = remap
+        .iter()
+        .filter(|&&(old, _)| follow_remap(&remap, old) == id)
+        .map(|&(old, _)| old)
+        .collect();
+    remap.retain(|&(old, _)| old != id && !chain.contains(&old));
+}
+
+/// Records a freshly created display: holders of `previous` follow it, and a
+/// display created after a detach (`None`) starts with no stale entries.
+fn adopt_created_id(previous: Option<u32>, id: u32) {
+    match previous {
+        Some(old) => record_id_change(old, id),
+        None => retire_id(id),
+    }
+}
+
 /// Wakes a sleeping display the way a local keypress does, without unlocking.
 #[cfg(target_os = "macos")]
 pub fn wake_display() {
@@ -176,6 +197,50 @@ pub fn wake_displays_and_wait(timeout: std::time::Duration) {
         still_asleep = any_display_asleep(),
         "woke the displays for a client"
     );
+}
+
+/// The display a session captures and posts input to, shared by everything
+/// that addresses it. A virtual display created on connect can come back with
+/// a new id, so readers look it up per use instead of keeping a copy.
+#[derive(Debug, Clone, Default)]
+pub struct DisplayTarget {
+    id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    virtual_display: bool,
+}
+
+impl DisplayTarget {
+    pub fn fixed(id: Option<u32>) -> Self {
+        let target = Self::default();
+        if let Some(id) = id {
+            target.set(id);
+        }
+        target
+    }
+
+    /// A virtual display's id, which may not exist yet or may change.
+    pub fn virtual_display() -> Self {
+        Self {
+            virtual_display: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_virtual_display(&self) -> bool {
+        self.virtual_display
+    }
+
+    /// `None` until a display exists; 0 is `kCGNullDirectDisplay`. Follows
+    /// the remap table in case WindowServer re-registered the display.
+    pub fn get(&self) -> Option<u32> {
+        match self.id.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            id => Some(current_id(id)),
+        }
+    }
+
+    pub fn set(&self, id: u32) {
+        self.id.store(id, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -308,7 +373,7 @@ mod macos {
 
     pub struct VirtualDisplay {
         // RAII: dropped last so the CG handle is released after we've
-        // logged anything we want to log about it.
+        // logged anything we want to log about it. `None` while detached.
         handle: Option<private_api::Handle>,
         display_id: u32,
         name: String,
@@ -318,6 +383,7 @@ mod macos {
         size_pts: (f64, f64),
         /// Backing pixels per point: 1, or 2 for a HiDPI mode.
         scale: u32,
+        target: super::DisplayTarget,
     }
 
     impl VirtualDisplay {
@@ -332,6 +398,94 @@ mod macos {
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
             Self::create(width, height, refresh_hz, "macrdp", std::process::id(), 1)
+        }
+
+        /// A display that exists only once [`Self::attach`] creates it, so an
+        /// idle server leaves the Mac's display arrangement alone.
+        pub fn new_detached(width: u32, height: u32, refresh_hz: u32) -> Self {
+            Self {
+                handle: None,
+                display_id: 0,
+                origin_pts: (0.0, 0.0),
+                size_pts: (f64::from(width), f64::from(height)),
+                scale: 1,
+                name: "macrdp".to_string(),
+                serial: std::process::id(),
+                refresh_hz,
+                target: super::DisplayTarget::virtual_display(),
+            }
+        }
+
+        pub fn is_attached(&self) -> bool {
+            self.handle.is_some()
+        }
+
+        /// Shared view of this display's current id, updated on every attach.
+        pub fn target(&self) -> super::DisplayTarget {
+            self.target.clone()
+        }
+
+        /// Creates the display at `width`×`height` pixels if it is detached,
+        /// keeping its name and serial so macOS sees the same monitor return.
+        pub fn attach(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
+            if self.is_attached() {
+                return self.resize(width, height, scale);
+            }
+            self.create_in_place(width, height, scale)?;
+            tracing::info!(
+                display_id = self.display_id,
+                origin = ?self.origin_pts,
+                size = ?self.size_pts,
+                scale,
+                "virtual display attached for the session"
+            );
+            Ok(())
+        }
+
+        /// Destroys the display; macOS moves its windows onto the remaining
+        /// displays. Keeps the last size for the next [`Self::attach`].
+        pub fn detach(&mut self) -> bool {
+            if self.handle.take().is_none() {
+                return false;
+            }
+            super::retire_id(self.display_id);
+            self.target.set(0);
+            tracing::info!(display_id = self.display_id, "virtual display detached");
+            true
+        }
+
+        /// Creates the display again under its name and serial, keeping the
+        /// shared target. A display a session still refers to (the handle was
+        /// lost without a [`Self::detach`]) gets a remap entry so holders of
+        /// its old id follow it; one created after a detach starts clean.
+        fn create_in_place(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
+            let before = self.target.get().map(|_| self.display_id);
+            // The WindowServer can still hold the previous instance's serial
+            // for a moment after it is destroyed.
+            let mut attempt = 0;
+            let created = loop {
+                match Self::create(
+                    width,
+                    height,
+                    self.refresh_hz,
+                    &self.name,
+                    self.serial,
+                    scale,
+                ) {
+                    Ok(vd) => break vd,
+                    Err(e) if attempt < 4 => {
+                        attempt += 1;
+                        tracing::debug!(error = ?e, attempt, "creating virtual display; retrying");
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let target = self.target.clone();
+            *self = Self { target, ..created };
+            super::adopt_created_id(before, self.display_id);
+            self.target.set(self.display_id);
+            Ok(())
         }
 
         /// Another display for a multi-monitor session, at `width`×`height`
@@ -403,6 +557,11 @@ mod macos {
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 scale,
+                target: {
+                    let target = super::DisplayTarget::virtual_display();
+                    target.set(id);
+                    target
+                },
             };
             if scale == 2 && vd.size_pts != (f64::from(width / 2), f64::from(height / 2)) {
                 vd.select_hidpi_mode(width / 2, height / 2)?;
@@ -503,7 +662,7 @@ mod macos {
 
         /// Re-resolves the id WindowServer may have changed (seen across lock and display sleep).
         pub fn refresh_id(&mut self) -> Option<u32> {
-            let live = self.handle.as_ref().map_or(0, |h| h.live_display_id());
+            let live = self.handle.as_ref()?.live_display_id();
             let online: Vec<_> = online_displays()
                 .unwrap_or_default()
                 .into_iter()
@@ -530,6 +689,7 @@ mod macos {
             if id != self.display_id {
                 super::record_id_change(self.display_id, id);
                 self.display_id = id;
+                self.target.set(id);
                 let b = CGDisplay::new(id).bounds();
                 if b.size.width > 0.0 && b.size.height > 0.0 {
                     self.origin_pts = (b.origin.x, b.origin.y);
@@ -540,7 +700,11 @@ mod macos {
         }
 
         /// Re-resolves the id, recreating the display if gone; returns whether the id moved.
+        /// A detached display stays detached: it only comes back through [`Self::attach`].
         pub fn ensure_live(&mut self) -> Result<bool> {
+            if !self.is_attached() {
+                return Err(anyhow!("virtual display is detached"));
+            }
             let before = self.display_id;
             if self.refresh_id().is_none() {
                 tracing::warn!(
@@ -556,20 +720,10 @@ mod macos {
         /// Replaces the display with a fresh one of the same descriptor and mode.
         pub fn recreate(&mut self) -> Result<()> {
             let (width, height) = self.size_px();
-            let before = self.display_id;
             // WindowServer rejects our serial while the old display is alive.
             self.handle = None;
-            let fresh = Self::create(
-                width,
-                height,
-                self.refresh_hz,
-                &self.name,
-                self.serial,
-                self.scale,
-            )?;
-            *self = fresh;
-            super::record_id_change(before, self.display_id);
-            Ok(())
+            let scale = self.scale;
+            self.create_in_place(width, height, scale)
         }
 
         pub fn origin_pts(&self) -> (f64, f64) {
@@ -2133,7 +2287,9 @@ mod stub {
         Some(false)
     }
 
-    pub struct VirtualDisplay;
+    pub struct VirtualDisplay {
+        target: super::DisplayTarget,
+    }
 
     impl VirtualDisplay {
         pub fn new(_width: u32, _height: u32, _refresh_hz: u32) -> Result<Self> {
@@ -2141,6 +2297,23 @@ mod stub {
                 "virtual display is macOS-only — this binary was built for a \
                  different target"
             ))
+        }
+        pub fn new_detached(_width: u32, _height: u32, _refresh_hz: u32) -> Self {
+            Self {
+                target: super::DisplayTarget::virtual_display(),
+            }
+        }
+        pub fn is_attached(&self) -> bool {
+            false
+        }
+        pub fn target(&self) -> super::DisplayTarget {
+            self.target.clone()
+        }
+        pub fn attach(&mut self, _width: u32, _height: u32, _scale: u32) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn detach(&mut self) -> bool {
+            false
         }
         pub fn display_id(&self) -> u32 {
             0
@@ -2296,6 +2469,46 @@ mod tests {
         assert_eq!(follow_remap(&[(17, 21), (21, 23)], 17), 23);
         assert_eq!(follow_remap(&[(17, 21)], 5), 5);
         assert!([17, 21].contains(&follow_remap(&[(17, 21), (21, 17)], 17)));
+    }
+
+    #[test]
+    fn retiring_an_id_drops_its_chain_and_keeps_others() {
+        record_id_change(90_117, 90_121);
+        record_id_change(90_121, 90_123);
+        record_id_change(90_201, 90_205);
+        retire_id(90_123);
+        assert_eq!(current_id(90_117), 90_117);
+        assert_eq!(current_id(90_121), 90_121);
+        assert_eq!(current_id(90_201), 90_205);
+    }
+
+    #[test]
+    fn a_display_created_after_a_detach_does_not_inherit_old_entries() {
+        record_id_change(90_305, 90_301);
+        adopt_created_id(None, 90_305);
+        assert_eq!(current_id(90_305), 90_305);
+        adopt_created_id(Some(90_305), 90_309);
+        assert_eq!(current_id(90_305), 90_309);
+    }
+
+    #[test]
+    fn display_target_follows_a_re_registration() {
+        let target = DisplayTarget::virtual_display();
+        target.set(90_401);
+        record_id_change(90_401, 90_407);
+        assert_eq!(target.get(), Some(90_407));
+        target.set(0);
+        assert_eq!(target.get(), None);
+    }
+
+    #[test]
+    fn a_detached_display_is_never_recreated_behind_the_lifecycle() {
+        let mut vd = VirtualDisplay::new_detached(1920, 1080, 60);
+        assert!(!vd.is_attached());
+        assert!(vd.ensure_live().is_err());
+        assert_eq!(vd.refresh_id(), None);
+        assert!(!vd.detach());
+        assert_eq!(vd.target().get(), None);
     }
 
     #[test]

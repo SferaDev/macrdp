@@ -29,15 +29,15 @@ pub struct MacInputHandler {
 
 impl MacInputHandler {
     /// `target_display_id` identifies the macOS display we're posting
-    /// events into: `None` means the current primary panel; `Some(id)`
-    /// is the `CGDirectDisplayID` we should re-query bounds for on
-    /// every event. Re-querying matters because the target's global
+    /// events into: no id means the current primary panel; an id is the
+    /// `CGDirectDisplayID` we should re-query bounds for on every event
+    /// (read per use, since an on-connect virtual display's id can change). Re-querying matters because the target's global
     /// origin can move *after* this handler is constructed — e.g.
     /// `--detach-primary` disables the built-in panel mid-session,
     /// which shifts the virtual display to `(0, 0)`.
     pub fn new(
         desktop_size: crate::capture::SharedDesktopSize,
-        target_display_id: Option<u32>,
+        target_display_id: crate::virtual_display::DisplayTarget,
         click_signal: Option<crate::capture::ClickSignal>,
         keyboard_layout: Option<String>,
         keyboard_layout_klid: Option<SharedKeyboardLayout>,
@@ -957,7 +957,7 @@ mod macos {
         // see `target_bounds`) so a mid-session bounds change (e.g.
         // --detach-primary disabling the built-in mid-flight) doesn't
         // strand events on stale coords.
-        target_display_id: Option<u32>,
+        target_display_id: crate::virtual_display::DisplayTarget,
         // TTL cache for `target_bounds`: the CoreGraphics bounds query sits
         // on the busiest input path (mouse-move fires hundreds of times/s
         // during a drag) while display geometry changes only on a rare
@@ -1026,7 +1026,7 @@ mod macos {
 
     impl Inner {
         pub fn new(
-            target_display_id: Option<u32>,
+            target_display_id: crate::virtual_display::DisplayTarget,
             keyboard_layout: Option<&str>,
             klid_handle: Option<super::SharedKeyboardLayout>,
         ) -> Result<Self> {
@@ -1124,8 +1124,8 @@ mod macos {
                     return b;
                 }
             }
-            let d = match self.target_display_id {
-                Some(id) => CGDisplay::new(crate::virtual_display::current_id(id)),
+            let d = match self.target_display_id.get() {
+                Some(id) => CGDisplay::new(id),
                 None => CGDisplay::main(),
             };
             let b = d.bounds();
@@ -1698,8 +1698,7 @@ mod macos {
             // either OS. Only acts when there's a virtual display to gather onto;
             // runs off-thread so input never stalls.
             if ctrl && opt && !cmd && vk == VK_G {
-                if let Some(id) = self.target_display_id {
-                    let id = crate::virtual_display::current_id(id);
+                if let Some(id) = self.target_display_id.get() {
                     std::thread::spawn(move || {
                         let moved = gather_windows_onto_display(id);
                         tracing::info!(

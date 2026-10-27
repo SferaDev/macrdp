@@ -253,9 +253,49 @@ pub struct SessionTracker {
     /// edge-triggered; we wake one waiter per state transition, which
     /// is what the watchdog needs.
     pub notify: Arc<Notify>,
+    /// Sessions between `updates()` starting and their stream being counted,
+    /// so an idle release can't pull a display out from under one.
+    pub starting: Arc<AtomicUsize>,
+}
+
+/// Holds a [`SessionTracker`]'s `starting` count for one `updates()` call.
+pub struct StartingSession(SessionTracker);
+
+impl Drop for StartingSession {
+    fn drop(&mut self) {
+        self.0.starting.fetch_sub(1, Ordering::SeqCst);
+        // A start that never produced a stream leaves no transition to wake
+        // the watcher, so wake it here.
+        if self.0.is_idle() {
+            self.0.notify.notify_one();
+        }
+    }
 }
 
 impl SessionTracker {
+    pub fn start(&self) -> StartingSession {
+        self.starting.fetch_add(1, Ordering::SeqCst);
+        StartingSession(self.clone())
+    }
+
+    /// No session is streaming or starting.
+    pub fn is_idle(&self) -> bool {
+        self.count.load(Ordering::SeqCst) == 0 && self.starting.load(Ordering::SeqCst) == 0
+    }
+
+    /// Polls for a session to come back within `grace`; true if one did.
+    pub async fn returns_within(&self, grace: Duration) -> bool {
+        const POLL: Duration = Duration::from_millis(75);
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(POLL).await;
+            if self.count.load(Ordering::SeqCst) > 0 {
+                return true;
+            }
+        }
+        false
+    }
+
     fn enter(&self) {
         let prev = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
@@ -298,6 +338,45 @@ impl Drop for CountedUpdates {
 impl RdpServerDisplayUpdates for CountedUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         self.inner.next_update().await
+    }
+}
+
+/// The session's virtual displays when they exist only while a client is
+/// connected (the default; `--keep-virtual-display` keeps them attached).
+#[derive(Clone)]
+pub struct IdleRelease {
+    pub tracker: SessionTracker,
+    pub primary: Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>,
+    pub secondaries: SecondaryDisplays,
+}
+
+pub type SecondaryDisplays =
+    Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>>>;
+
+impl IdleRelease {
+    /// Destroys the displays unless a session is streaming or starting.
+    /// Checked under the display lock, which `updates()` takes to attach.
+    pub fn release_if_idle(&self) -> bool {
+        let mut primary = self.primary.lock().expect("virtual display mutex poisoned");
+        if !self.tracker.is_idle() {
+            return false;
+        }
+        let secondaries = std::mem::take(
+            &mut *self
+                .secondaries
+                .lock()
+                .expect("secondary displays mutex poisoned"),
+        );
+        if !secondaries.is_empty() {
+            crate::virtual_display::set_session_monitors(None);
+        }
+        for vd in secondaries {
+            vd.lock().expect("virtual display mutex poisoned").detach();
+        }
+        // A recreated display can reuse the id, so a stream on the old one must not be taken over.
+        #[cfg(target_os = "macos")]
+        macos::discard_prepared_stream();
+        primary.detach()
     }
 }
 
@@ -356,6 +435,9 @@ pub struct CaptureDisplay {
     /// counter that drives the `--detach-primary` session-transition
     /// watcher. `None` disables the wrap entirely (zero overhead).
     pub session_tracker: Option<SessionTracker>,
+    /// A `--detach-primary`/`--capture-primary`/`--shield-primary` session,
+    /// where the virtual display is the only visible display.
+    pub headless: bool,
     /// EGFX/H.264 frame sink (macOS-only, opt-in via `--enable-h264`). When
     /// `Some`, every captured SCK frame is submitted to the H.264 encoder; once
     /// EGFX has negotiated, the legacy BitmapUpdate path is suppressed and the
@@ -415,7 +497,7 @@ pub struct CaptureDisplay {
     /// (`--multi-monitor`); `None` serves one monitor.
     pub monitor_layout: Option<crate::monitor_layout::MonitorLayout>,
     /// One virtual display per non-primary monitor of a multi-monitor session.
-    pub secondary_displays: Vec<Arc<std::sync::Mutex<crate::virtual_display::VirtualDisplay>>>,
+    pub secondary_displays: SecondaryDisplays,
     /// Retries for monitors whose display didn't come up; see
     /// `retry_missing_displays`.
     pub display_retries: Arc<AtomicU32>,
@@ -719,6 +801,7 @@ impl RdpServerDisplay for CaptureDisplay {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
+        let _starting = self.session_tracker.as_ref().map(SessionTracker::start);
         crate::virtual_display::wake_displays_and_wait(Duration::from_secs(2));
         let (width, height) = self.sync_virtual_display();
         let result = self.build_updates(width, height).await;
@@ -758,7 +841,6 @@ impl CaptureDisplay {
             return (width, height);
         };
         let mut vd = vd.lock().expect("virtual display mutex poisoned");
-        self.resolve_primary_display(&mut vd);
         let (vd_w, vd_h, scale) = match &self.monitor_layout {
             Some(layout) => {
                 let p = layout.monitors[layout.primary()];
@@ -770,6 +852,22 @@ impl CaptureDisplay {
                 virtual_display_scale(width, height, self.client_scale_percent),
             ),
         };
+        if !vd.is_attached() {
+            // Created at the size the client asked for, so there's no re-mode
+            // and nothing to re-anchor: the headless guard installs after this.
+            // A fresh display also settles any pending recreate request.
+            self.recreate_virtual_display
+                .store(false, Ordering::Relaxed);
+            if let Err(e) = vd.attach(u32::from(vd_w), u32::from(vd_h), scale) {
+                tracing::error!(error = ?e, "creating the virtual display for the session failed");
+            }
+            self.display_id = Some(vd.display_id());
+            self.screen_size_pts = vd.size_pts();
+            #[cfg(target_os = "macos")]
+            crate::switcher_hud::set_display_id(vd.display_id());
+            return (width, height);
+        }
+        self.resolve_primary_display(&mut vd);
         let (cur_w, cur_h) = vd.size_px();
         if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
             // A live resize re-modes the display before the reactivation that
@@ -807,12 +905,11 @@ impl CaptureDisplay {
                 //      settles (off-thread, ~0.7 s) and read the FINAL (0,0)
                 //      bounds; too soon and it sweeps windows in a coordinate space
                 //      that's about to shift → they land off-screen.
-                // Headless-only (session_tracker is Some exactly for
-                // --capture-primary/--detach-primary, where the vd is the only
-                // visible display); skipped for plain --virtual-display, where a
+                // Headless-only (--capture-primary/--detach-primary/
+                // --shield-primary, where the vd is the only visible display); skipped for plain --virtual-display, where a
                 // window off the vd may be intentionally on the physical panel.
                 #[cfg(target_os = "macos")]
-                if self.session_tracker.is_some() {
+                if self.headless {
                     after_headless_remode(&mut vd, &self.captured_primary, &self.shielded_primary);
                 }
                 (width, height)
@@ -857,7 +954,7 @@ impl CaptureDisplay {
                 );
                 self.screen_size_pts = vd.size_pts();
                 #[cfg(target_os = "macos")]
-                if self.session_tracker.is_some() {
+                if self.headless {
                     after_headless_remode(vd, &self.captured_primary, &self.shielded_primary);
                 }
             }
@@ -881,9 +978,13 @@ impl CaptureDisplay {
             .lock()
             .expect("virtual display mutex poisoned")
             .display_id();
+        let secondary_displays = self.secondary_displays.clone();
+        let mut secondary_displays = secondary_displays
+            .lock()
+            .expect("secondary displays mutex poisoned");
         let Some(layout) = self.monitor_layout.clone() else {
-            if !self.secondary_displays.is_empty() {
-                self.secondary_displays.clear();
+            if !secondary_displays.is_empty() {
+                secondary_displays.clear();
                 crate::virtual_display::set_session_monitors(None);
             }
             return;
@@ -891,9 +992,9 @@ impl CaptureDisplay {
         let others: Vec<usize> = (0..layout.monitors.len())
             .filter(|&i| i != layout.primary())
             .collect();
-        self.secondary_displays.truncate(others.len());
+        secondary_displays.truncate(others.len());
         // A display WindowServer dropped is recreated below, with the ones after it.
-        if let Some(gone) = self.secondary_displays.iter().position(|vd| {
+        if let Some(gone) = secondary_displays.iter().position(|vd| {
             vd.lock()
                 .expect("virtual display mutex poisoned")
                 .refresh_id()
@@ -903,12 +1004,12 @@ impl CaptureDisplay {
                 monitor = gone + 1,
                 "a secondary virtual display is gone; recreating it"
             );
-            self.secondary_displays.truncate(gone);
+            secondary_displays.truncate(gone);
         }
         for (n, &i) in others.iter().enumerate() {
             let m = layout.monitors[i];
             let (w, h) = (u32::from(m.width), u32::from(m.height));
-            if let Some(vd) = self.secondary_displays.get(n) {
+            if let Some(vd) = secondary_displays.get(n) {
                 let mut vd = vd.lock().expect("virtual display mutex poisoned");
                 if vd.size_px() != (w, h) || vd.scale() != m.scale {
                     if let Err(e) = vd.resize(w, h, m.scale) {
@@ -917,7 +1018,7 @@ impl CaptureDisplay {
                         // their monitors fall back to the primary below.
                         tracing::warn!(error = ?e, monitor = i, "re-moding a secondary virtual display failed; removing it");
                         drop(vd);
-                        self.secondary_displays.truncate(n);
+                        secondary_displays.truncate(n);
                         break;
                     }
                 }
@@ -928,9 +1029,7 @@ impl CaptureDisplay {
                     m.scale,
                     n as u32 + 1,
                 ) {
-                    Ok(vd) => self
-                        .secondary_displays
-                        .push(Arc::new(std::sync::Mutex::new(vd))),
+                    Ok(vd) => secondary_displays.push(Arc::new(std::sync::Mutex::new(vd))),
                     Err(e) => {
                         tracing::warn!(error = ?e, monitor = i, "creating a secondary virtual display failed");
                         break;
@@ -940,7 +1039,7 @@ impl CaptureDisplay {
         }
         let origins = layout.origins_pts();
         let mut placements = vec![(primary_id, 0, 0)];
-        for (vd, &i) in self.secondary_displays.iter().zip(&others) {
+        for (vd, &i) in secondary_displays.iter().zip(&others) {
             let id = vd
                 .lock()
                 .expect("virtual display mutex poisoned")
@@ -1060,7 +1159,7 @@ impl CaptureDisplay {
             (Some(vd), None) => Some(PrimaryRemode {
                 vd: vd.clone(),
                 client_scale_percent: self.client_scale_percent,
-                headless: self.session_tracker.is_some(),
+                headless: self.headless,
                 captured_primary: self.captured_primary.clone(),
                 shielded_primary: self.shielded_primary.clone(),
             }),
@@ -1444,6 +1543,17 @@ mod macos {
     }
 
     static PREPARED_STREAM: std::sync::Mutex<Option<PreparedStream>> = std::sync::Mutex::new(None);
+
+    /// Stops a resize's prepared capture that no reactivation took over.
+    pub(super) fn discard_prepared_stream() {
+        let prepared = PREPARED_STREAM
+            .lock()
+            .expect("prepared stream mutex poisoned")
+            .take();
+        if let Some(prepared) = prepared {
+            let _ = prepared.stream.stop_capture();
+        }
+    }
 
     fn take_prepared_stream(display_id: u32, size: (u16, u16)) -> Option<PreparedStream> {
         let prepared = PREPARED_STREAM
@@ -2912,6 +3022,90 @@ mod tests {
         let e = e.context("starting captures");
         assert!(e.downcast_ref::<DisplayMissing>().is_some());
         assert!(format!("{:#}", e).contains("id=17"));
+    }
+
+    #[test]
+    fn display_target_follows_the_latest_id() {
+        let target = crate::virtual_display::DisplayTarget::virtual_display();
+        assert_eq!(target.get(), None);
+        let reader = target.clone();
+        target.set(7);
+        assert_eq!(reader.get(), Some(7));
+        assert!(reader.is_virtual_display());
+        let fixed = crate::virtual_display::DisplayTarget::fixed(None);
+        assert_eq!(fixed.get(), None);
+        assert!(!fixed.is_virtual_display());
+    }
+
+    #[test]
+    fn starting_session_blocks_idle_until_dropped() {
+        let tracker = SessionTracker::default();
+        assert!(tracker.is_idle());
+        let starting = tracker.start();
+        assert!(!tracker.is_idle());
+        tracker.enter();
+        drop(starting);
+        assert!(!tracker.is_idle());
+        tracker.leave();
+        assert!(tracker.is_idle());
+    }
+
+    #[tokio::test]
+    async fn failed_start_wakes_the_release_watcher() {
+        let tracker = SessionTracker::default();
+        drop(tracker.start());
+        tokio::time::timeout(Duration::from_secs(1), tracker.notify.notified())
+            .await
+            .expect("a start that streamed nothing must notify");
+    }
+
+    #[tokio::test]
+    async fn returns_within_sees_a_reconnect_inside_the_grace() {
+        let tracker = SessionTracker::default();
+        assert!(!tracker.returns_within(Duration::from_millis(200)).await);
+        let back = tracker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            back.enter();
+        });
+        assert!(tracker.returns_within(Duration::from_secs(2)).await);
+    }
+
+    fn detached_release(tracker: &SessionTracker) -> IdleRelease {
+        let vd = || {
+            Arc::new(std::sync::Mutex::new(
+                crate::virtual_display::VirtualDisplay::new_detached(1920, 1080, 60),
+            ))
+        };
+        IdleRelease {
+            tracker: tracker.clone(),
+            primary: vd(),
+            secondaries: Arc::new(std::sync::Mutex::new(vec![vd()])),
+        }
+    }
+
+    #[test]
+    fn idle_release_keeps_displays_while_a_session_starts() {
+        let tracker = SessionTracker::default();
+        let release = detached_release(&tracker);
+        let starting = tracker.start();
+        release.release_if_idle();
+        assert_eq!(release.secondaries.lock().unwrap().len(), 1);
+        drop(starting);
+        release.release_if_idle();
+        assert!(release.secondaries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_release_keeps_displays_while_a_session_streams() {
+        let tracker = SessionTracker::default();
+        let release = detached_release(&tracker);
+        tracker.enter();
+        release.release_if_idle();
+        assert_eq!(release.secondaries.lock().unwrap().len(), 1);
+        tracker.leave();
+        release.release_if_idle();
+        assert!(release.secondaries.lock().unwrap().is_empty());
     }
 
     #[test]

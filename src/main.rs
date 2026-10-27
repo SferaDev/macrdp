@@ -341,6 +341,14 @@ struct Args {
     #[arg(long)]
     make_primary: bool,
 
+    /// Keep the virtual display attached for the whole run instead of only
+    /// while a client is connected. By default it is created when a client
+    /// connects and destroyed a few seconds after the last one leaves, so a
+    /// Mac used locally between sessions has no invisible display for new
+    /// windows to open on. --make-primary implies this.
+    #[arg(long)]
+    keep_virtual_display: bool,
+
     /// While an RDP client is connected, disable every physical display
     /// (built-in panel + any external monitors) so the Mac is headless
     /// via the virtual display alone: backlights off, no menu bar, no
@@ -1801,17 +1809,44 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How long a session that dropped to zero streams has to come back before the
+/// watchers treat it as a real disconnect; see `spawn_primary_overlay_watcher`.
+const REACTIVATION_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Destroys an on-connect virtual display once the last session has stayed
+/// gone for the reconnect grace, for a plain `--virtual-display` run (the
+/// headless modes release it from `spawn_primary_overlay_watcher`).
+fn spawn_display_release_watcher(release: capture::IdleRelease) {
+    tokio::spawn(async move {
+        loop {
+            release.tracker.notify.notified().await;
+            release_display_after_grace(&release).await;
+        }
+    });
+}
+
+async fn release_display_after_grace(release: &capture::IdleRelease) {
+    if !release.tracker.is_idle() || release.tracker.returns_within(REACTIVATION_GRACE).await {
+        return;
+    }
+    if release.release_if_idle() {
+        info!("no RDP client for the reconnect grace; virtual display removed");
+    }
+}
+
 /// Installs the overlay on the vd's current id, waking the displays between attempts (CGError 1014).
 async fn install_overlay<T>(
     label: &'static str,
     install: fn(u32) -> Result<T>,
-    vd_id: u32,
+    vd_target: &virtual_display::DisplayTarget,
 ) -> Result<T> {
     const ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
-        match install(virtual_display::current_id(vd_id)) {
+        let Some(vd_id) = vd_target.get() else {
+            return Err(anyhow!("no virtual display to go headless onto"));
+        };
+        match install(vd_id) {
             Ok(ovr) => return Ok(ovr),
             Err(e) if attempt < ATTEMPTS => {
                 warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
@@ -1829,9 +1864,12 @@ async fn install_overlay<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
-    vd_id: u32,
+    vd_target: virtual_display::DisplayTarget,
+    // Some when the virtual display exists only while a client is connected.
+    idle_release: Option<capture::IdleRelease>,
     tracker: capture::SessionTracker,
     slot: Arc<std::sync::Mutex<Option<T>>>,
     install: fn(u32) -> Result<T>,
@@ -1881,8 +1919,6 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
         // and skip the teardown as soon as it does; only a count that STAYS 0 for
         // the whole window is a real disconnect (then teardown is delayed by at
         // most the grace — a couple seconds of extra gamma-blank, harmless).
-        const REACTIVATION_GRACE: Duration = Duration::from_millis(2500);
-        const REACTIVATION_POLL: Duration = Duration::from_millis(75);
         let mut was_zero = true;
         let mut installed_at: Option<Instant> = None;
         loop {
@@ -1899,9 +1935,12 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             "connection flapped during debounce — skipping install"
                         );
                         was_zero = true;
+                        if let Some(release) = &idle_release {
+                            release_display_after_grace(release).await;
+                        }
                         continue;
                     }
-                    match install_overlay(label, install, vd_id).await {
+                    match install_overlay(label, install, &vd_target).await {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -1916,8 +1955,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // display the client now sees — the reconnect half of
                             // "follow me". Off-thread; the install's reposition has
                             // already settled, so the vd's live bounds are correct.
-                            if restore_windows {
-                                let vd_id = virtual_display::current_id(vd_id);
+                            if let (true, Some(vd_id)) = (restore_windows, vd_target.get()) {
                                 std::thread::spawn(move || {
                                     let moved = restore_gather_windows(vd_id);
                                     if moved > 0 {
@@ -1996,16 +2034,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                     // disconnect. `was_zero` is left false on the skip (overlay
                     // still engaged), so the paired count→1 `enter` notification
                     // lands as a no-op (false, false).
-                    let deadline = Instant::now() + REACTIVATION_GRACE;
-                    let mut came_back = false;
-                    while Instant::now() < deadline {
-                        tokio::time::sleep(REACTIVATION_POLL).await;
-                        if tracker.count.load(Ordering::SeqCst) > 0 {
-                            came_back = true;
-                            break;
-                        }
-                    }
-                    if came_back {
+                    if tracker.returns_within(REACTIVATION_GRACE).await {
                         info!(
                             label,
                             "session flapped during grace (reactivation) — keeping \
@@ -2041,7 +2070,8 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         // this is a guaranteed no-op for --capture-primary (and
                         // off macOS, where the stub returns false). The take_*
                         // read clears the flag.
-                        if virtual_display::take_detach_reenable_failed() {
+                        let panel_stuck = virtual_display::take_detach_reenable_failed();
+                        if panel_stuck {
                             if detach_restart_on_stuck(
                                 std::io::stdout().is_terminal(),
                                 std::env::var("MACRDP_DETACH_RESTART_ON_STUCK")
@@ -2075,6 +2105,13 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                      stays dark until macrdp restarts (launchctl \
                                      kickstart -k, or quit + relaunch)."
                                 );
+                            }
+                        }
+                        // After the guard's drop has the physical panel back; a
+                        // dark panel keeps the virtual display as the only one.
+                        if let (Some(release), false) = (&idle_release, panel_stuck) {
+                            if release.release_if_idle() {
+                                info!(label, "virtual display removed until the next client");
                             }
                         }
                         // (--restore-windows-on-disconnect) Sweep windows off the
@@ -2210,9 +2247,15 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                                 }
                             });
                         }
+                    } else if let Some(release) = &idle_release {
+                        release.release_if_idle();
                     }
                 }
-                _ => {}
+                _ => {
+                    if let (true, Some(release)) = (now_zero, &idle_release) {
+                        release_display_after_grace(release).await;
+                    }
+                }
             }
             was_zero = now_zero;
         }
@@ -2307,6 +2350,11 @@ fn parse_max_client_size(spec: &str) -> Result<(u16, u16), String> {
         Ok(v)
     };
     Ok((parse_dim(w, "width")?, parse_dim(h, "height")?))
+}
+
+/// Whether the virtual display exists only while a client is connected.
+fn virtual_display_on_connect(args: &Args) -> bool {
+    args.virtual_display && !args.keep_virtual_display && !args.make_primary
 }
 
 fn args_from_config(path: &Path) -> Result<Args> {
@@ -2445,6 +2493,9 @@ fn args_from_config(path: &Path) -> Result<Args> {
         let mut primary_mode = get("PRIMARY_MODE", "none");
         if primary_mode == "none" && on("CAPTURE_PRIMARY", false) {
             primary_mode = "capture".to_string();
+        }
+        if on("KEEP_VIRTUAL_DISPLAY", false) {
+            argv.push("--keep-virtual-display".into());
         }
         match primary_mode.as_str() {
             "detach" => argv.push("--detach-primary".into()),
@@ -2938,6 +2989,10 @@ async fn async_main() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     let physical_main_id: u32 = 0;
 
+    if args.virtual_display && args.make_primary && !args.keep_virtual_display {
+        info!("--make-primary keeps the virtual display attached for the whole run");
+    }
+    let vd_on_connect = virtual_display_on_connect(&args);
     let virtual_display: Option<Arc<std::sync::Mutex<virtual_display::VirtualDisplay>>> =
         if args.virtual_display {
             let w = args
@@ -2946,23 +3001,41 @@ async fn async_main() -> Result<()> {
             let h = args
                 .height
                 .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            let vd = virtual_display::VirtualDisplay::new(
-                u32::from(w),
-                u32::from(h),
-                virtual_display::refresh_hz(),
-            )
-            .context("attaching virtual display")?;
-            info!(
-                display_id = vd.display_id(),
-                origin = ?vd.origin_pts(),
-                size = ?vd.size_pts(),
-                "virtual display attached — the RDP session uses this surface; \
-                 your primary panel is untouched"
-            );
-            Some(Arc::new(std::sync::Mutex::new(vd)))
+            if vd_on_connect {
+                info!(
+                    "virtual display will attach when a client connects and detach after \
+                     the last one leaves (--keep-virtual-display keeps it attached)"
+                );
+                Some(Arc::new(std::sync::Mutex::new(
+                    virtual_display::VirtualDisplay::new_detached(
+                        u32::from(w),
+                        u32::from(h),
+                        virtual_display::refresh_hz(),
+                    ),
+                )))
+            } else {
+                let vd = virtual_display::VirtualDisplay::new(
+                    u32::from(w),
+                    u32::from(h),
+                    virtual_display::refresh_hz(),
+                )
+                .context("attaching virtual display")?;
+                info!(
+                    display_id = vd.display_id(),
+                    origin = ?vd.origin_pts(),
+                    size = ?vd.size_pts(),
+                    "virtual display attached — the RDP session uses this surface; \
+                     your primary panel is untouched"
+                );
+                Some(Arc::new(std::sync::Mutex::new(vd)))
+            }
         } else {
             None
         };
+    let vd_target = virtual_display
+        .as_ref()
+        .map(|vd| vd.lock().expect("virtual display mutex poisoned").target());
+    let secondary_displays = capture::SecondaryDisplays::default();
 
     // --detach-primary / --capture-primary are lazy: the headless
     // mechanism is only engaged once a client actually connects. A
@@ -3026,16 +3099,26 @@ async fn async_main() -> Result<()> {
     if args.auto_unlock && args.skip_auth {
         warn!("--auto-unlock has no effect under --skip-auth; ignoring");
     }
+    let headless = args.detach_primary || args.capture_primary || args.shield_primary;
+    let idle_release = match &virtual_display {
+        Some(vd) if vd_on_connect => Some(capture::IdleRelease {
+            tracker: session_tracker.clone(),
+            primary: vd.clone(),
+            secondaries: secondary_displays.clone(),
+        }),
+        _ => None,
+    };
+    if let (Some(release), false) = (&idle_release, headless) {
+        spawn_display_release_watcher(release.clone());
+    }
     if args.detach_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --detach-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+        let vd_target = vd_target
+            .clone()
+            .expect("checked above when --detach-primary");
         spawn_primary_overlay_watcher(
             "detach",
-            vd_id,
+            vd_target,
+            idle_release.clone(),
             session_tracker.clone(),
             detached_primary.clone(),
             virtual_display::DetachedPrimary::install,
@@ -3046,15 +3129,13 @@ async fn async_main() -> Result<()> {
             auto_unlock,
         );
     } else if args.capture_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --capture-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+        let vd_target = vd_target
+            .clone()
+            .expect("checked above when --capture-primary");
         spawn_primary_overlay_watcher(
             "capture",
-            vd_id,
+            vd_target,
+            idle_release.clone(),
             session_tracker.clone(),
             captured_primary.clone(),
             virtual_display::CapturedPrimary::install,
@@ -3065,15 +3146,13 @@ async fn async_main() -> Result<()> {
             auto_unlock,
         );
     } else if args.shield_primary {
-        let vd_id = virtual_display
-            .as_ref()
-            .expect("checked above when --shield-primary")
-            .lock()
-            .expect("virtual display mutex poisoned")
-            .display_id();
+        let vd_target = vd_target
+            .clone()
+            .expect("checked above when --shield-primary");
         spawn_primary_overlay_watcher(
             "shield",
-            vd_id,
+            vd_target,
+            idle_release.clone(),
             session_tracker.clone(),
             shielded_primary.clone(),
             virtual_display::ShieldedPrimary::install,
@@ -3149,19 +3228,22 @@ async fn async_main() -> Result<()> {
         // moved the display to (0, 0), the cached size is fine but
         // we want a fresh read for parity with the input handler.
         #[cfg(target_os = "macos")]
-        let size = {
+        let size = if vd.is_attached() {
             let b = core_graphics::display::CGDisplay::new(vd.display_id()).bounds();
             (b.size.width, b.size.height)
+        } else {
+            vd.size_pts()
         };
         #[cfg(not(target_os = "macos"))]
         let size = vd.size_pts();
+        let id = vd.is_attached().then(|| vd.display_id());
         info!(
             width = w,
             height = h,
-            display_id = vd.display_id(),
+            display_id = ?id,
             "desktop size (virtual display)"
         );
-        (w, h, Some(vd.display_id()), size)
+        (w, h, id, size)
     } else {
         let detected = primary_display_size().await?;
         let mut w = args
@@ -3382,8 +3464,8 @@ async fn async_main() -> Result<()> {
         cursor_scale: args.cursor_scale,
         // Only attach the tracker when the watchdog needs it. Saves
         // a useless atomic increment/decrement per session otherwise.
-        session_tracker: (args.detach_primary || args.capture_primary || args.shield_primary)
-            .then(|| session_tracker.clone()),
+        session_tracker: (headless || idle_release.is_some()).then(|| session_tracker.clone()),
+        headless,
         #[cfg(target_os = "macos")]
         gfx: gfx.clone(),
         keyframe_on_change,
@@ -3403,7 +3485,7 @@ async fn async_main() -> Result<()> {
         virtual_display: virtual_display.clone(),
         client_scale_percent: 100,
         monitor_layout: None,
-        secondary_displays: Vec::new(),
+        secondary_displays,
         display_retries: Arc::default(),
         recreate_virtual_display: Arc::default(),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
@@ -3426,9 +3508,11 @@ async fn async_main() -> Result<()> {
     // id, for auto-detecting a non-US layout when --keyboard-layout isn't given.
     let keyboard_layout_klid: crate::input::SharedKeyboardLayout =
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let display_target =
+        vd_target.unwrap_or_else(|| virtual_display::DisplayTarget::fixed(capture_display_id));
     let input_handler = MacInputHandler::new(
         desktop_size.clone(),
-        capture_display_id,
+        display_target.clone(),
         click_signal,
         args.keyboard_layout.clone(),
         Some(keyboard_layout_klid.clone()),
@@ -3454,7 +3538,7 @@ async fn async_main() -> Result<()> {
         // Bind audio to the same display the video captures so --detach-primary
         // / --capture-primary (which disable/capture the physical panel) don't
         // kill the audio stream's content source.
-        capture_display_id,
+        display_target,
     ));
 
     // with_hybrid advertises HYBRID | HYBRID_EX so clients run CredSSP/NLA
@@ -4090,6 +4174,36 @@ mod config_tests {
         assert!(args.capture_primary);
         assert!(!args.detach_primary);
         assert!(!args.keychain);
+    }
+
+    #[test]
+    fn virtual_display_attaches_on_connect_unless_kept() {
+        let vd = "VIRTUAL_DISPLAY=1\nVD_WIDTH=1920\nVD_HEIGHT=1080\nUSE_KEYCHAIN=0\n";
+        for (name, extra, on_connect) in [
+            ("vd-default", "", true),
+            ("vd-keep", "KEEP_VIRTUAL_DISPLAY=1\n", false),
+            ("vd-keep-off", "KEEP_VIRTUAL_DISPLAY=0\n", true),
+            ("vd-detach", "PRIMARY_MODE=detach\n", true),
+            ("vd-make-primary", "EXTRA_FLAGS=\"--make-primary\"\n", false),
+        ] {
+            let path = write_temp(name, &format!("{vd}{extra}"));
+            let args = args_from_config(&path).unwrap();
+            fs::remove_file(&path).ok();
+            assert_eq!(
+                super::virtual_display_on_connect(&args),
+                on_connect,
+                "{name}"
+            );
+        }
+
+        let path = write_temp("vd-off", "KEEP_VIRTUAL_DISPLAY=1\n");
+        let args = args_from_config(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(
+            !args.keep_virtual_display,
+            "only meaningful with VIRTUAL_DISPLAY=1"
+        );
+        assert!(!super::virtual_display_on_connect(&args));
     }
 
     #[test]
