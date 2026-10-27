@@ -1801,7 +1801,6 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Installs the overlay on the vd's current id, waking the displays between attempts (CGError 1014).
 async fn install_overlay<T>(
     label: &'static str,
@@ -1829,6 +1828,7 @@ async fn install_overlay<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
