@@ -407,6 +407,8 @@ struct ConnectionContext {
     /// (stretched) because the tunnel is congested. Restored (+ one recovery IDR)
     /// when the link fully recovers. See [`idr_backoff_decision`].
     idr_backed_off: bool,
+    /// True until the first decrease: clean intervals with live acks grow the target multiplicatively.
+    adaptive_slow_start: bool,
     /// P3: which transport EGFX was on at the previous controller step, so the
     /// step can detect the UDP→TCP edge (watchdog de-migrate) and snap the bitrate
     /// back to the ceiling once before the TCP controller takes over. Mirrors
@@ -1091,6 +1093,31 @@ fn blank_params_scaled(p: &BlankRecoveryParams, mult: f64) -> BlankRecoveryParam
 /// recover full quality within seconds) or backs off if it strains. Fast /
 /// unknown links start at the ceiling exactly as before. `seed_rtt_ms == 0`
 /// disables seeding. Pure, unit-tested.
+/// What a previous connection learned: the last bitrate it held without congestion, at what RTT.
+#[derive(Clone, Copy, Debug)]
+struct LinkMemory {
+    bps: u32,
+    rtt_ms: u32,
+    at: Instant,
+}
+
+/// A seed from `memory` when this connection's RTT says it is the same path, clamped to `[floor, ceiling]`.
+fn remembered_seed(memory: LinkMemory, link_rtt_ms: u32, floor: u32, ceiling: u32) -> Option<u32> {
+    if memory.rtt_ms == 0 || link_rtt_ms == 0 || memory.bps == 0 {
+        return None;
+    }
+    let tolerance = (memory.rtt_ms / 2).max(20);
+    (link_rtt_ms.abs_diff(memory.rtt_ms) <= tolerance)
+        .then(|| memory.bps.clamp(floor.min(ceiling), ceiling.max(1)))
+}
+
+/// Additive increase, or multiplicative by `slow_start` while it is `Some`, capped at `ceiling`.
+fn increase_target(current: u32, increase_bps: u32, ceiling: u32, slow_start: Option<f32>) -> u32 {
+    let additive = current.saturating_add(increase_bps);
+    let multiplied = slow_start.map_or(0, |f| (current as f32 * f) as u32);
+    additive.max(multiplied).min(ceiling)
+}
+
 fn seeded_initial_bitrate(ceiling: u32, floor: u32, link_rtt_ms: u32, seed_rtt_ms: u32) -> u32 {
     if seed_rtt_ms == 0 || link_rtt_ms == 0 || link_rtt_ms < seed_rtt_ms {
         return ceiling;
@@ -1492,6 +1519,12 @@ pub struct Gfx {
     fast_path: Option<FastPath>,
     /// `MACRDP_AVC444=lazy`: see `crate::lazy_chroma`.
     lazy_config: Option<LazyChromaConfig>,
+    /// Per-interval growth factor during slow start; `MACRDP_ADAPTIVE_SLOW_START`, default 1.25, <= 1 disables.
+    adaptive_slow_start: Option<f32>,
+    /// The last connection's clean bitrate, the next connection's seed; shared across `Gfx` clones.
+    link_memory: Arc<Mutex<Option<LinkMemory>>>,
+    /// How long `link_memory` stays a valid seed; `MACRDP_ADAPTIVE_SEED_MEMORY_SECS`, default 900, 0 disables.
+    seed_memory_ttl: Duration,
 }
 
 impl Gfx {
@@ -1680,6 +1713,14 @@ impl Gfx {
             reactivate: blank_reactivate,
         };
         let adaptive_seed_rtt_ms = env_u32_zero_ok("MACRDP_ADAPTIVE_SEED_RTT_MS", 50);
+        let adaptive_slow_start = std::env::var("MACRDP_ADAPTIVE_SLOW_START")
+            .ok()
+            .map_or(Some(1.25), |s| s.trim().parse::<f32>().ok())
+            .filter(|&f| f > 1.0);
+        let seed_memory_ttl = Duration::from_secs(u64::from(env_u32_zero_ok(
+            "MACRDP_ADAPTIVE_SEED_MEMORY_SECS",
+            900,
+        )));
         let damage_policy = DamageTracker::from_env();
         if !damage_policy.enabled() {
             info!("EGFX changed-region rects DISABLED (MACRDP_EGFX_DIRTY_RECTS) — every frame updates the whole surface");
@@ -1768,6 +1809,9 @@ impl Gfx {
             damage_policy,
             fast_path,
             lazy_config,
+            adaptive_slow_start,
+            link_memory: Arc::new(Mutex::new(None)),
+            seed_memory_ttl,
         }
     }
 
@@ -2582,15 +2626,24 @@ impl Gfx {
                 self.adaptive_increase_bps,
                 self.adaptive_decrease,
             ),
-            RateAction::Increase => aimd_bitrate(
+            RateAction::Increase => increase_target(
                 ctx.adaptive_target_bps,
-                0,
-                self.adaptive_floor_bps,
-                ceiling,
                 self.adaptive_increase_bps,
-                self.adaptive_decrease,
+                ceiling,
+                self.adaptive_slow_start
+                    .filter(|_| ctx.adaptive_slow_start && acks_usable),
             ),
         };
+        if action == RateAction::Decrease {
+            ctx.adaptive_slow_start = false;
+        }
+        if signal_usable && !congested && !self.seed_memory_ttl.is_zero() {
+            *self.link_memory.lock().unwrap() = Some(LinkMemory {
+                bps: new_target,
+                rtt_ms: ctx.link_rtt_ms,
+                at: now,
+            });
+        }
         if new_target != ctx.adaptive_target_bps {
             let prev = ctx.adaptive_target_bps;
             ctx.adaptive_target_bps = new_target;
@@ -3744,7 +3797,22 @@ impl GfxServerFactory for Gfx {
         // overshoot a distant pipe (the controller climbs back if there's
         // headroom). Adaptive-off keeps the plain ceiling.
         let link_rtt_ms = self.link_rtt_ms.load(Ordering::Relaxed);
-        let initial_target_bps = if self.adaptive_enabled {
+        let memory = *self.link_memory.lock().unwrap();
+        let remembered = memory
+            .filter(|m| m.at.elapsed() < self.seed_memory_ttl)
+            .and_then(|m| {
+                remembered_seed(m, link_rtt_ms, self.adaptive_floor_bps, self.bitrate_bps)
+            });
+        let initial_target_bps = if self.adaptive_enabled && remembered.is_some() {
+            let seeded = remembered.unwrap_or(self.bitrate_bps);
+            info!(
+                link_rtt_ms,
+                seed_bps = seeded,
+                ceiling_bps = self.bitrate_bps,
+                "seeding adaptive bitrate from the previous connection on this path"
+            );
+            seeded
+        } else if self.adaptive_enabled {
             let seeded = seeded_initial_bitrate(
                 self.bitrate_bps,
                 self.adaptive_floor_bps,
@@ -3801,6 +3869,7 @@ impl GfxServerFactory for Gfx {
             adaptive_last_control: Instant::now(),
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
+            adaptive_slow_start: true,
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
             adaptive_delay_ewma: 0.0,
@@ -4934,6 +5003,76 @@ mod tests {
             seeded_initial_bitrate(1_200_000, 9_000_000, 200, 50),
             1_200_000
         );
+    }
+
+    #[test]
+    fn slow_start_multiplies_until_it_ends() {
+        // Slow start beats the additive step once the target is large enough…
+        assert_eq!(
+            increase_target(8_000_000, 1_250_000, 20_000_000, Some(1.25)),
+            10_000_000
+        );
+        // …never does less than it, and never passes the ceiling.
+        assert_eq!(
+            increase_target(1_000_000, 1_250_000, 20_000_000, Some(1.25)),
+            2_250_000
+        );
+        assert_eq!(
+            increase_target(18_000_000, 1_250_000, 20_000_000, Some(1.25)),
+            20_000_000
+        );
+        // Without it the step is the plain additive increase.
+        assert_eq!(
+            increase_target(8_000_000, 1_250_000, 20_000_000, None),
+            9_250_000
+        );
+    }
+
+    #[test]
+    fn remembered_seed_needs_the_same_path() {
+        let memory = |bps, rtt_ms| LinkMemory {
+            bps,
+            rtt_ms,
+            at: Instant::now(),
+        };
+        assert_eq!(
+            remembered_seed(memory(18_000_000, 50), 65, 2_500_000, 20_000_000),
+            Some(18_000_000)
+        );
+        // A LAN memory says nothing about a WAN connection, nor the reverse.
+        assert_eq!(
+            remembered_seed(memory(20_000_000, 2), 50, 2_500_000, 20_000_000),
+            None
+        );
+        assert_eq!(
+            remembered_seed(memory(5_000_000, 60), 3, 2_500_000, 20_000_000),
+            None
+        );
+        // Unknown RTTs never match; a lowered ceiling still caps the seed.
+        assert_eq!(
+            remembered_seed(memory(18_000_000, 0), 0, 2_500_000, 20_000_000),
+            None
+        );
+        assert_eq!(
+            remembered_seed(memory(18_000_000, 50), 50, 2_500_000, 10_000_000),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn a_reconnect_on_the_same_path_seeds_from_the_last_clean_rate() {
+        let gfx = gfx_with_context();
+        gfx.link_rtt_ms.store(60, Ordering::Relaxed);
+        *gfx.link_memory.lock().unwrap() = Some(LinkMemory {
+            bps: 4_000_000,
+            rtt_ms: 55,
+            at: Instant::now(),
+        });
+        assert!(gfx.build_server_with_handle().is_some());
+        let guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        assert_eq!(ctx.adaptive_target_bps, 4_000_000);
+        assert!(ctx.adaptive_slow_start);
     }
 
     #[test]

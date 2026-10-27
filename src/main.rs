@@ -2512,6 +2512,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("TCP_NOTSENT_LOWAT", "MACRDP_TCP_NOTSENT_LOWAT"),
         ("EGFX_MAX_FRAME_LAG", "MACRDP_EGFX_MAX_FRAME_LAG"),
         ("EGFX_INFLIGHT_QUEUE_MS", "MACRDP_EGFX_INFLIGHT_QUEUE_MS"),
+        ("ADAPTIVE_SLOW_START", "MACRDP_ADAPTIVE_SLOW_START"),
+        (
+            "ADAPTIVE_SEED_MEMORY_SECS",
+            "MACRDP_ADAPTIVE_SEED_MEMORY_SECS",
+        ),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         ("SCK_PACED", "MACRDP_SCK_PACED"),
         (
