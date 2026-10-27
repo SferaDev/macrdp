@@ -197,6 +197,6 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     captured in `BasicSettingsWaitInitial` from `optional_data` next to the
     fingerprint fields (divergence (4)), carried across a
     deactivation–reactivation and surfaced as a `pub` field on `AcceptorResult`.
-    Consumed by the vendored server's divergence (25). Windows App for Mac sends
+    Consumed by the vendored server's divergence (29). Windows App for Mac sends
     200 from a Retina panel and 100 from a standard one. Same additive
     GCC-surfacing shape as (2) and (4), so cleanly upstreamable.

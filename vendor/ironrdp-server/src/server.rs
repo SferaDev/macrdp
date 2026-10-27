@@ -3587,7 +3587,7 @@ impl RdpServer {
             }
         }
 
-        // (vendored, divergence (25)) A reactivation repeats the connect-time
+        // (vendored, divergence (29)) A reactivation repeats the connect-time
         // Core Data, which a live monitor layout may have superseded since.
         if !result.reactivation {
             let mut display = self.display.lock().await;
