@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -79,7 +79,8 @@ struct Queue {
 }
 
 struct Shared {
-    display_id: u32,
+    /// Follows the virtual display when WindowServer re-registers it mid-session.
+    display_id: AtomicU32,
     params: StreamParams,
     queue: Mutex<Queue>,
     stream: Mutex<Option<SCStream>>,
@@ -143,7 +144,7 @@ impl SCStreamDelegateTrait for Delegate {
         if *shared.stopping.lock().unwrap() {
             return;
         }
-        tracing::warn!(display_id = shared.display_id, %error, "SCK stopped the capture; restarting it once the display is back");
+        tracing::warn!(display_id = shared.display_id.load(Ordering::Relaxed), %error, "SCK stopped the capture; restarting it once the display is back");
         let weak = self.0.clone();
         let spawned = std::thread::Builder::new()
             .name("sck-restart".into())
@@ -160,10 +161,10 @@ fn open(shared: &Arc<Shared>, display: &SCDisplay) -> Result<SCStream, SCError> 
         .with_display(display)
         .with_excluding_windows(&[])
         .build();
-    let hz = display_hz(shared.display_id);
+    let hz = display_hz(shared.display_id.load(Ordering::Relaxed));
     let cap = frame_cap(p.fps, hz, paced());
     tracing::info!(
-        display_id = shared.display_id,
+        display_id = shared.display_id.load(Ordering::Relaxed),
         ?hz,
         fps = p.fps,
         ?cap,
@@ -203,19 +204,26 @@ fn restart(weak: Weak<Shared>) {
         let Ok(content) = SCShareableContent::get() else {
             continue;
         };
-        let Some(display) = content
-            .displays()
-            .into_iter()
-            .find(|d| d.display_id() == shared.display_id)
-        else {
+        let displays = content.displays();
+        let old = shared.display_id.load(Ordering::Relaxed);
+        let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
+        let size = (
+            u32::from(shared.params.width),
+            u32::from(shared.params.height),
+        );
+        let Some(id) = crate::virtual_display::follow_reregistered(old, size, &ids) else {
             continue;
         };
+        let Some(display) = displays.into_iter().find(|d| d.display_id() == id) else {
+            continue;
+        };
+        shared.display_id.store(id, Ordering::Relaxed);
         match open(&shared, &display) {
             Ok(stream) => {
                 let old = shared.stream.lock().unwrap().replace(stream);
                 drop(old);
                 tracing::info!(
-                    display_id = shared.display_id,
+                    display_id = shared.display_id.load(Ordering::Relaxed),
                     after_ms = started.elapsed().as_millis() as u64,
                     "SCK capture restarted"
                 );
@@ -226,7 +234,7 @@ fn restart(weak: Weak<Shared>) {
     }
     if let Some(shared) = weak.upgrade() {
         tracing::warn!(
-            display_id = shared.display_id,
+            display_id = shared.display_id.load(Ordering::Relaxed),
             "display did not come back; ending its capture"
         );
         shared.close();
@@ -241,7 +249,7 @@ impl CaptureStream {
     /// Opens and starts a capture of `display`.
     pub fn start(display: &SCDisplay, params: StreamParams) -> Result<Self, SCError> {
         let shared = Arc::new(Shared {
-            display_id: display.display_id(),
+            display_id: AtomicU32::new(display.display_id()),
             params,
             queue: Mutex::new(Queue::default()),
             stream: Mutex::new(None),

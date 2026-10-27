@@ -28,6 +28,7 @@ mod cursor;
 // Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod damage;
+mod display_awake;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod egfx_fast_path;
 #[cfg(all(test, target_os = "macos"))]
@@ -1945,6 +1946,34 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
     }
 }
 
+/// Installs the overlay on the vd's current id, waking the displays between attempts (CGError 1014).
+async fn install_overlay<T>(
+    label: &'static str,
+    install: fn(u32) -> Result<T>,
+    vd_id: u32,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match install(virtual_display::current_id(vd_id)) {
+            Ok(ovr) => return Ok(ovr),
+            // Only a reconfiguration refused while the displays sleep can succeed on retry.
+            Err(e) if attempt < ATTEMPTS && format!("{e:#}").contains("CGError") => {
+                warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
+                tokio::task::spawn_blocking(|| {
+                    virtual_display::wake_displays_and_wait(std::time::Duration::from_secs(3))
+                })
+                .await
+                .ok();
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
@@ -2018,7 +2047,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(vd_id) {
+                    match install_overlay(label, install, vd_id).await {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -2034,6 +2063,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // "follow me". Off-thread; the install's reposition has
                             // already settled, so the vd's live bounds are correct.
                             if restore_windows {
+                                let vd_id = virtual_display::current_id(vd_id);
                                 std::thread::spawn(move || {
                                     let moved = restore_gather_windows(vd_id);
                                     if moved > 0 {
@@ -3540,6 +3570,7 @@ async fn async_main() -> Result<()> {
         monitor_layout: None,
         secondary_displays: Vec::new(),
         display_retries: Arc::default(),
+        recreate_virtual_display: Arc::default(),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
