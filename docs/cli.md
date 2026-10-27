@@ -365,52 +365,95 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   MACRDP_UDP_MIGRATE_EGFX env var (still works as a
                           #   fallback). macOS-built; protocol layer cross-platform.
 --adaptive-bitrate        # Opt-in (default OFF; ADAPTIVE_BITRATE=1 in config.env).
-                          #   Congestion-responsive H.264 rate control on BOTH the UDP
-                          #   tunnel AND the TCP path (only with --enable-h264): an
-                          #   AIMD controller reads the STANDING QUEUE DELAY — each
-                          #   frame's ship→ack round trip minus the windowed-minimum
-                          #   RTT, EWMA-smoothed — plus reliable-tunnel retransmits,
-                          #   and live-adjusts the VideoToolbox bitrate within
-                          #   [floor, --bitrate ceiling] — multiplicative-decrease
-                          #   under sustained congestion, additive-increase when clear
-                          #   (hysteresis + a 3-zone hold so single spikes don't pump
-                          #   the bitrate). The signal is RTT-aware: a long-but-clean
-                          #   pipe (VPN/ZeroTier at 200+ ms) reads as ~0 queue and
-                          #   keeps FULL quality (the pre-2026-07-04 frame-count
-                          #   signal misread RTT as congestion and oscillated); a
-                          #   genuinely thin pipe reads as real queue and degrades
-                          #   gracefully — including a no-ack distress fallback so a
-                          #   fully choked client (acks silent) still registers.
-                          #   Under congestion it also stretches the periodic IDR
-                          #   (BOTH transports) to avoid injecting a big keyframe
-                          #   into a congested pipe. So --bitrate is a CEILING, not a
-                          #   fixed target: set it high (e.g. 8) and it backs off
-                          #   only when the link strains.
-                          #   P2b frame-rate floor: once bitrate is pinned at the floor
-                          #   AND still congested (quality cuts exhausted), it caps the
-                          #   effective fps (default 10) to shed packet load — on BOTH
-                          #   transports, never to zero (the client needs trailing frames
-                          #   to present/ack). Video degrades to choppy-but-steady-and-in-
-                          #   sync instead of freezing; fps + bitrate recover when clear.
-                          #   RTT-seeded start (2026-07-05): when the kernel-measured
-                          #   TCP RTT at accept is >= MACRDP_ADAPTIVE_SEED_RTT_MS
-                          #   (default 50; 0 disables), the encoder STARTS at
-                          #   ceiling/3 (clamped to the floor) instead of the full
-                          #   ceiling, so the first seconds don't overshoot a distant
-                          #   pipe; the controller climbs back within seconds if the
-                          #   link has headroom (long-but-fat links still reach full
-                          #   quality). Fast/unknown links start at the ceiling.
-                          #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
-                          #   DECREASE,INTERVAL_MS,RETX_TOLERANCE},
-                          #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
-                          #   default 100 ms of standing queue; replaces the removed
-                          #   MACRDP_{UDP,TCP}_ADAPTIVE_LAG_THRESHOLD),
-                          #   MACRDP_ADAPTIVE_EWMA_ALPHA, MACRDP_ADAPTIVE_FLOOR_FPS.
-                          #   The RETX_TOLERANCE (default 2) is the per-interval
-                          #   reliable-retransmit count tolerated before treating loss
-                          #   as congestion — keeps sporadic wireless (WiFi)
-                          #   retransmits from ratcheting the bitrate down (0 = any
-                          #   retransmit counts, the old behaviour). macOS-only.
+                          #   Delay-targeted H.264 rate control on BOTH the UDP
+                          #   tunnel AND the TCP path (only with --enable-h264).
+                          #   Signal: the STANDING QUEUE DELAY, each frame's
+                          #   ship->ack round trip minus the windowed-minimum RTT
+                          #   and minus the frame's own transmission time, taken
+                          #   as the smallest sample over the last 500 ms and at
+                          #   least 8 frames, so relay jitter does not read as a
+                          #   queue. The controller (src/rate_control.rs)
+                          #   keeps it between QUEUE_LOW_MS and QUEUE_HIGH_MS
+                          #   (default 30..50 ms): it grows only below the low
+                          #   mark while the queue is not rising, eases down in
+                          #   the upper half of the band, and above the high mark
+                          #   cuts to just under the rate the client actually
+                          #   acknowledged (a margin proportional to the excess),
+                          #   so the queue drains in about a second instead of
+                          #   being chased by repeated cuts. That acknowledged
+                          #   rate is remembered as the path's capacity: the
+                          #   controller returns quickly to 95% of it and probes
+                          #   above it slowly, faster the longer the link stays
+                          #   clean, so a link that gained headroom is found
+                          #   again without a sawtooth. Growth is capped at twice
+                          #   the recent delivered rate (an idle screen proves
+                          #   nothing), and captures held back by the unacked-byte
+                          #   budget count as a full link. A cut needs the queue
+                          #   above the high mark for 500 ms (a queue 3x the mark
+                          #   cuts at once), and the high mark rises by twice the
+                          #   measured jitter, up to double. A sender well under
+                          #   its target (a static screen, judged over ~1 s) never
+                          #   cuts on delay; its unacked-byte budget bounds the
+                          #   queue instead. Cuts stay above 50% of the remembered
+                          #   capacity unless loss, or a busy link delivering
+                          #   under both that floor and the target, says
+                          #   otherwise. The keyframe backoff and frame-rate
+                          #   floor follow the same evidence. A delay that stands flat for
+                          #   ~2 s while the unacked bytes or the cut rate rule
+                          #   out a queue is path latency (a relay change): the
+                          #   min RTT is re-baselined to it at once and the
+                          #   capacity from before the episode restored.
+                          #   --bitrate is only the ceiling; no per-network
+                          #   tuning is needed.
+                          #   Frame rate: when the bitrate (or, off congestion,
+                          #   92% of the remembered capacity) leaves fewer than
+                          #   MACRDP_ADAPTIVE_MIN_BPP (default 0.02) bits per pixel
+                          #   per frame, the capture rate steps down (60 -> 30 ->
+                          #   20 -> 15 -> 10, floored at MACRDP_ADAPTIVE_FLOOR_FPS)
+                          #   and back up with 30% headroom, at most every 2 s;
+                          #   --fps is the maximum. The VideoToolbox bitrate is
+                          #   scaled so each frame keeps target/fps bits.
+                          #   Keyframes: the periodic interval stretches so
+                          #   keyframes (measured as they ship) take at most
+                          #   MACRDP_ADAPTIVE_IDR_SHARE (default 0.05) of the
+                          #   link, never shorter than --keyframe-interval and
+                          #   at most 30 s; the queue a keyframe causes is not
+                          #   read as congestion while it drains. VideoToolbox
+                          #   ignores DataRateLimits for H.264 keyframes (tested),
+                          #   so size is not capped. Under congestion the
+                          #   periodic keyframe is suppressed and comes back,
+                          #   with one recovery IDR, after 2 s of low queue.
+                          #   P2b frame-rate floor: at the bitrate floor and still
+                          #   congested, captures are capped at FLOOR_FPS.
+                          #   Start: when the kernel-measured TCP RTT at accept is
+                          #   >= MACRDP_ADAPTIVE_SEED_RTT_MS (default 20; 0
+                          #   disables) the encoder starts at ceiling/3. A
+                          #   reconnect on the same path (RTT within max(20 ms,
+                          #   half the old RTT)) starts at the last rate held with
+                          #   a low queue and, when one was measured, skips slow
+                          #   start and parks under the remembered capacity, for
+                          #   MACRDP_ADAPTIVE_SEED_MEMORY_SECS (default 900; 0 =
+                          #   off). Otherwise slow start multiplies the target by
+                          #   MACRDP_ADAPTIVE_SLOW_START (default 1.25; <=1 = off)
+                          #   per clean interval until the queue first rises.
+                          #   Tunables: MACRDP_UDP_ADAPTIVE_FLOOR_BPS (default
+                          #   500000, no longer a share of the ceiling),
+                          #   MACRDP_UDP_ADAPTIVE_INCREASE_BPS (unset = growth
+                          #   proportional to the rate; set = that fixed step per
+                          #   interval), MACRDP_UDP_ADAPTIVE_DECREASE (cut on loss
+                          #   or on a queue with no ack measurement, default 0.7),
+                          #   MACRDP_UDP_ADAPTIVE_INTERVAL_MS (300),
+                          #   MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE (2),
+                          #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (default 50),
+                          #   MACRDP_ADAPTIVE_QUEUE_LOW_MS (default 60% of high),
+                          #   MACRDP_ADAPTIVE_FLOOR_FPS (10). The RETX_TOLERANCE
+                          #   is the per-interval reliable-retransmit count
+                          #   tolerated before treating loss as congestion, which
+                          #   keeps sporadic wireless (WiFi) retransmits from
+                          #   ratcheting the bitrate down (0 = any retransmit
+                          #   counts). The stats endpoint reports capacity_bps and
+                          #   delivered_bps alongside bitrate, queue and fps.
+                          #   macOS-only.
 --enable-lossy-audio      # EXPERIMENTAL, opt-in (default OFF; ENABLE_LOSSY_AUDIO=1
                           #   in config.env). Implies --enable-udp-multitransport;
                           #   needs --enable-aac + --enable-h264. Stream RDPSND audio
@@ -602,7 +645,7 @@ counts against both limits from the moment it ships until the client acknowledge
 past either one, captures are dropped before encode (the H.264 chain stays valid):
 ```
 MACRDP_EGFX_MAX_FRAME_LAG=3          # unacked frames on TCP (0 disables)
-MACRDP_EGFX_INFLIGHT_QUEUE_MS=80     # unacked BYTES: target bitrate x (base ack RTT + this), at least 256 KiB (0 disables)
+MACRDP_EGFX_INFLIGHT_QUEUE_MS=80     # unacked BYTES: target bitrate x (base ack RTT + this), at least 64 KiB (0 disables)
 ```
 The byte limit is what bounds latency on a WAN link: one keyframe can be several hundred KB,
 which a frame count lets through whole. While over it, one capture still goes through each

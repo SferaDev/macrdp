@@ -48,6 +48,8 @@ mod lock_activity;
 mod logging;
 mod monitor_layout;
 mod multitransport;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod rate_control;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
@@ -701,7 +703,7 @@ struct Args {
     /// Opt-in (default OFF). Congestion-responsive H.264 bitrate, on BOTH the TCP
     /// path and the UDP tunnel (only with --enable-h264): an AIMD controller reads
     /// the standing queue delay (each frame's ship→ack round trip minus the
-    /// windowed-minimum RTT, EWMA-smoothed) plus reliable-tunnel retransmits, and
+    /// windowed-minimum RTT, minimum over ~500 ms) plus reliable-tunnel retransmits, and
     /// moves the VideoToolbox bitrate within [floor, --bitrate] — so --bitrate is a
     /// ceiling. A long but clean link (VPN/ZeroTier) keeps full quality; a thin one
     /// degrades gracefully instead of freezing. Under sustained congestion it also
@@ -709,7 +711,7 @@ struct Args {
     /// the frame rate (default 10 fps, never zero). A link whose measured RTT at
     /// connect is >= MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at ceiling/3. Tunables:
     /// MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,DECREASE,INTERVAL_MS,RETX_TOLERANCE},
-    /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,EWMA_ALPHA,FLOOR_FPS}. macOS-only build; see
+    /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,QUEUE_LOW_MS,FLOOR_FPS}. macOS-only build; see
     /// docs/cli.md.
     #[arg(long)]
     adaptive_bitrate: bool,
@@ -2669,6 +2671,11 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("TCP_NOTSENT_LOWAT", "MACRDP_TCP_NOTSENT_LOWAT"),
         ("EGFX_MAX_FRAME_LAG", "MACRDP_EGFX_MAX_FRAME_LAG"),
         ("EGFX_INFLIGHT_QUEUE_MS", "MACRDP_EGFX_INFLIGHT_QUEUE_MS"),
+        ("ADAPTIVE_SLOW_START", "MACRDP_ADAPTIVE_SLOW_START"),
+        (
+            "ADAPTIVE_SEED_MEMORY_SECS",
+            "MACRDP_ADAPTIVE_SEED_MEMORY_SECS",
+        ),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         ("SCK_PACED", "MACRDP_SCK_PACED"),
         (
