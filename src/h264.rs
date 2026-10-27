@@ -4046,7 +4046,15 @@ impl GraphicsPipelineHandler for GfxHandler {
         // ACKNOWLEDGEMENT 0xFFFFFFFF) — with acks off, loss can't be inferred.
         if let Some(ctx) = self.ctx.lock().unwrap().as_mut() {
             ctx.last_ack_at = Instant::now();
-            ctx.acks_suspended = queue_depth == 0xFFFF_FFFF;
+            let suspended = queue_depth == 0xFFFF_FFFF;
+            if suspended != ctx.acks_suspended {
+                // Every ack-driven limit is off while suspended, so a WAN latency report needs to know.
+                info!(
+                    suspended,
+                    frame_id, "EGFX client changed frame-ack suspension"
+                );
+            }
+            ctx.acks_suspended = suspended;
             // Record decode progress for the UDP frame-ack-lag backpressure gate.
             // The client sends FrameAcknowledge after it DECODES a frame, so this
             // is the floor of its decode backlog. Only advance on a real ack (not
