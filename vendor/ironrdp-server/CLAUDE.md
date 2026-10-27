@@ -2060,3 +2060,11 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     (`CCtx`), so none of the three is reachable here; the bump is to keep the
     scan meaningful. Only `Cargo.toml` changes, no code. Drop it once upstream
     requires zstd-safe >= 8.2.
+
+(29) `TCP_NOTSENT_LOWAT` on the accepted RDP socket (NOT upstreamed; added
+    2026-10-27). macOS autotunes the send buffer to megabytes, so `write_all`
+    returned at once and a WAN link held seconds of EGFX video in the kernel,
+    ahead of audio waves and fast-path tiles, invisible to the audio-lag model.
+    Capping unsent bytes (default 128 KiB, `MACRDP_TCP_NOTSENT_LOWAT`, 0 = off)
+    keeps that backlog in userspace where writes block and the lag controls see
+    it. Set at both accept sites, next to (27).

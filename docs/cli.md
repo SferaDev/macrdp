@@ -582,6 +582,12 @@ MACRDP_BLANK_RECOVERY_MAX_CONSECUTIVE_DROPS=3  # reconnect-storm guard (0 = unca
 MACRDP_AUTO_RECONNECT=1                # 0 = don't provision the auto-reconnect cookie (only the drop fallback needs it)
 ```
 
+Send backlog on the RDP socket (env, settable through `config.env` as
+`TCP_NOTSENT_LOWAT`):
+```
+MACRDP_TCP_NOTSENT_LOWAT=131072  # bytes the kernel may hold unsent on the RDP socket (0 = OS default, unbounded autotuning)
+```
+
 Testing against the server:
 ```bash
 # FreeRDP — easiest to script and get verbose logs from.
