@@ -394,6 +394,15 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   pipe; the controller climbs back within seconds if the
                           #   link has headroom (long-but-fat links still reach full
                           #   quality). Fast/unknown links start at the ceiling.
+                          #   A reconnect on the same path (RTT within max(20 ms,
+                          #   half the old RTT)) instead starts at the last bitrate
+                          #   the previous connection held without congestion, for
+                          #   MACRDP_ADAPTIVE_SEED_MEMORY_SECS (default 900; 0 = off).
+                          #   Slow start: until the first decrease, each clean
+                          #   interval with live acks multiplies the target by
+                          #   MACRDP_ADAPTIVE_SLOW_START (default 1.25; <=1 = plain
+                          #   additive climb), so ceiling/3 reaches the ceiling in
+                          #   about 1.5 s instead of 3+.
                           #   Tunables: MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,
                           #   DECREASE,INTERVAL_MS,RETX_TOLERANCE},
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (congestion threshold,
