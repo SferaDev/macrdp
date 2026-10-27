@@ -1802,6 +1802,33 @@ fn detach_restart_on_stuck(stdout_is_tty: bool, env_override: Option<&str>) -> b
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Installs the overlay on the vd's current id, waking the displays between attempts (CGError 1014).
+async fn install_overlay<T>(
+    label: &'static str,
+    install: fn(u32) -> Result<T>,
+    vd_id: u32,
+) -> Result<T> {
+    const ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match install(virtual_display::current_id(vd_id)) {
+            Ok(ovr) => return Ok(ovr),
+            Err(e) if attempt < ATTEMPTS => {
+                warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
+                tokio::task::spawn_blocking(|| {
+                    virtual_display::wake_displays_and_wait(std::time::Duration::from_secs(3))
+                })
+                .await
+                .ok();
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn spawn_primary_overlay_watcher<T: Send + 'static>(
     label: &'static str,
     vd_id: u32,
@@ -1874,7 +1901,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(virtual_display::current_id(vd_id)) {
+                    match install_overlay(label, install, vd_id).await {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
