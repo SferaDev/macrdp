@@ -1594,9 +1594,10 @@ impl Gfx {
         let adaptive_ewma_alpha = env_f64("MACRDP_ADAPTIVE_EWMA_ALPHA")
             .filter(|&a| a > 0.0 && a <= 1.0)
             .unwrap_or(0.5);
+        // 0.02 keeps 30 fps for a 3024x1898 desktop on a ~6 Mbit relayed path; a keystroke waits at most one frame.
         let adaptive_min_bpp = env_f64("MACRDP_ADAPTIVE_MIN_BPP")
             .filter(|&n| n >= 0.0)
-            .unwrap_or(0.05);
+            .unwrap_or(0.02);
         let adaptive_idr_share = env_f64("MACRDP_ADAPTIVE_IDR_SHARE")
             .filter(|&n| (0.0..1.0).contains(&n))
             .unwrap_or(0.05);

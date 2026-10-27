@@ -384,7 +384,7 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   budget count as a full link. --bitrate is only the
                           #   ceiling; no per-network tuning is needed.
                           #   Frame rate: when the bitrate leaves fewer than
-                          #   MACRDP_ADAPTIVE_MIN_BPP (default 0.05) bits per pixel
+                          #   MACRDP_ADAPTIVE_MIN_BPP (default 0.02) bits per pixel
                           #   per frame, the capture rate steps down (60 -> 30 ->
                           #   20 -> 15 -> 10, floored at MACRDP_ADAPTIVE_FLOOR_FPS)
                           #   and back up with 30% headroom, at most every 2 s;
