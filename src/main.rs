@@ -47,6 +47,8 @@ mod lock_activity;
 mod logging;
 mod monitor_layout;
 mod multitransport;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod rate_control;
 mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]

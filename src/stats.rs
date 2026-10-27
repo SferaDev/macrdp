@@ -48,8 +48,12 @@ pub struct SessionStats {
     /// Standing queue delay (ms above the windowed-min RTT) — the adaptive
     /// controller's congestion signal. Meaningful only with acks flowing.
     pub queue_delay_ms: AtomicU32,
-    /// Effective frame rate (capped by the adaptive floor under congestion).
+    /// Frame rate the encoder is held to; the adaptive controller lowers it on a thin link.
     pub fps: AtomicU32,
+    /// Bottleneck rate the adaptive controller measured while a queue stood; 0 = not yet seen.
+    pub capacity_bps: AtomicU32,
+    /// Rate the client acknowledged over the last control interval.
+    pub delivered_bps: AtomicU32,
     pub frames_sent: AtomicU64,
     pub adaptive: AtomicBool,
     pub aac: AtomicBool,
@@ -61,7 +65,8 @@ impl SessionStats {
             concat!(
                 "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
                 "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
-                "\"frames_sent\":{},\"adaptive\":{},\"aac\":{}}}"
+                "\"frames_sent\":{},\"adaptive\":{},\"aac\":{},",
+                "\"capacity_bps\":{},\"delivered_bps\":{}}}"
             ),
             self.connected.load(Ordering::Relaxed),
             self.width.load(Ordering::Relaxed),
@@ -74,6 +79,8 @@ impl SessionStats {
             self.frames_sent.load(Ordering::Relaxed),
             self.adaptive.load(Ordering::Relaxed),
             self.aac.load(Ordering::Relaxed),
+            self.capacity_bps.load(Ordering::Relaxed),
+            self.delivered_bps.load(Ordering::Relaxed),
         )
     }
 }
@@ -157,6 +164,7 @@ mod tests {
         assert!(j.contains("\"width\":1920"));
         assert!(j.contains("\"bitrate_bps\":4000000"));
         assert!(j.contains("\"fps\":60"));
+        assert!(j.contains("\"capacity_bps\":0"));
     }
 
     #[test]
