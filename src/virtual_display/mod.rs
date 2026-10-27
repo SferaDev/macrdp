@@ -46,6 +46,69 @@ pub fn session_monitors() -> Option<SessionMonitors> {
         .clone()
 }
 
+/// Vendor, model and serial a display reports; ours carry the descriptor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayIdentity {
+    pub vendor: u32,
+    pub model: u32,
+    pub serial: u32,
+}
+
+/// Cached id while still ours, else the live handle's, else ours by identity; `None` if gone.
+pub fn pick_display_id(
+    cached: u32,
+    live: u32,
+    online: &[(u32, DisplayIdentity)],
+    ours: DisplayIdentity,
+) -> Option<u32> {
+    let is_ours = |id: u32| {
+        id != 0
+            && online
+                .iter()
+                .any(|&(o, identity)| o == id && (identity == ours || identity.serial == 0))
+    };
+    if is_ours(cached) {
+        return Some(cached);
+    }
+    if is_ours(live) {
+        return Some(live);
+    }
+    online
+        .iter()
+        .find(|&&(_, identity)| identity == ours)
+        .map(|&(id, _)| id)
+}
+
+/// Old virtual display ids and the ids WindowServer re-registered them under.
+static ID_REMAP: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Follows `remap` from `id` to the newest id; stops on a cycle.
+pub fn follow_remap(remap: &[(u32, u32)], id: u32) -> u32 {
+    let mut current = id;
+    for _ in 0..=remap.len() {
+        match remap.iter().rev().find(|&&(old, _)| old == current) {
+            Some(&(_, new)) if new != current => current = new,
+            _ => break,
+        }
+    }
+    current
+}
+
+/// Maps a possibly stale virtual display id to its current one.
+pub fn current_id(id: u32) -> u32 {
+    follow_remap(&ID_REMAP.lock().unwrap_or_else(|e| e.into_inner()), id)
+}
+
+fn record_id_change(old: u32, new: u32) {
+    if old == new {
+        return;
+    }
+    let mut remap = ID_REMAP.lock().unwrap_or_else(|e| e.into_inner());
+    remap.retain(|&(o, _)| o != old && o != new);
+    remap.push((old, new));
+    tracing::warn!(old, new, "virtual display re-registered under a new id");
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::time::Duration;
@@ -134,6 +197,21 @@ mod macos {
             || super::session_monitors().is_some_and(|s| s.display_ids.contains(&id))
     }
 
+    fn display_identity(id: CGDirectDisplayID) -> super::DisplayIdentity {
+        extern "C" {
+            fn CGDisplayVendorNumber(display: CGDirectDisplayID) -> u32;
+            fn CGDisplayModelNumber(display: CGDirectDisplayID) -> u32;
+            fn CGDisplaySerialNumber(display: CGDirectDisplayID) -> u32;
+        }
+        unsafe {
+            super::DisplayIdentity {
+                vendor: CGDisplayVendorNumber(id),
+                model: CGDisplayModelNumber(id),
+                serial: CGDisplaySerialNumber(id),
+            }
+        }
+    }
+
     fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         extern "C" {
             fn CGGetOnlineDisplayList(
@@ -162,8 +240,11 @@ mod macos {
     pub struct VirtualDisplay {
         // RAII: dropped last so the CG handle is released after we've
         // logged anything we want to log about it.
-        _handle: private_api::Handle,
+        handle: Option<private_api::Handle>,
         display_id: u32,
+        name: String,
+        serial: u32,
+        refresh_hz: u32,
         origin_pts: (f64, f64),
         size_pts: (f64, f64),
         /// Backing pixels per point: 1, or 2 for a HiDPI mode.
@@ -245,8 +326,11 @@ mod macos {
             }
 
             let mut vd = Self {
-                _handle: handle,
+                handle: Some(handle),
                 display_id: id,
+                name: name.to_owned(),
+                serial,
+                refresh_hz,
                 origin_pts: (bounds.origin.x, bounds.origin.y),
                 size_pts: (bounds.size.width, bounds.size.height),
                 scale,
@@ -348,6 +432,65 @@ mod macos {
             self.display_id
         }
 
+        /// Re-resolves the id WindowServer may have changed (seen across lock and display sleep).
+        pub fn refresh_id(&mut self) -> Option<u32> {
+            let live = self.handle.as_ref().map_or(0, |h| h.live_display_id());
+            let online: Vec<_> = online_displays()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| (id, display_identity(id)))
+                .collect();
+            let ours = super::DisplayIdentity {
+                vendor: private_api::VENDOR_ID,
+                model: private_api::PRODUCT_ID,
+                serial: self.serial,
+            };
+            let id = super::pick_display_id(self.display_id, live, &online, ours)?;
+            if id != self.display_id {
+                super::record_id_change(self.display_id, id);
+                self.display_id = id;
+                let b = CGDisplay::new(id).bounds();
+                if b.size.width > 0.0 && b.size.height > 0.0 {
+                    self.origin_pts = (b.origin.x, b.origin.y);
+                    self.size_pts = (b.size.width, b.size.height);
+                }
+            }
+            Some(id)
+        }
+
+        /// Re-resolves the id, recreating the display if gone; returns whether the id moved.
+        pub fn ensure_live(&mut self) -> Result<bool> {
+            let before = self.display_id;
+            if self.refresh_id().is_none() {
+                tracing::warn!(
+                    display_id = before,
+                    displays = %describe_displays(),
+                    "virtual display is gone; recreating it"
+                );
+                self.recreate()?;
+            }
+            Ok(self.display_id != before)
+        }
+
+        /// Replaces the display with a fresh one of the same descriptor and mode.
+        pub fn recreate(&mut self) -> Result<()> {
+            let (width, height) = self.size_px();
+            let before = self.display_id;
+            // WindowServer rejects our serial while the old display is alive.
+            self.handle = None;
+            let fresh = Self::create(
+                width,
+                height,
+                self.refresh_hz,
+                &self.name,
+                self.serial,
+                self.scale,
+            )?;
+            *self = fresh;
+            super::record_id_change(before, self.display_id);
+            Ok(())
+        }
+
         pub fn origin_pts(&self) -> (f64, f64) {
             self.origin_pts
         }
@@ -381,7 +524,9 @@ mod macos {
         /// in points with HiDPI on, so the expected bounds are the point size.
         pub fn resize(&mut self, width: u32, height: u32, scale: u32) -> Result<()> {
             let (width, height) = (width / scale, height / scale);
-            self._handle
+            self.handle
+                .as_ref()
+                .context("virtual display handle released")?
                 .apply_mode(width, height, 60, scale == 2)
                 .context("re-applying virtual display mode")?;
 
@@ -773,7 +918,8 @@ mod macos {
                 detached_count = self.detached.len(),
                 "DetachedPrimary::drop running — re-enabling physical displays"
             );
-            let any = CGDisplay::new(self.virtual_id);
+            let virtual_id = super::current_id(self.virtual_id);
+            let any = CGDisplay::new(virtual_id);
 
             // Two transactions: re-enable in tx 1, reposition in tx 2.
             // Mixing both in a single transaction trips CGError 1001
@@ -861,7 +1007,7 @@ mod macos {
             for (id, origin) in &self.detached {
                 let _ = CGDisplay::new(*id).configure_display_origin(&config, origin.0, origin.1);
             }
-            let _ = CGDisplay::new(self.virtual_id).configure_display_origin(
+            let _ = CGDisplay::new(virtual_id).configure_display_origin(
                 &config,
                 self.virtual_old_origin.0,
                 self.virtual_old_origin.1,
@@ -1915,6 +2061,15 @@ mod stub {
         pub fn display_id(&self) -> u32 {
             0
         }
+        pub fn refresh_id(&mut self) -> Option<u32> {
+            None
+        }
+        pub fn ensure_live(&mut self) -> Result<bool> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
+        pub fn recreate(&mut self) -> Result<()> {
+            Err(anyhow!("virtual display is macOS-only"))
+        }
         pub fn origin_pts(&self) -> (f64, f64) {
             (0.0, 0.0)
         }
@@ -1990,4 +2145,70 @@ pub fn refresh_hz() -> u32 {
         .and_then(|v| v.parse().ok())
         .filter(|hz| (24..=240).contains(hz))
         .unwrap_or(60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OURS: DisplayIdentity = DisplayIdentity {
+        vendor: 0x6D616372,
+        model: 0x6D616372,
+        serial: 4242,
+    };
+    const PANEL: DisplayIdentity = DisplayIdentity {
+        vendor: 0x610,
+        model: 0xa050,
+        serial: 0,
+    };
+
+    #[test]
+    fn keeps_the_cached_id_while_it_is_ours() {
+        let online = [(1, PANEL), (17, OURS)];
+        assert_eq!(pick_display_id(17, 17, &online, OURS), Some(17));
+    }
+
+    #[test]
+    fn follows_the_live_id_after_re_registration() {
+        let online = [(1, PANEL), (21, OURS)];
+        assert_eq!(pick_display_id(17, 21, &online, OURS), Some(21));
+    }
+
+    #[test]
+    fn finds_the_display_by_identity_when_the_live_id_is_stale() {
+        let online = [(1, PANEL), (23, OURS)];
+        assert_eq!(pick_display_id(22, 22, &online, OURS), Some(23));
+    }
+
+    #[test]
+    fn a_reused_id_belonging_to_another_display_is_not_ours() {
+        let other = DisplayIdentity { serial: 7, ..OURS };
+        let online = [(17, other), (21, OURS)];
+        assert_eq!(pick_display_id(17, 17, &online, OURS), Some(21));
+    }
+
+    #[test]
+    fn reports_a_display_that_is_gone() {
+        let online = [(1, PANEL)];
+        assert_eq!(pick_display_id(17, 17, &online, OURS), None);
+        assert_eq!(pick_display_id(17, 0, &[], OURS), None);
+    }
+
+    #[test]
+    fn remap_follows_chains_and_survives_cycles() {
+        assert_eq!(follow_remap(&[], 17), 17);
+        assert_eq!(follow_remap(&[(17, 21)], 17), 21);
+        assert_eq!(follow_remap(&[(17, 21), (21, 23)], 17), 23);
+        assert_eq!(follow_remap(&[(17, 21)], 5), 5);
+        assert!([17, 21].contains(&follow_remap(&[(17, 21), (21, 17)], 17)));
+    }
+
+    #[test]
+    fn recorded_changes_reach_current_id() {
+        record_id_change(90_017, 90_021);
+        record_id_change(90_021, 90_023);
+        assert_eq!(current_id(90_017), 90_023);
+        assert_eq!(current_id(90_021), 90_023);
+        assert_eq!(current_id(90_023), 90_023);
+    }
 }

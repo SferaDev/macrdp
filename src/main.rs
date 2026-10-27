@@ -1874,7 +1874,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                         was_zero = true;
                         continue;
                     }
-                    match install(vd_id) {
+                    match install(virtual_display::current_id(vd_id)) {
                         Ok(ovr) => {
                             installed_at = Some(Instant::now());
                             info!(
@@ -1890,6 +1890,7 @@ fn spawn_primary_overlay_watcher<T: Send + 'static>(
                             // "follow me". Off-thread; the install's reposition has
                             // already settled, so the vd's live bounds are correct.
                             if restore_windows {
+                                let vd_id = virtual_display::current_id(vd_id);
                                 std::thread::spawn(move || {
                                     let moved = restore_gather_windows(vd_id);
                                     if moved > 0 {
@@ -3369,6 +3370,7 @@ async fn async_main() -> Result<()> {
         monitor_layout: None,
         secondary_displays: Vec::new(),
         display_retries: Arc::default(),
+        recreate_virtual_display: Arc::default(),
         // Shared so a live re-mode can re-assert the gamma blanking (a re-mode
         // resets gamma → the panel un-blanks). Only for --capture-primary.
         captured_primary: if args.capture_primary {
