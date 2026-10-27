@@ -584,6 +584,18 @@ mod macos {
             self.scale
         }
 
+        /// Whether WindowServer still runs the mode we cached; a re-registration across sleep can drop it to 1x.
+        pub fn live_mode_matches(&self) -> bool {
+            let d = CGDisplay::new(self.display_id);
+            let b = d.bounds();
+            let pts = (b.size.width - self.size_pts.0).abs() < 1.0
+                && (b.size.height - self.size_pts.1).abs() < 1.0;
+            let px = d.display_mode().map_or(true, |m| {
+                (m.pixel_width() as u32, m.pixel_height() as u32) == self.size_px()
+            });
+            pts && px
+        }
+
         /// The framebuffer size, which is what the RDP session is served at.
         pub fn size_px(&self) -> (u32, u32) {
             (
@@ -2162,6 +2174,9 @@ mod stub {
         }
         pub fn scale(&self) -> u32 {
             1
+        }
+        pub fn live_mode_matches(&self) -> bool {
+            true
         }
         pub fn size_px(&self) -> (u32, u32) {
             (0, 0)

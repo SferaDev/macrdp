@@ -771,7 +771,10 @@ impl CaptureDisplay {
             ),
         };
         let (cur_w, cur_h) = vd.size_px();
-        if (cur_w as u16, cur_h as u16) == (vd_w, vd_h) && vd.scale() == scale {
+        if (cur_w as u16, cur_h as u16) == (vd_w, vd_h)
+            && vd.scale() == scale
+            && vd.live_mode_matches()
+        {
             // A live resize re-modes the display before the reactivation that
             // lands here.
             self.screen_size_pts = vd.size_pts();

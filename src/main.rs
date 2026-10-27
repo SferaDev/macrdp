@@ -1812,7 +1812,8 @@ async fn install_overlay<T>(
     loop {
         match install(virtual_display::current_id(vd_id)) {
             Ok(ovr) => return Ok(ovr),
-            Err(e) if attempt < ATTEMPTS => {
+            // Only a reconfiguration refused while the displays sleep can succeed on retry.
+            Err(e) if attempt < ATTEMPTS && format!("{e:#}").contains("CGError") => {
                 warn!(label, attempt, error = %e, "headless overlay install failed; waking the displays and retrying");
                 tokio::task::spawn_blocking(|| {
                     virtual_display::wake_displays_and_wait(std::time::Duration::from_secs(3))
