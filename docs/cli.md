@@ -520,6 +520,11 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   naming a file. AUDIT_LOG=1 (default) still gates
                           #   whether the events emit at all. Config key: AUDIT_FILE.
                           #   Schema + collector configs: docs/siem-forwarding.md.
+--heartbeat-secs <N>      # Seconds between MS-RDPBCGR Server Heartbeat PDUs
+                          #   (default 2, 0 = off). Sent on the MCS message channel
+                          #   only to clients that set RNS_UD_CS_SUPPORT_HEARTBEAT_PDU,
+                          #   so a client behind a tunnel can tell a dead server
+                          #   from an idle one. count1=3, count2=3.
 --stats-endpoint          # Expose a loopback (127.0.0.1) READ-ONLY live-telemetry
                           #   endpoint that the menu-bar controller's Status pane
                           #   reads: current H.264 bitrate + ceiling, link RTT,

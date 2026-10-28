@@ -17,6 +17,7 @@ mod encoder;
 #[cfg(feature = "egfx")]
 mod gfx;
 mod handler;
+mod heartbeat;
 #[cfg(feature = "helper")]
 mod helper;
 #[cfg(feature = "multitransport")]
@@ -40,6 +41,7 @@ pub use echo::{EchoDvcBridge, EchoRoundTripMeasurement, EchoServerHandle, EchoSe
 #[cfg(feature = "egfx")]
 pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle};
 pub use handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+pub use heartbeat::HeartbeatConfig;
 #[cfg(feature = "helper")]
 pub use helper::TlsIdentityCtx;
 #[cfg(feature = "multitransport")]

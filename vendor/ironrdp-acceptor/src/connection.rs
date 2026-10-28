@@ -51,6 +51,8 @@ pub struct Acceptor {
     // (vendored) The client's desktop scale factor in percent, from the
     // optional part of the Client Core Data. `None` when not announced.
     desktop_scale_factor: Option<u32>,
+    // (vendored) earlyCapabilityFlags from the Client Core Data, e.g. heartbeat support.
+    client_early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
     // (vendored) Adopt a multi-monitor layout from the Client Monitor Data, and
     // the layout adopted for this session (empty for a single monitor).
     honor_client_monitors: bool,
@@ -171,6 +173,9 @@ pub struct AcceptorResult {
     /// (vendored) Desktop scale factor in percent announced in the Client Core
     /// Data (for example 200 on a Retina Mac client). `None` when absent.
     pub desktop_scale_factor: Option<u32>,
+    /// (vendored) The earlyCapabilityFlags of the Client Core Data, for example
+    /// `SUPPORT_HEART_BEAT_PDU`. `None` when the client did not send the field.
+    pub client_early_capability: Option<gcc::ClientEarlyCapabilityFlags>,
     /// (vendored) The client's monitors when the acceptor adopted a
     /// multi-monitor layout (see `set_honor_client_monitors`); empty otherwise.
     pub monitor_layout: Vec<ClientMonitor>,
@@ -223,6 +228,7 @@ impl Acceptor {
             client_version: 0,
             client_build: 0,
             desktop_scale_factor: None,
+            client_early_capability: None,
             honor_client_monitors: false,
             monitor_layout: Vec::new(),
             multitransport_offer: None,
@@ -335,6 +341,7 @@ impl Acceptor {
             client_version: consumed.client_version,
             client_build: consumed.client_build,
             desktop_scale_factor: consumed.desktop_scale_factor,
+            client_early_capability: consumed.client_early_capability,
             honor_client_monitors: consumed.honor_client_monitors,
             monitor_layout: consumed.monitor_layout,
             multitransport_offer: consumed.multitransport_offer,
@@ -429,6 +436,7 @@ impl Acceptor {
                 client_version: self.client_version,
                 client_build: self.client_build,
                 desktop_scale_factor: self.desktop_scale_factor,
+                client_early_capability: self.client_early_capability,
                 monitor_layout: self.monitor_layout.clone(),
                 multitransport_offered: self.multitransport_offered,
                 reactivation: self.reactivation,
@@ -700,6 +708,7 @@ impl Sequence for Acceptor {
                 self.client_version = gcc_blocks.core.version.0;
                 self.client_build = gcc_blocks.core.client_build;
                 self.desktop_scale_factor = gcc_blocks.core.optional_data.desktop_scale_factor;
+                self.client_early_capability = early_capability;
 
                 // Adopt the client's requested desktop size (from its Client
                 // Core Data) before Demand Active is sent, so the session is
