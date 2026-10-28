@@ -111,6 +111,47 @@ fn record_id_change(old: u32, new: u32) {
     tracing::warn!(old, new, "virtual display re-registered under a new id");
 }
 
+/// One online display as the capture restart sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineDisplay {
+    pub id: u32,
+    pub identity: DisplayIdentity,
+    pub builtin: bool,
+    pub size_px: (u32, u32),
+}
+
+/// The id a lost virtual display came back under: a recorded change, else the only display with our
+/// vendor id, else the only external display of the session's size. `None` while it is not back.
+pub fn pick_reregistered(
+    old: u32,
+    online: &[OnlineDisplay],
+    vendor: u32,
+    size_px: (u32, u32),
+) -> Option<u32> {
+    let current = current_id(old);
+    if online.iter().any(|d| d.id == current) {
+        return Some(current);
+    }
+    let unique = |f: &dyn Fn(&OnlineDisplay) -> bool| {
+        let mut it = online.iter().filter(|d| f(d));
+        match (it.next(), it.next()) {
+            (Some(d), None) => Some(d.id),
+            _ => None,
+        }
+    };
+    unique(&|d| d.identity.vendor == vendor)
+        .or_else(|| unique(&|d| !d.builtin && d.size_px == size_px))
+}
+
+/// Resolves and records the id a lost virtual display came back under, among `ids` (what SCK lists).
+#[cfg(target_os = "macos")]
+pub fn follow_reregistered(old: u32, size_px: (u32, u32), ids: &[u32]) -> Option<u32> {
+    let online: Vec<_> = ids.iter().map(|&id| macos::online_display(id)).collect();
+    let new = pick_reregistered(old, &online, macos::our_vendor(), size_px)?;
+    record_id_change(old, new);
+    Some(new)
+}
+
 /// Wakes a sleeping display the way a local keypress does, without unlocking.
 #[cfg(target_os = "macos")]
 pub fn wake_display() {
@@ -279,6 +320,23 @@ mod macos {
                 serial: CGDisplaySerialNumber(id),
             }
         }
+    }
+
+    pub(super) fn online_display(id: u32) -> super::OnlineDisplay {
+        let d = CGDisplay::new(id);
+        let size_px = d.display_mode().map_or((0, 0), |m| {
+            (m.pixel_width() as u32, m.pixel_height() as u32)
+        });
+        super::OnlineDisplay {
+            id,
+            identity: display_identity(id),
+            builtin: d.is_builtin(),
+            size_px,
+        }
+    }
+
+    pub(super) fn our_vendor() -> u32 {
+        private_api::VENDOR_ID
     }
 
     fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
@@ -2295,6 +2353,62 @@ mod tests {
         };
         let online = [(29, odd)];
         assert_eq!(pick_display_id(29, 29, &online, OURS), Some(29));
+    }
+
+    fn online(
+        id: u32,
+        identity: DisplayIdentity,
+        builtin: bool,
+        size_px: (u32, u32),
+    ) -> OnlineDisplay {
+        OnlineDisplay {
+            id,
+            identity,
+            builtin,
+            size_px,
+        }
+    }
+
+    #[test]
+    fn a_reregistered_display_is_found_by_vendor_then_by_size() {
+        let odd = DisplayIdentity {
+            vendor: 1,
+            model: 1,
+            serial: 1,
+        };
+        let by_vendor = [
+            online(1, PANEL, true, (3024, 1964)),
+            online(134, OURS, false, (3024, 1898)),
+        ];
+        assert_eq!(
+            pick_reregistered(80_132, &by_vendor, OURS.vendor, (3024, 1898)),
+            Some(134)
+        );
+        let by_size = [
+            online(1, PANEL, true, (3024, 1898)),
+            online(134, odd, false, (3024, 1898)),
+        ];
+        assert_eq!(
+            pick_reregistered(80_133, &by_size, OURS.vendor, (3024, 1898)),
+            Some(134)
+        );
+        let ambiguous = [
+            online(134, odd, false, (3024, 1898)),
+            online(135, odd, false, (3024, 1898)),
+        ];
+        assert_eq!(
+            pick_reregistered(80_134, &ambiguous, OURS.vendor, (3024, 1898)),
+            None
+        );
+        assert_eq!(
+            pick_reregistered(
+                80_135,
+                &[online(1, PANEL, true, (3024, 1964))],
+                OURS.vendor,
+                (3024, 1898)
+            ),
+            None
+        );
     }
 
     #[test]
