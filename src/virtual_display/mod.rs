@@ -209,11 +209,12 @@ pub fn wake_displays_and_wait(timeout: std::time::Duration) {
     if !asleep {
         return;
     }
-    let deadline = std::time::Instant::now() + timeout;
-    while any_display_asleep() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    while any_display_asleep() && started.elapsed() < timeout {
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     tracing::info!(
+        waited_ms = started.elapsed().as_millis() as u64,
         still_asleep = any_display_asleep(),
         "woke the displays for a client"
     );
@@ -706,7 +707,7 @@ mod macos {
                         bounds.size.height,
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
 

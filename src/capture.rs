@@ -792,6 +792,7 @@ impl CaptureDisplay {
         }
         match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
             Ok(()) => {
+                crate::connect_timeline::mark(crate::connect_timeline::Step::Remode);
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
@@ -1110,6 +1111,7 @@ impl CaptureDisplay {
                 secondaries = secondaries.len(),
                 "session captures started"
             );
+            crate::connect_timeline::mark(crate::connect_timeline::Step::CaptureStarted);
             Box::new(primary?.with_secondaries(secondaries))
         };
         #[cfg(not(target_os = "macos"))]
@@ -1359,6 +1361,10 @@ mod macos {
     /// How long the primary capture keeps its latest frame for an EGFX
     /// channel that isn't ready yet.
     const EGFX_READY_GRACE: Duration = Duration::from_secs(10);
+
+    /// How long the first frame waits for EGFX before going out as a legacy
+    /// bitmap, which at session size is megabytes ahead of the H.264 frame.
+    const LEGACY_FIRST_FRAME_GRACE: Duration = Duration::from_secs(1);
 
     /// How long a live resize waits for the resized display's first frame.
     const RESIZE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1878,6 +1884,9 @@ mod macos {
         /// change.
         held_frame: Option<(Vec<u8>, usize)>,
         hold_until: Instant,
+        /// Size of the held first frame while it waits out [`LEGACY_FIRST_FRAME_GRACE`].
+        legacy_pending: Option<(u16, u16)>,
+        legacy_after: Instant,
         /// The frame EGFX dropped last (busy encoder); offered again a frame
         /// later until it is encoded. Lives in `last_frame`.
         resubmit: bool,
@@ -2052,6 +2061,24 @@ mod macos {
                     false
                 }
             }
+        }
+
+        /// Sends the held first frame as a legacy bitmap once EGFX missed its grace.
+        fn legacy_fallback(&mut self) {
+            if self.seeded || Instant::now() < self.legacy_after {
+                return;
+            }
+            let (Some((w, h)), Some((frame, stride))) =
+                (self.legacy_pending.take(), self.held_frame.as_ref())
+            else {
+                return;
+            };
+            for (sx, sy, sw, sh) in split_strips(0, 0, w, h) {
+                if let Some(update) = rect_update(frame, *stride, sx, sy, sw, sh) {
+                    self.pending.push_back(update);
+                }
+            }
+            self.seeded = true;
         }
 
         /// Ships the held frame once EGFX takes it. Returns whether it did.
@@ -2231,6 +2258,8 @@ mod macos {
                 suppress_next_adopt,
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
+                legacy_pending: None,
+                legacy_after: Instant::now() + LEGACY_FIRST_FRAME_GRACE,
                 resubmit: false,
                 last_change_at: Instant::now(),
                 aux_waiting: false,
@@ -2402,6 +2431,7 @@ mod macos {
                 if self.ship_held_frame() {
                     continue;
                 }
+                self.legacy_fallback();
 
                 // Poll cursor at loop top — preempts queued bitmap rects so
                 // pointer shape updates keep up instead of batching behind the
@@ -2770,6 +2800,10 @@ mod macos {
                                 held.0.clear();
                                 held.0.extend_from_slice(src);
                                 held.1 = stride_bytes;
+                                if !self.seeded && Instant::now() < self.legacy_after {
+                                    self.legacy_pending = Some((pb_width, pb_height));
+                                    continue;
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
