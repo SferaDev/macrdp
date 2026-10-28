@@ -665,6 +665,18 @@ its presentation time, which measured 2.4 ms sooner at 120 Hz and 8 ms sooner at
 MACRDP_VD_REFRESH_HZ=60  # virtual display refresh, 24-240; above 60 it is also the H.264 --fps default
 MACRDP_SCK_PACED=1       # cap every capture at 1/fps again
 ```
+
+Remembered virtual display mode (env, settable through `config.env` as `REMEMBER_VD_MODE`).
+Each mode applied to the primary virtual display for a session (pixel size and 1x/2x scale)
+is saved to `~/Library/Application Support/macrdp/vd-mode`, and the next start creates the
+display in that mode instead of `--width`/`--height` 1x, so the first connect after a restart
+skips the re-mode and its WindowServer settle (about 1.5 s for a 2x client). A missing or
+invalid file falls back to `--width`/`--height`; a client asking for another size still
+re-modes. Ignored with `--no-client-resolution`. Multi-monitor sessions remember the primary
+monitor only.
+```
+MACRDP_REMEMBER_VD_MODE=1  # 0/off: always start at --width/--height
+```
 Trace stages, per monitor `mN` (`m0` = primary): `sck_age` (host clock now minus
 the SCK sample's presentation time, at dequeue, when positive), `sck_lead` (the same
 when the sample arrives ahead of its presentation time, as SCK delivers it early),

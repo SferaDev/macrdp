@@ -3284,6 +3284,7 @@ impl Gfx {
         // Counted like any shipped frame: ack lag, RTT ring and stats.
         ship.last_shipped
             .store(u64::from(frame_id), Ordering::Relaxed);
+        crate::connect_timeline::mark(crate::connect_timeline::Step::FirstFrame);
         if let Some(s) = crate::stats::global() {
             s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);
         }
@@ -3670,6 +3671,7 @@ impl Gfx {
                 // round trip for the queue-delay congestion signal.
                 if let Some(frame_id) = sent {
                     last_shipped.store(u64::from(frame_id), Ordering::Relaxed);
+                    crate::connect_timeline::mark(crate::connect_timeline::Step::FirstFrame);
                     // stats: no-op unless --stats-endpoint.
                     if let Some(s) = crate::stats::global() {
                         s.frames_sent.store(u64::from(frame_id), Ordering::Relaxed);

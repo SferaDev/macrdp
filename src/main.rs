@@ -24,6 +24,7 @@ mod clipboard_image;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
+mod connect_timeline;
 mod connection_hooks;
 mod cursor;
 // Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
@@ -62,6 +63,8 @@ mod shield;
 mod stats;
 mod switcher_hud;
 mod usb_redirect;
+mod vd_mode_state;
+mod video_first;
 mod videotoolbox;
 mod virtual_display;
 
@@ -1178,6 +1181,48 @@ fn read_password_from_keychain(username: &str) -> Result<Zeroizing<String>> {
         return Err(anyhow!("keychain entry for macrdp is empty"));
     }
     Ok(s)
+}
+
+/// Creates the virtual display in the last session's mode when one is
+/// remembered, else at `width`×`height` 1x.
+fn create_virtual_display(
+    args: &Args,
+    width: u32,
+    height: u32,
+) -> Result<virtual_display::VirtualDisplay> {
+    let hz = virtual_display::refresh_hz();
+    // A pinned size never re-modes, so a remembered mode would override it.
+    let remember = !args.no_client_resolution
+        && vd_mode_state::enabled(std::env::var("MACRDP_REMEMBER_VD_MODE").ok().as_deref());
+    let path = match default_cert_dir() {
+        Ok(dir) if remember => Some(vd_mode_state::path_in(&dir)),
+        _ => None,
+    };
+    let stored = path.as_deref().and_then(vd_mode_state::load);
+    if let Some(path) = path {
+        vd_mode_state::init(path, stored);
+    }
+    if let Some(mode) = stored {
+        match virtual_display::VirtualDisplay::new_scaled(mode.width, mode.height, mode.scale, hz) {
+            Ok(vd) => {
+                info!(
+                    width = mode.width,
+                    height = mode.height,
+                    scale = mode.scale,
+                    "virtual display created in the last session's mode \
+                     (MACRDP_REMEMBER_VD_MODE=0 disables)"
+                );
+                return Ok(vd);
+            }
+            Err(e) => warn!(
+                error = %format!("{e:#}"),
+                ?mode,
+                "creating the virtual display in the remembered mode failed; \
+                 using --width/--height"
+            ),
+        }
+    }
+    virtual_display::VirtualDisplay::new(width, height, hz).context("attaching virtual display")
 }
 
 fn default_cert_dir() -> Result<PathBuf> {
@@ -2713,6 +2758,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
             "MACRDP_ADAPTIVE_SEED_MEMORY_SECS",
         ),
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
+        ("REMEMBER_VD_MODE", "MACRDP_REMEMBER_VD_MODE"),
         ("SCK_PACED", "MACRDP_SCK_PACED"),
         (
             "BLANK_RECOVERY_MIN_RENDER_REPORTS",
@@ -3113,12 +3159,7 @@ async fn async_main() -> Result<()> {
             let h = args
                 .height
                 .ok_or_else(|| anyhow!("--virtual-display requires --height"))?;
-            let vd = virtual_display::VirtualDisplay::new(
-                u32::from(w),
-                u32::from(h),
-                virtual_display::refresh_hz(),
-            )
-            .context("attaching virtual display")?;
+            let vd = create_virtual_display(&args, u32::from(w), u32::from(h))?;
             info!(
                 display_id = vd.display_id(),
                 origin = ?vd.origin_pts(),
@@ -3308,13 +3349,9 @@ async fn async_main() -> Result<()> {
     //   - primary panel with override: use the override + main geometry.
     let (width, height, capture_display_id, screen_size_pts) = if let Some(vd) = &virtual_display {
         let vd = vd.lock().expect("virtual display mutex poisoned");
-        // Both required earlier, so the unwraps can't fire.
-        let w = args
-            .width
-            .expect("checked above when --virtual-display set");
-        let h = args
-            .height
-            .expect("checked above when --virtual-display set");
+        // The remembered mode can differ from --width/--height.
+        let (w, h) = vd.size_px();
+        let (w, h) = (w as u16, h as u16);
         // Re-query CGDisplayBounds rather than trusting the cached
         // values from VirtualDisplay creation: if --make-primary
         // moved the display to (0, 0), the cached size is fine but
