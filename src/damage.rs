@@ -45,6 +45,9 @@ const FULL_FRAMES_AFTER_KEYFRAME: u32 = 8;
 /// a full-surface entry.
 const MAX_QUEUED: usize = 64;
 
+/// Most rects a shielded frame ships with; past this it ships unshielded.
+const MAX_SHIELDED_RECTS: usize = 128;
+
 /// A rectangle in surface pixels, right and bottom exclusive (the
 /// `RDPGFX_RECT16` convention).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +73,7 @@ impl Rect {
         self.left >= self.right || self.top >= self.bottom
     }
 
-    fn area(&self) -> u64 {
+    pub fn area(&self) -> u64 {
         if self.is_empty() {
             0
         } else {
@@ -85,6 +88,47 @@ impl Rect {
             right: self.right.max(o.right),
             bottom: self.bottom.max(o.bottom),
         }
+    }
+
+    pub fn intersects(&self, o: &Rect) -> bool {
+        self.intersection_area(o) > 0
+    }
+
+    pub fn contains(&self, o: &Rect) -> bool {
+        o.left >= self.left && o.top >= self.top && o.right <= self.right && o.bottom <= self.bottom
+    }
+
+    /// The parts of `self` outside `hole`: at most four disjoint rects.
+    fn minus(&self, hole: &Rect) -> Vec<Rect> {
+        if !self.intersects(hole) {
+            return vec![*self];
+        }
+        let (top, bottom) = (self.top.max(hole.top), self.bottom.min(hole.bottom));
+        [
+            Rect {
+                bottom: top,
+                ..*self
+            },
+            Rect {
+                top: bottom,
+                ..*self
+            },
+            Rect {
+                top,
+                bottom,
+                right: hole.left.max(self.left),
+                ..*self
+            },
+            Rect {
+                top,
+                bottom,
+                left: hole.right.min(self.right),
+                ..*self
+            },
+        ]
+        .into_iter()
+        .filter(|r| !r.is_empty())
+        .collect()
     }
 
     fn intersection_area(&self, o: &Rect) -> u64 {
@@ -184,6 +228,15 @@ pub fn region_rects(rects: &[Rect], width: u16, height: u16) -> Option<Vec<Rect>
     Some(out)
 }
 
+/// `rects` with every `holes` pixel cut out, as disjoint pieces of the inputs.
+pub fn subtract(rects: &[Rect], holes: &[Rect]) -> Vec<Rect> {
+    let mut out: Vec<Rect> = rects.iter().copied().filter(|r| !r.is_empty()).collect();
+    for hole in holes.iter().filter(|h| !h.is_empty()) {
+        out = out.iter().flat_map(|r| r.minus(hole)).collect();
+    }
+    out
+}
+
 /// Merges the pair whose bounding box adds the least uncovered area, as long
 /// as there are more than `max` rects or a merge adds nothing.
 fn merge(rects: &mut Vec<Rect>, max: usize) {
@@ -216,7 +269,8 @@ fn merge(rects: &mut Vec<Rect>, max: usize) {
 pub struct DamageTracker {
     enabled: bool,
     full_refresh: Option<Duration>,
-    queue: VecDeque<(i64, Damage)>,
+    /// Submitted frames: pts, damage, and the rects newer tiles painted since.
+    queue: VecDeque<(i64, Damage, Vec<Rect>)>,
     frames_since_keyframe: u32,
     last_full: Option<Instant>,
 }
@@ -267,12 +321,19 @@ impl DamageTracker {
         if !self.enabled {
             return;
         }
-        self.queue.push_back((pts, damage));
+        self.queue.push_back((pts, damage, Vec::new()));
         if self.queue.len() > MAX_QUEUED {
             self.queue.pop_front();
             if let Some(front) = self.queue.front_mut() {
                 front.1 = Damage::Full;
             }
+        }
+    }
+
+    /// Keeps every frame submitted so far off `rects`, which newer tiles painted.
+    pub fn shield(&mut self, rects: &[Rect]) {
+        for (_, _, holes) in &mut self.queue {
+            holes.extend_from_slice(rects);
         }
     }
 
@@ -290,10 +351,14 @@ impl DamageTracker {
         }
         let mut damage = Damage::default();
         let mut found = false;
-        while self.queue.front().is_some_and(|(p, _)| *p <= pts) {
-            let (p, d) = self.queue.pop_front().expect("front checked");
+        let mut holes = Vec::new();
+        while self.queue.front().is_some_and(|(p, _, _)| *p <= pts) {
+            let (p, d, h) = self.queue.pop_front().expect("front checked");
             damage.add(&d);
-            found |= p == pts;
+            if p == pts {
+                found = true;
+                holes = h;
+            }
         }
         if is_keyframe {
             self.frames_since_keyframe = 0;
@@ -320,7 +385,24 @@ impl DamageTracker {
         if regions.is_none() {
             self.last_full = Some(now);
         }
-        regions
+        if holes.is_empty() {
+            return regions;
+        }
+        let whole = [Rect {
+            left: 0,
+            top: 0,
+            right: u32::from(width),
+            bottom: u32::from(height),
+        }];
+        let mut shielded = subtract(regions.as_deref().unwrap_or(&whole), &holes);
+        if shielded.is_empty() {
+            // Some clients reject a frame without rects; outside the holes is always safe.
+            shielded = subtract(&whole, &holes);
+        }
+        if shielded.is_empty() || shielded.len() > MAX_SHIELDED_RECTS {
+            return regions;
+        }
+        Some(shielded)
     }
 }
 
@@ -471,6 +553,66 @@ mod tests {
         t.submitted(pts + 1, Damage::Rects(vec![r(1000, 600, 1004, 604)]));
         let out = t.regions(pts + 1, false, 1920, 1080, now).unwrap();
         assert!(covers(&out, 0, 0) && covers(&out, 1000, 600), "{out:?}");
+    }
+
+    #[test]
+    fn subtract_cuts_out_exactly_the_holes() {
+        let rects = [r(0, 0, 40, 30), r(100, 100, 120, 110)];
+        let holes = [r(10, 5, 20, 15), r(35, 25, 60, 60), r(500, 500, 510, 510)];
+        let out = subtract(&rects, &holes);
+        for x in 0..130 {
+            for y in 0..120 {
+                let want = covers(&rects, x, y) && !covers(&holes, x, y);
+                let n = out
+                    .iter()
+                    .filter(|o| x >= o.left && x < o.right && y >= o.top && y < o.bottom)
+                    .count();
+                assert_eq!(n, usize::from(want), "({x},{y}) in {out:?}");
+            }
+        }
+        assert_eq!(subtract(&[r(0, 0, 8, 8)], &[r(0, 0, 8, 8)]), vec![]);
+    }
+
+    #[test]
+    fn shield_keeps_older_frames_off_newer_tiles_only() {
+        let now = Instant::now();
+        let mut t = DamageTracker::new(true, None);
+        let pts = settled(&mut t, now);
+        let busy = r(1200, 0, 1920, 1080);
+        let tile = r(100, 100, 148, 148);
+        t.submitted(pts, Damage::Rects(vec![busy, tile]));
+        t.shield(&[tile]);
+        t.submitted(pts + 1, Damage::Rects(vec![busy, tile]));
+        let older = t.regions(pts, false, 1920, 1080, now).unwrap();
+        assert!(!older.iter().any(|o| o.intersects(&tile)), "{older:?}");
+        assert!(covers(&older, 1500, 500) && covers(&older, 96, 96));
+        let newer = t.regions(pts + 1, false, 1920, 1080, now).unwrap();
+        assert!(covers(&newer, 100, 100) && covers(&newer, 147, 147));
+    }
+
+    #[test]
+    fn a_shielded_whole_frame_ships_everything_but_the_tiles() {
+        let now = Instant::now();
+        let mut t = DamageTracker::new(true, None);
+        let tile = r(10, 10, 20, 20);
+        t.submitted(0, Damage::Full);
+        t.shield(&[tile]);
+        let out = t.regions(0, true, 64, 64, now).unwrap();
+        let px: u64 = out.iter().map(Rect::area).sum();
+        assert_eq!(px, 64 * 64 - 100);
+        assert!(!out.iter().any(|o| o.intersects(&tile)));
+    }
+
+    #[test]
+    fn a_frame_entirely_under_tiles_still_ships_a_rect() {
+        let now = Instant::now();
+        let mut t = DamageTracker::new(true, None);
+        let pts = settled(&mut t, now);
+        t.submitted(pts, Damage::Rects(vec![r(0, 0, 4, 4)]));
+        t.shield(&[r(0, 0, 64, 64)]);
+        let out = t.regions(pts, false, 1920, 1080, now).unwrap();
+        assert!(!out.is_empty());
+        assert!(!out.iter().any(|o| o.intersects(&r(0, 0, 64, 64))));
     }
 
     #[test]

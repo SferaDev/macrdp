@@ -50,7 +50,7 @@ impl FastPath {
         )
     }
 
-    fn parse(mode: Option<&str>, max_px: Option<&str>) -> Option<Self> {
+    pub(crate) fn parse(mode: Option<&str>, max_px: Option<&str>) -> Option<Self> {
         let codec = match mode?.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "on" | "planar" => Codec::Planar,
             "uncompressed" | "raw" => Codec::Uncompressed,
