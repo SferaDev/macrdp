@@ -57,7 +57,7 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
-    /// Zeroes the per-session values; `aac` is process config.
+    /// Zeroes the per-session values; `aac` is process config and capture rebuilds are cumulative.
     pub fn session_ended(&self) {
         self.connected.store(false, Ordering::Relaxed);
         for v in [
@@ -83,7 +83,7 @@ impl SessionStats {
                 "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
                 "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
                 "\"frames_sent\":{},\"adaptive\":{},\"aac\":{},",
-                "\"capacity_bps\":{},\"delivered_bps\":{}}}"
+                "\"capacity_bps\":{},\"delivered_bps\":{},\"capture_rebuilds\":{}}}"
             ),
             self.connected.load(Ordering::Relaxed),
             self.width.load(Ordering::Relaxed),
@@ -98,6 +98,7 @@ impl SessionStats {
             self.aac.load(Ordering::Relaxed),
             self.capacity_bps.load(Ordering::Relaxed),
             self.delivered_bps.load(Ordering::Relaxed),
+            crate::capture_watchdog::rebuilds(),
         )
     }
 }
@@ -182,6 +183,7 @@ mod tests {
         assert!(j.contains("\"bitrate_bps\":4000000"));
         assert!(j.contains("\"fps\":60"));
         assert!(j.contains("\"capacity_bps\":0"));
+        assert!(j.contains("\"capture_rebuilds\":"));
     }
 
     #[test]
@@ -203,6 +205,11 @@ mod tests {
         assert!(j.contains("\"frames_sent\":0"));
         assert!(j.contains("\"adaptive\":false"));
         assert!(j.contains("\"aac\":true"), "aac is process config");
+        let rebuilds = format!(
+            "\"capture_rebuilds\":{}",
+            crate::capture_watchdog::rebuilds()
+        );
+        assert!(j.contains(&rebuilds), "rebuilds stay cumulative");
     }
 
     #[test]
