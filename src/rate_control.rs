@@ -165,8 +165,10 @@ impl RateController {
         self.prev_delay_ms = i.delay_ms;
         let t = self.target;
         // Held captures while the link delivers less than the target: the budget, not the queue, is absorbing the excess.
-        let link_bound =
-            i.gated && i.allowance_ms <= 0.0 && delivered.is_some_and(|d| d < 0.97 * t);
+        // Delivery far under the target is an idle screen, not a full link: only near-target delivery counts.
+        let link_bound = i.gated
+            && i.allowance_ms <= 0.0
+            && delivered.is_some_and(|d| (0.6 * t..0.97 * t).contains(&d));
 
         let (verdict, next) = if i.loss {
             self.slow_start = false;
