@@ -2947,7 +2947,8 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
-        let mut display_updates = self.display.lock().await.updates().await?;
+        // (vendored, divergence (31)) `updates()` runs in `dispatch_display` so heartbeats keep flowing while it starts.
+        let display = Arc::clone(&self.display);
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
@@ -3002,6 +3003,7 @@ impl RdpServer {
         };
 
         let dispatch_display = async move {
+            let mut display_updates = display.lock().await.updates().await?;
             let mut buffer = vec![0u8; 4096];
 
             loop {

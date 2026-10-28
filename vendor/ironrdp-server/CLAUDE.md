@@ -2101,3 +2101,14 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     cadence it can time out on. macrdp sets period 2 s, count1 3, count2 3
     (`--heartbeat-secs`, 0 = off). The IronRDP connector does not announce
     support, so conn_test only covers the negative case.
+
+(31) `RdpServerDisplay::updates()` runs inside the `dispatch_display` arm of
+    `client_loop` (NOT upstreamed; added 2026-10-28). Upstream awaits it before
+    the loop starts, so nothing else on the connection runs while the display
+    starts its capture. macrdp's capture start takes seconds when the virtual
+    display re-registered (SCK retries), and a watchdog rebuild goes through a
+    same-size reactivation that lands here: heartbeats (30) stopped for over
+    6 s and the client reconnected. Now heartbeats, input and DVC setup (the
+    EGFX handshake) run while the capture starts. Synchronous work inside an
+    `updates()` implementation still blocks the whole loop, so keep long waits
+    out of it (macrdp moves its display wake wait to `spawn_blocking`).

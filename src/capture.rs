@@ -725,7 +725,11 @@ impl RdpServerDisplay for CaptureDisplay {
         // `sync_virtual_display` is a sync block (no awaits) so the display
         // mutex guard never lives across an await point (Send bound on the
         // returned future).
-        crate::virtual_display::wake_displays_and_wait(Duration::from_secs(2));
+        // Off the server task, which keeps sending heartbeats meanwhile.
+        let _ = tokio::task::spawn_blocking(|| {
+            crate::virtual_display::wake_displays_and_wait(Duration::from_secs(2))
+        })
+        .await;
         let (width, height) = self.sync_virtual_display();
         let result = self.build_updates(width, height).await;
         if let Err(e) = &result {
