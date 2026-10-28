@@ -24,6 +24,7 @@ mod clipboard_image;
 mod clipboard_rich;
 #[cfg(test)]
 mod conn_test;
+mod connection_hooks;
 mod cursor;
 // Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -3534,6 +3535,7 @@ async fn async_main() -> Result<()> {
         )),
         None => conn_handler,
     };
+    let conn_handler = Some(connection_hooks::SessionHooks::wrap(conn_handler));
 
     let mut server = RdpServer::builder()
         .with_addr(args.bind)
