@@ -52,6 +52,9 @@ pub struct SessionStats {
     /// Rate the client acknowledged over the last control interval.
     pub delivered_bps: AtomicU32,
     pub frames_sent: AtomicU64,
+    /// Input-priority tile frames shipped this session, and their bytes.
+    pub input_tiles: AtomicU64,
+    pub input_tile_bytes: AtomicU64,
     pub adaptive: AtomicBool,
     pub aac: AtomicBool,
 }
@@ -73,7 +76,9 @@ impl SessionStats {
         ] {
             v.store(0, Ordering::Relaxed);
         }
-        self.frames_sent.store(0, Ordering::Relaxed);
+        for v in [&self.frames_sent, &self.input_tiles, &self.input_tile_bytes] {
+            v.store(0, Ordering::Relaxed);
+        }
         self.adaptive.store(false, Ordering::Relaxed);
     }
 
@@ -83,7 +88,8 @@ impl SessionStats {
                 "{{\"connected\":{},\"width\":{},\"height\":{},\"bitrate_bps\":{},",
                 "\"ceiling_bps\":{},\"rtt_ms\":{},\"queue_delay_ms\":{},\"fps\":{},",
                 "\"frames_sent\":{},\"adaptive\":{},\"aac\":{},",
-                "\"capacity_bps\":{},\"delivered_bps\":{},\"capture_rebuilds\":{}}}"
+                "\"capacity_bps\":{},\"delivered_bps\":{},\"capture_rebuilds\":{},",
+                "\"input_tiles\":{},\"input_tile_bytes\":{}}}"
             ),
             self.connected.load(Ordering::Relaxed),
             self.width.load(Ordering::Relaxed),
@@ -99,6 +105,8 @@ impl SessionStats {
             self.capacity_bps.load(Ordering::Relaxed),
             self.delivered_bps.load(Ordering::Relaxed),
             crate::capture_watchdog::rebuilds(),
+            self.input_tiles.load(Ordering::Relaxed),
+            self.input_tile_bytes.load(Ordering::Relaxed),
         )
     }
 }
@@ -184,6 +192,7 @@ mod tests {
         assert!(j.contains("\"fps\":60"));
         assert!(j.contains("\"capacity_bps\":0"));
         assert!(j.contains("\"capture_rebuilds\":"));
+        assert!(j.contains("\"input_tiles\":0,\"input_tile_bytes\":0}"));
     }
 
     #[test]
@@ -194,6 +203,8 @@ mod tests {
         s.bitrate_bps.store(5_000_000, Ordering::Relaxed);
         s.delivered_bps.store(1_000_000, Ordering::Relaxed);
         s.frames_sent.store(900, Ordering::Relaxed);
+        s.input_tiles.store(12, Ordering::Relaxed);
+        s.input_tile_bytes.store(4096, Ordering::Relaxed);
         s.adaptive.store(true, Ordering::Relaxed);
         s.aac.store(true, Ordering::Relaxed);
         s.session_ended();
@@ -203,6 +214,7 @@ mod tests {
         assert!(j.contains("\"bitrate_bps\":0"));
         assert!(j.contains("\"delivered_bps\":0"));
         assert!(j.contains("\"frames_sent\":0"));
+        assert!(j.contains("\"input_tiles\":0") && j.contains("\"input_tile_bytes\":0"));
         assert!(j.contains("\"adaptive\":false"));
         assert!(j.contains("\"aac\":true"), "aac is process config");
         let rebuilds = format!(

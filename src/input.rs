@@ -66,6 +66,12 @@ impl MacInputHandler {
 impl RdpServerInputHandler for MacInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
         crate::lazy_chroma::note_input();
+        if matches!(
+            event,
+            KeyboardEvent::Pressed { .. } | KeyboardEvent::UnicodePressed(_)
+        ) {
+            crate::input_priority::note_input();
+        }
         #[cfg(target_os = "macos")]
         {
             let t = std::time::Instant::now();
@@ -92,6 +98,12 @@ impl RdpServerInputHandler for MacInputHandler {
 
     fn mouse(&mut self, event: MouseEvent) {
         crate::lazy_chroma::note_input();
+        if matches!(
+            event,
+            MouseEvent::LeftPressed | MouseEvent::RightPressed | MouseEvent::MiddlePressed
+        ) {
+            crate::input_priority::note_input();
+        }
         // A button-down is the "user intent" signal the H.264 path uses to lower
         // its keyframe threshold for a moment (a click usually precedes a UI
         // change). Record before delegating, since `inner.mouse` takes `event`.
