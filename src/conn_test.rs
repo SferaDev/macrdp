@@ -1080,6 +1080,143 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+/// IronRDP's client does not announce RNS_UD_CS_SUPPORT_HEARTBEAT_PDU, so a
+/// heartbeat-enabled server must leave it alone and keep the session up.
+#[tokio::test]
+async fn heartbeats_skip_a_client_that_does_not_support_them() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            server.set_heartbeat(Some(ironrdp_server::HeartbeatConfig {
+                period_secs: 1,
+                count1: 3,
+                count2: 3,
+            }));
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            let a = connect_with_retry(addr).await?;
+            let (_size, mut framed) = connect_client(a, 1280, 800).await?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+            loop {
+                match tokio::time::timeout_at(deadline, framed.read_pdu()).await {
+                    Err(_) => break,
+                    Ok(Ok((_action, bytes))) => {
+                        assert!(
+                            !is_heartbeat(&bytes),
+                            "heartbeat sent to a client without support"
+                        )
+                    }
+                    Ok(Err(e)) => anyhow::bail!("session closed: {e}"),
+                }
+            }
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// Counts keyboard events, so a test can see when the server applied client input.
+struct CountingInput(Arc<std::sync::atomic::AtomicUsize>);
+impl RdpServerInputHandler for CountingInput {
+    fn keyboard(&mut self, _e: KeyboardEvent) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn mouse(&mut self, _e: MouseEvent) {}
+}
+
+/// A display whose capture never finishes starting.
+struct NeverStartingDisplay;
+#[async_trait::async_trait]
+impl RdpServerDisplay for NeverStartingDisplay {
+    async fn size(&mut self) -> ServerDesktopSize {
+        ServerDesktopSize {
+            width: 1024,
+            height: 768,
+        }
+    }
+    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+        std::future::pending::<()>().await;
+        Ok(Box::new(TestUpdates))
+    }
+}
+
+/// The session must be served while the display is still starting its capture:
+/// the heartbeat arm shares the loop with input, so input stands in for it here.
+#[tokio::test]
+async fn the_session_runs_while_the_capture_is_still_starting() -> anyhow::Result<()> {
+    use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent, SynchronizeFlags};
+    use ironrdp_tokio::FramedWrite as _;
+    init_tracing();
+
+    let keys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, 3389))
+        .with_tls(server_tls_acceptor())
+        .with_input_handler(CountingInput(Arc::clone(&keys)))
+        .with_display_handler(NeverStartingDisplay)
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .build();
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run_connection(server_io).await;
+            });
+            let (_size, mut framed) = connect_client(client_io, 1024, 768).await?;
+            let sync =
+                FastPathInput::single(FastPathInputEvent::SyncEvent(SynchronizeFlags::empty()));
+            framed.write_all(&ironrdp_core::encode_vec(&sync)?).await?;
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while keys.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "input was not applied while the capture was starting"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// Is this raw server PDU a Server Heartbeat PDU (SEC_HEARTBEAT security header)?
+fn is_heartbeat(bytes: &[u8]) -> bool {
+    use ironrdp_core::decode;
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::x224::X224;
+
+    let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
+        return false;
+    };
+    let McsMessage::SendDataIndication(data) = x224.0 else {
+        return false;
+    };
+    data.user_data.len() == 8 && data.user_data[..2] == [0x00, 0x40]
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {

@@ -427,6 +427,11 @@ struct Args {
     #[arg(long)]
     stats_endpoint: bool,
 
+    /// Seconds between the MS-RDPBCGR Server Heartbeat PDUs sent to clients that
+    /// support them, so a client on a tunnel can spot a dead server. 0 disables.
+    #[arg(long, default_value_t = 2)]
+    heartbeat_secs: u8,
+
     /// Serve the display as H.264 video over the EGFX virtual channel
     /// (MS-RDPEGFX, AVC420) instead of legacy RemoteFx/QOI BitmapUpdates.
     /// Hardware-encoded via VideoToolbox. Falls back to the legacy path
@@ -3635,6 +3640,15 @@ async fn async_main() -> Result<()> {
     // `input::modifier_reset_handle` for why the display `updates()` path and
     // `on_accept` were both the wrong seam.
     server.set_input_reset_handle(input::modifier_reset_handle());
+
+    // Warn after 3 missed heartbeats, reconnect after 3 more.
+    server.set_heartbeat(
+        (args.heartbeat_secs > 0).then_some(ironrdp_server::HeartbeatConfig {
+            period_secs: args.heartbeat_secs,
+            count1: 3,
+            count2: 3,
+        }),
+    );
 
     // The acceptor records the client's announced keyboard-layout id (KLID) in
     // its Client Core Data; the server publishes it here so the input handler
