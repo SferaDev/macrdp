@@ -259,11 +259,17 @@ impl SessionTracker {
     fn enter(&self) {
         let prev = self.count.fetch_add(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev + 1, "SessionTracker::enter");
+        if prev == 0 {
+            crate::display_awake::session_started();
+        }
         self.notify.notify_one();
     }
     fn leave(&self) {
         let prev = self.count.fetch_sub(1, Ordering::SeqCst);
         tracing::info!(prev, now = prev.saturating_sub(1), "SessionTracker::leave");
+        if prev == 1 {
+            crate::display_awake::session_ended();
+        }
         self.notify.notify_one();
     }
 }

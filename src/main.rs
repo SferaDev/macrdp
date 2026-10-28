@@ -28,6 +28,7 @@ mod cursor;
 // Only the macOS capture and EGFX paths use it; the rect math is tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod damage;
+mod display_awake;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod egfx_fast_path;
 #[cfg(all(test, target_os = "macos"))]
