@@ -425,6 +425,8 @@ struct ConnectionContext {
     delay_interval_min: f64,
     /// `acked_bytes` at the last control step; the difference over the interval is the delivery rate.
     rate_acked_mark: u64,
+    /// `ShipLog::shipped_bytes` at the last control step, for the send rate.
+    rate_shipped_mark: u64,
     /// The unacked-byte budget held back a capture since the last control step.
     inflight_gated: bool,
     /// Capture rate the encoder is held to; `Gfx::fps` is the maximum.
@@ -2566,7 +2568,7 @@ impl Gfx {
         let actively_shipping =
             now.saturating_duration_since(ctx.last_ship_at) < Duration::from_secs(1);
         let interval_min = std::mem::replace(&mut ctx.delay_interval_min, f64::INFINITY);
-        let sample_ms = effective_queue_delay(
+        let mut sample_ms = effective_queue_delay(
             if interval_min.is_finite() {
                 interval_min
             } else {
@@ -2591,6 +2593,44 @@ impl Gfx {
             && !in_warmup
             && now.saturating_duration_since(ctx.epoch) > Duration::from_secs(3);
         let signal_usable = acks_usable || distress;
+        let delivered_bytes = ctx.acked_bytes.saturating_sub(ctx.rate_acked_mark);
+        ctx.rate_acked_mark = ctx.acked_bytes;
+        let delivered_bps = (acks_usable && delivered_bytes > 0)
+            .then(|| delivered_bytes as f64 * 8.0 / dt.as_secs_f64());
+        let shipped = ctx.ship_times.lock().unwrap().shipped_bytes;
+        let sent_bytes = shipped.saturating_sub(ctx.rate_shipped_mark);
+        ctx.rate_shipped_mark = shipped;
+        let sent_bps = Some(sent_bytes as f64 * 8.0 / dt.as_secs_f64());
+        let inflight_bytes = acks_usable.then(|| shipped.saturating_sub(ctx.acked_bytes) as f64);
+        let gated = std::mem::take(&mut ctx.inflight_gated);
+        let shift = acks_usable
+            .then(|| {
+                ctx.rate.observe_path(crate::rate_control::ShiftInput {
+                    dt,
+                    delay_ms: sample_ms,
+                    delivered_bps,
+                    sent_bps,
+                    inflight_bytes,
+                    gated,
+                })
+            })
+            .flatten();
+        let base_ms = ctx.rtt_min_cur_ms.min(ctx.rtt_min_prev_ms);
+        if let Some(shift_ms) = shift.filter(|_| base_ms.is_finite()) {
+            // The path itself got slower (a relay change): the new round trip is the base, not a queue.
+            ctx.rtt_min_cur_ms = base_ms + shift_ms;
+            ctx.rtt_min_prev_ms = base_ms + shift_ms;
+            ctx.rtt_bucket_started = now;
+            ctx.queue_delay_ms = (ctx.queue_delay_ms - shift_ms).max(0.0);
+            ctx.adaptive_delay_ewma = (ctx.adaptive_delay_ewma - shift_ms).max(0.0);
+            sample_ms = (sample_ms - shift_ms).max(0.0);
+            info!(
+                shift_ms,
+                base_rtt_ms = base_ms + shift_ms,
+                target_bps = ctx.adaptive_target_bps,
+                "EGFX standing delay is path latency; re-baselined the min RTT"
+            );
+        }
         // Only fold real samples into the EWMA — during warmup (and idle
         // no-ack periods) the delay is startup backlog / silence, not
         // congestion, and must not pre-load the average.
@@ -2598,10 +2638,6 @@ impl Gfx {
             ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
                 + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
         }
-        let delivered_bytes = ctx.acked_bytes.saturating_sub(ctx.rate_acked_mark);
-        ctx.rate_acked_mark = ctx.acked_bytes;
-        let delivered_bps = (acks_usable && delivered_bytes > 0)
-            .then(|| delivered_bytes as f64 * 8.0 / dt.as_secs_f64());
         let keyframe = ctx.ship_times.lock().unwrap().keyframe;
         let allowance_ms = keyframe.map_or(0.0, |(bytes, at)| {
             crate::rate_control::idr_allowance_ms(
@@ -2611,7 +2647,6 @@ impl Gfx {
                 self.adaptive_interval,
             )
         });
-        let gated = std::mem::take(&mut ctx.inflight_gated);
         // Per-interval visibility even when the target doesn't change (the
         // adjusted-line below only logs on a change; Hold periods were opaque).
         trace!(
@@ -2620,6 +2655,8 @@ impl Gfx {
             delivered_bps,
             allowance_ms,
             gated,
+            inflight_bytes,
+            sent_bps,
             ack_lag,
             acks_usable,
             distress,
@@ -2634,6 +2671,8 @@ impl Gfx {
             usable: signal_usable,
             allowance_ms,
             gated,
+            inflight_bytes,
+            sent_bps,
         });
         let new_target = ctx.rate.target_bps();
         let low = self.adaptive_queue_low_ms;
@@ -2683,7 +2722,7 @@ impl Gfx {
                 ctx.fps_level,
                 self.fps,
                 self.adaptive_floor_fps,
-                f64::from(new_target),
+                ctx.rate.fps_basis_bps(),
                 u64::from(w) * u64::from(h),
                 self.adaptive_min_bpp,
             );
@@ -3943,6 +3982,7 @@ impl GfxServerFactory for Gfx {
             rate,
             delay_interval_min: f64::INFINITY,
             rate_acked_mark: 0,
+            rate_shipped_mark: 0,
             inflight_gated: false,
             fps_level: self.fps.max(1),
             fps_changed_at: Instant::now(),

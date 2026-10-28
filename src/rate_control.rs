@@ -36,6 +36,20 @@ const DRIFT_PER_S: f64 = 0.03;
 const PARK: f64 = 0.92;
 /// Seconds of clean probing per doubling of the probe rate.
 const PROBE_DOUBLING_S: f64 = 2.0;
+/// Sending under this share of the target is the screen's doing, not the link's.
+const APP_LIMITED: f64 = 0.6;
+/// A queue of D ms at rate R holds R x D bytes; in-flight bytes under this share of that cannot be one.
+const QUEUE_ROOM: f64 = 0.5;
+/// Cuts stay above this share of the remembered capacity until loss, or a queue outlasting `CAPACITY_HOLD_S`.
+const CAPACITY_FLOOR: f64 = 0.7;
+const CAPACITY_HOLD_S: f64 = 3.0;
+/// A standing delay held this long with no sign of being a queue is path latency.
+const SHIFT_HOLD_S: f64 = 2.1;
+/// How far the delay may wander and still count as standing, plus a slow fall a draining queue would far outrun.
+const SHIFT_FLAT_MS: f64 = 10.0;
+const SHIFT_SAG_MS_PER_S: f64 = 15.0;
+/// Delivering under this share of the capacity drains any queue of ours within the hold.
+const SHIFT_DRAIN: f64 = 0.8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RateConfig {
@@ -67,6 +81,10 @@ pub struct RateInput {
     pub allowance_ms: f64,
     /// The unacked-byte budget held back a capture this interval.
     pub gated: bool,
+    /// Bytes shipped but not yet acknowledged, at the end of the interval.
+    pub inflight_bytes: Option<f64>,
+    /// Bytes shipped over the interval as a rate.
+    pub sent_bps: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,7 +103,12 @@ pub struct RateController {
     peak_delivered: f64,
     prev_delay_ms: f64,
     over_high: u32,
+    cut_s: f64,
+    /// The capacity before the current cut episode, which the episode's own deliveries cannot erode.
+    episode_capacity: Option<f64>,
     probe_s: f64,
+    congested: bool,
+    shift: PathShift,
 }
 
 impl RateController {
@@ -100,7 +123,11 @@ impl RateController {
             peak_delivered: 0.0,
             prev_delay_ms: 0.0,
             over_high: 0,
+            cut_s: 0.0,
+            episode_capacity: None,
             probe_s: 0.0,
+            congested: false,
+            shift: PathShift::default(),
         };
         c.target = c.clamp(c.target);
         c
@@ -124,6 +151,27 @@ impl RateController {
         self.slow_start
     }
 
+    /// The rate the frame rate is chosen for: an idle screen's low target is not a thin link.
+    pub fn fps_basis_bps(&self) -> f64 {
+        match self.capacity {
+            Some(c) if !self.congested => self.target.max(self.clamp(c * PARK)),
+            _ => self.target,
+        }
+    }
+
+    fn app_limited(&self, gated: bool, sent: Option<f64>, delivered: Option<f64>) -> bool {
+        let t = self.target;
+        !gated
+            && sent.is_some_and(|s| s < APP_LIMITED * t)
+            && delivered.is_none_or(|d| d < APP_LIMITED * t)
+    }
+
+    /// Whether the unacked bytes are too few to hold a queue of `delay_ms` at the link's rate.
+    fn no_room_for(&self, inflight: Option<f64>, delay_ms: f64) -> bool {
+        let rate = self.capacity.unwrap_or(self.target);
+        inflight.is_some_and(|b| b * 8.0 < QUEUE_ROOM * rate * delay_ms / 1000.0)
+    }
+
     /// A rate safe to start the next connection on this path at.
     pub fn safe_bps(&self) -> u32 {
         let t = self
@@ -135,7 +183,8 @@ impl RateController {
     /// Jumps to `bps` (a transport change), keeping what was learned about the path.
     pub fn reset_to(&mut self, bps: u32) {
         self.target = self.clamp(f64::from(bps));
-        self.over_high = 0;
+        self.end_episode();
+        self.shift = PathShift::default();
         self.prev_delay_ms = 0.0;
     }
 
@@ -169,19 +218,37 @@ impl RateController {
         let link_bound = i.gated
             && i.allowance_ms <= 0.0
             && delivered.is_some_and(|d| (0.6 * t..0.97 * t).contains(&d));
+        let app_limited = self.app_limited(i.gated, i.sent_bps, delivered);
+        // A delay an idle sender has no bytes in flight to cause is path latency: neither cut nor drift on it.
+        let phantom = app_limited && !rising && self.no_room_for(i.inflight_bytes, i.delay_ms);
+        self.congested = false;
 
         let (verdict, next) = if i.loss {
             self.slow_start = false;
+            self.congested = true;
             self.over_high = 0;
+            // A queue that follows a loss cut persists after cutting: no floor for it.
+            self.cut_s = f64::INFINITY;
             if let Some(d) = delivered.filter(|d| *d >= 0.5 * t) {
                 self.note_capacity(d);
             }
             (Verdict::Decrease, t * self.cfg.loss_decrease)
         } else if !i.usable {
             (Verdict::Hold, t)
+        } else if phantom && i.delay_ms > low {
+            self.over_high = 0;
+            (Verdict::Hold, t)
         } else if i.delay_ms > high || link_bound {
             self.slow_start = false;
+            self.congested = true;
             self.over_high += 1;
+            self.begin_episode(dt);
+            // A busy sender's queue delivering half the remembered capacity is a link that lost it: no floor.
+            if !app_limited
+                && delivered.is_some_and(|d| self.episode_capacity.is_some_and(|c| d < 0.5 * c))
+            {
+                self.cut_s = f64::INFINITY;
+            }
             let excess = i.delay_ms - 0.5 * (low + high);
             // Without a deep queue to drain, settling just under the delivered rate is enough.
             let margin = if i.delay_ms > high {
@@ -191,6 +258,8 @@ impl RateController {
             };
             let factor = (1.0 - excess / DRAIN_MS).clamp(MAX_CUT, margin);
             let next = match delivered {
+                // An idle screen's delivery says nothing about the link: cut from the target.
+                _ if app_limited => t * factor,
                 // A queue that outlasts one interval means the link is carrying all it can.
                 Some(d) if self.over_high >= 2 || link_bound => {
                     // A draining queue delivers less than the link carries: keep the episode's best.
@@ -215,6 +284,7 @@ impl RateController {
             }
             self.over_high = 0;
             if (i.delay_ms > 0.5 * (low + high) || i.gated) && i.allowance_ms <= 0.0 {
+                self.begin_episode(dt);
                 // A rate that only holds the queue steady is the capacity: ease under it.
                 (Verdict::Decrease, t * (1.0 - DRIFT_PER_S * dt))
             } else {
@@ -222,11 +292,21 @@ impl RateController {
             }
         } else if i.allowance_ms > 0.0 || i.gated {
             // A keyframe's burst says nothing about the link's steady capacity, and a held capture says it is full.
-            self.over_high = 0;
+            self.end_episode();
             (Verdict::Hold, t)
         } else {
-            self.over_high = 0;
-            (Verdict::Increase, self.grow(t, dt))
+            self.end_episode();
+            (Verdict::Increase, self.grow(t, dt, app_limited))
+        };
+        let floor = self
+            .episode_capacity
+            .or(self.capacity)
+            .map(|c| c * CAPACITY_FLOOR);
+        let next = match floor {
+            Some(f) if verdict == Verdict::Decrease && !i.loss && self.cut_s <= CAPACITY_HOLD_S => {
+                next.max(f.min(t))
+            }
+            _ => next,
         };
         if verdict == Verdict::Decrease || i.delay_ms > low {
             self.probe_s = 0.0;
@@ -238,7 +318,67 @@ impl RateController {
         verdict
     }
 
-    fn grow(&mut self, t: f64, dt: f64) -> f64 {
+    /// The delay to fold into the base RTT, once a standing delay has proven not to be a queue.
+    pub fn observe_path(&mut self, i: ShiftInput) -> Option<f64> {
+        let dt = i.dt.as_secs_f64().clamp(0.01, 2.0);
+        let d = i.delay_ms;
+        if d.is_nan() || d <= self.cfg.low_ms {
+            self.shift = PathShift::default();
+            return None;
+        }
+        let s = &self.shift;
+        let band = SHIFT_FLAT_MS + SHIFT_SAG_MS_PER_S * s.held_s;
+        if s.held_s == 0.0 || d > s.lo + SHIFT_FLAT_MS || d.max(s.hi) - d.min(s.lo) > band {
+            self.shift = PathShift {
+                lo: d,
+                hi: d,
+                ..PathShift::default()
+            };
+        }
+        let delivered = i.delivered_bps.filter(|d| *d > 0.0);
+        let idle = self.app_limited(i.gated, i.sent_bps, delivered)
+            && self.no_room_for(i.inflight_bytes, d);
+        // A queue of ours drains while the link delivers well under what it carried, so one that holds is not ours.
+        let carried = self.episode_capacity.or(self.capacity);
+        let undrained = carried.is_some_and(|c| {
+            self.target <= SHIFT_DRAIN * c && delivered.is_some_and(|x| x <= SHIFT_DRAIN * c)
+        });
+        let s = &mut self.shift;
+        s.lo = s.lo.min(d);
+        s.hi = s.hi.max(d);
+        s.held_s += dt;
+        if idle || undrained {
+            s.evidence_s += dt;
+        }
+        if s.held_s < SHIFT_HOLD_S || s.evidence_s < 0.75 * s.held_s {
+            return None;
+        }
+        let shift = s.lo;
+        self.shift = PathShift::default();
+        // The episode was a false alarm: what it taught about the link does not stand.
+        if let Some(c) = self.episode_capacity {
+            self.capacity = Some(self.capacity.map_or(c, |k| k.max(c)));
+        }
+        self.end_episode();
+        self.prev_delay_ms = (self.prev_delay_ms - shift).max(0.0);
+        Some(shift)
+    }
+
+    /// Counts the time a cut episode lasts, remembering the capacity it started from.
+    fn begin_episode(&mut self, dt: f64) {
+        if self.cut_s == 0.0 {
+            self.episode_capacity = self.capacity;
+        }
+        self.cut_s += dt;
+    }
+
+    fn end_episode(&mut self) {
+        self.over_high = 0;
+        self.cut_s = 0.0;
+        self.episode_capacity = None;
+    }
+
+    fn grow(&mut self, t: f64, dt: f64, app_limited: bool) -> f64 {
         let fixed = self.cfg.increase_bps.map(f64::from);
         let grown = if self.slow_start {
             let factor = self.cfg.slow_start.unwrap_or(1.0);
@@ -248,6 +388,9 @@ impl RateController {
             if t < park * 0.97 {
                 self.probe_s = 0.0;
                 t + (park - t) * (dt * 1.5).min(1.0)
+            } else if app_limited {
+                // An idle screen cannot probe past the capacity: its bursts are not the link's.
+                t
             } else {
                 // Probe gently, then faster the longer the link stays clean past the old capacity.
                 self.probe_s += dt;
@@ -262,6 +405,26 @@ impl RateController {
         let app_cap = (2.0 * self.peak_delivered).max(f64::from(self.cfg.floor_bps));
         grown.min(app_cap.max(t))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShiftInput {
+    pub dt: Duration,
+    /// The interval's unsmoothed standing delay.
+    pub delay_ms: f64,
+    pub delivered_bps: Option<f64>,
+    pub sent_bps: Option<f64>,
+    pub inflight_bytes: Option<f64>,
+    pub gated: bool,
+}
+
+/// Tells path latency from queue: a standing delay that neither the unacked bytes nor the cuts can explain.
+#[derive(Clone, Debug, Default)]
+struct PathShift {
+    held_s: f64,
+    evidence_s: f64,
+    lo: f64,
+    hi: f64,
 }
 
 /// Frame rates the governor steps through, highest first.
@@ -377,6 +540,8 @@ mod tests {
             usable: true,
             allowance_ms: 0.0,
             gated: false,
+            inflight_bytes: None,
+            sent_bps: None,
         }
     }
 
@@ -469,6 +634,81 @@ mod tests {
         assert_eq!(c.target_bps(), 4_250_000);
     }
 
+    fn idle(delay_ms: f64, inflight: f64) -> RateInput {
+        RateInput {
+            inflight_bytes: Some(inflight),
+            sent_bps: Some(200_000.0),
+            ..input(delay_ms, 200_000.0)
+        }
+    }
+
+    #[test]
+    fn an_idle_sender_does_not_cut_on_a_delay_it_has_no_bytes_for() {
+        let mut c = RateController::new(cfg(25_000_000), 4_000_000, Some(4_400_000));
+        // The step itself reads as a rising queue; once it stands it is held, not chased.
+        c.step(idle(52.0, 3_000.0));
+        let t = c.target_bps();
+        assert!(t >= 3_600_000, "{t}");
+        for _ in 0..20 {
+            assert_eq!(c.step(idle(52.0, 3_000.0)), Verdict::Hold);
+        }
+        assert_eq!(c.target_bps(), t);
+        assert!(c.fps_basis_bps() >= 4_000_000.0);
+    }
+
+    #[test]
+    fn an_idle_sender_cuts_from_the_target_and_keeps_the_capacity_floor() {
+        let mut c = RateController::new(cfg(25_000_000), 4_000_000, Some(4_400_000));
+        for _ in 0..5 {
+            assert_eq!(c.step(idle(80.0, 120_000.0)), Verdict::Decrease);
+        }
+        assert_eq!(c.target_bps(), (4_400_000.0 * CAPACITY_FLOOR) as u32);
+        assert_eq!(c.capacity_bps(), Some(4_400_000));
+        // Past the hold the queue has outlasted the cuts and the floor goes.
+        for _ in 0..10 {
+            c.step(idle(80.0, 120_000.0));
+        }
+        assert!(c.target_bps() < 2_000_000);
+    }
+
+    #[test]
+    fn a_standing_queue_at_capacity_is_never_rebaselined() {
+        let mut c = RateController::new(cfg(25_000_000), 5_000_000, Some(5_000_000));
+        for _ in 0..100 {
+            let i = RateInput {
+                inflight_bytes: Some(5e6 / 8.0 * 0.070),
+                sent_bps: Some(5e6),
+                ..input(40.0, 5e6)
+            };
+            let shift = c.observe_path(ShiftInput {
+                dt: i.dt,
+                delay_ms: 40.0,
+                delivered_bps: i.delivered_bps,
+                sent_bps: i.sent_bps,
+                inflight_bytes: i.inflight_bytes,
+                gated: false,
+            });
+            assert_eq!(shift, None);
+            c.step(i);
+        }
+    }
+
+    #[test]
+    fn a_flat_delay_an_idle_sender_cannot_cause_is_rebaselined() {
+        let mut c = RateController::new(cfg(25_000_000), 4_000_000, Some(4_400_000));
+        let shift = (0..10).find_map(|_| {
+            c.observe_path(ShiftInput {
+                dt: Duration::from_millis(300),
+                delay_ms: 52.0,
+                delivered_bps: Some(200_000.0),
+                sent_bps: Some(200_000.0),
+                inflight_bytes: Some(3_000.0),
+                gated: false,
+            })
+        });
+        assert_eq!(shift, Some(52.0));
+    }
+
     #[test]
     fn fps_steps_down_when_bits_per_pixel_run_short() {
         let px = 2560 * 1440;
@@ -526,6 +766,8 @@ mod tests {
     struct Run {
         /// (time s, target bps, interval delay ms, fps)
         trace: Vec<(f64, f64, f64, u32)>,
+        /// (time s, ms folded into the base RTT)
+        rebaselined: Vec<(f64, f64)>,
     }
 
     impl Run {
@@ -574,6 +816,34 @@ mod tests {
         initial_bps: u32,
         secs: f64,
     ) -> Run {
+        simulate_path(Path {
+            capacity: &capacity,
+            rtt_ms: &|_| base_rtt_ms,
+            jitter_ms,
+            idle: &|_| false,
+            rtt_window_s: f64::INFINITY,
+            ceiling_bps,
+            initial_bps,
+            secs,
+        })
+    }
+
+    struct Path<'a> {
+        capacity: &'a dyn Fn(f64) -> f64,
+        /// Propagation round trip, which a relay can change mid-session.
+        rtt_ms: &'a dyn Fn(f64) -> f64,
+        jitter_ms: f64,
+        /// A static screen: a trickle of small frames and an occasional large repaint.
+        idle: &'a dyn Fn(f64) -> bool,
+        /// Base-RTT bucket width; `RTT_MIN_WINDOW` in `h264.rs` is 30 s.
+        rtt_window_s: f64,
+        ceiling_bps: u32,
+        initial_bps: u32,
+        secs: f64,
+    }
+
+    fn simulate_path(p: Path) -> Run {
+        let jitter_ms = p.jitter_ms;
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         let mut jitter = move || {
             rng ^= rng << 13;
@@ -586,33 +856,48 @@ mod tests {
         let interval = Duration::from_millis(300);
         let tick = 1.0 / f64::from(max_fps);
         let keyframe_natural = 150_000.0f64;
-        let base_rtt_s = base_rtt_ms / 1000.0;
-        let mut c = RateController::new(cfg(ceiling_bps), initial_bps, None);
+        let mut c = RateController::new(cfg(p.ceiling_bps), p.initial_bps, None);
         let mut frames: Vec<Frame> = Vec::new();
         let mut link_free = 0.0f64;
         let mut fps = max_fps;
         let mut fps_changed = 0.0;
         let mut last_pass = -1.0;
         let mut last_keyframe = -100.0;
+        let mut last_repaint = 0.0;
         let mut keyframe_bytes = 0.0;
         let mut last_control = 0.0;
         let mut last_ack = 0.0f64;
-        let mut min_rtt = f64::INFINITY;
+        let mut last_delay = 0.0f64;
+        let (mut min_cur, mut min_prev, mut bucket_at) = (f64::INFINITY, f64::INFINITY, 0.0);
         let mut ewma = 0.0;
         let mut gated = false;
+        let mut sent = 0.0;
         let mut trace = Vec::new();
+        let mut rebaselined = Vec::new();
+        let mut ticks = 0u64;
         let mut now = 0.0;
-        while now < secs {
-            let link_bps = capacity(now);
+        while now < p.secs {
+            let link_bps = (p.capacity)(now);
+            let rtt_s = (p.rtt_ms)(now) / 1000.0;
+            let idle = (p.idle)(now);
             let target = f64::from(c.target_bps());
             let unacked: f64 = frames
                 .iter()
                 .filter(|f| f.acked > now)
                 .map(|f| f.bytes)
                 .sum();
-            let budget = (target / 8.0 * (base_rtt_ms + 80.0) / 1000.0).max(64.0 * 1024.0);
+            // h264.rs budgets on the measured base; the fixed-path scenarios keep the true one.
+            let base_ms = if p.rtt_window_s.is_finite() && min_cur.min(min_prev).is_finite() {
+                min_cur.min(min_prev) * 1000.0
+            } else {
+                (p.rtt_ms)(now)
+            };
+            let budget = (target / 8.0 * (base_ms + 80.0) / 1000.0).max(64.0 * 1024.0);
             let since_pass = Duration::from_secs_f64((now - last_pass).max(0.0));
-            let due = !fps_gate_drops(since_pass, fps, max_fps);
+            let repaint = idle && now - last_repaint >= 4.0;
+            let changed = !idle || ticks.is_multiple_of(4) || repaint;
+            ticks += 1;
+            let due = changed && !fps_gate_drops(since_pass, fps, max_fps);
             gated |= due && unacked > budget;
             if due && unacked <= budget {
                 last_pass = now;
@@ -621,14 +906,20 @@ mod tests {
                     last_keyframe = now;
                     keyframe_bytes = keyframe_natural;
                     keyframe_bytes
+                } else if repaint {
+                    last_repaint = now;
+                    60_000.0
+                } else if idle {
+                    1_500.0
                 } else {
                     target / 8.0 / f64::from(fps)
                 };
+                sent += bytes;
                 link_free = now.max(link_free) + bytes * 8.0 / link_bps;
                 frames.push(Frame {
                     sent: now,
                     bytes,
-                    acked: link_free + base_rtt_s + jitter(),
+                    acked: link_free + rtt_s + jitter(),
                 });
             }
             now += tick;
@@ -636,29 +927,59 @@ mod tests {
                 continue;
             }
             let dt = now - last_control;
-            let window: Vec<&Frame> = frames
+            let own = |f: &Frame| f.bytes * 8.0 / c.serialization_bps();
+            let mut interval_min = f64::INFINITY;
+            let mut delivered_bytes = 0.0;
+            for f in frames
                 .iter()
                 .filter(|f| f.acked > last_control && f.acked <= now)
-                .collect();
-            let own = |f: &Frame| f.bytes * 8.0 / c.serialization_bps();
-            for f in &window {
-                min_rtt = min_rtt.min(f.acked - f.sent);
+            {
+                if f.acked - bucket_at >= p.rtt_window_s {
+                    min_prev = min_cur;
+                    min_cur = f64::INFINITY;
+                    bucket_at = f.acked;
+                }
+                let rtt = f.acked - f.sent;
+                min_cur = min_cur.min(rtt);
+                last_delay = ((rtt - min_cur.min(min_prev) - own(f)) * 1000.0).max(0.0);
+                interval_min = interval_min.min(last_delay);
                 last_ack = last_ack.max(f.acked);
+                delivered_bytes += f.bytes;
             }
-            let interval_min = window
-                .iter()
-                .map(|f| ((f.acked - f.sent - own(f) - min_rtt) * 1000.0).max(0.0))
-                .fold(f64::INFINITY, f64::min);
             let outstanding = frames.iter().any(|f| f.acked > now);
-            let sample = if interval_min.is_finite() {
+            let shipping = now - last_pass < 1.0;
+            let mut sample = if interval_min.is_finite() {
                 interval_min
-            } else if outstanding {
-                (now - last_ack) * 1000.0
             } else {
-                0.0
+                last_delay
             };
+            if outstanding && shipping && !interval_min.is_finite() {
+                sample = sample.max((now - last_ack) * 1000.0);
+            }
+            let delivered = delivered_bytes * 8.0 / dt;
+            let sent_bps = std::mem::take(&mut sent) * 8.0 / dt;
+            let gated_now = std::mem::take(&mut gated);
+            let inflight: f64 = frames
+                .iter()
+                .filter(|f| f.acked > now)
+                .map(|f| f.bytes)
+                .sum();
+            if let Some(ms) = c.observe_path(ShiftInput {
+                dt: Duration::from_secs_f64(dt),
+                delay_ms: sample,
+                delivered_bps: Some(delivered),
+                sent_bps: Some(sent_bps),
+                inflight_bytes: Some(inflight),
+                gated: gated_now,
+            }) {
+                let base = min_cur.min(min_prev) + ms / 1000.0;
+                (min_cur, min_prev, bucket_at) = (base, base, now);
+                sample = (sample - ms).max(0.0);
+                last_delay = (last_delay - ms).max(0.0);
+                ewma = (ewma - ms).max(0.0);
+                rebaselined.push((now, ms));
+            }
             ewma = 0.5 * sample + 0.5 * ewma;
-            let delivered = window.iter().map(|f| f.bytes).sum::<f64>() * 8.0 / dt;
             let allowance = idr_allowance_ms(
                 keyframe_bytes as u64,
                 c.serialization_bps(),
@@ -672,11 +993,12 @@ mod tests {
                 loss: false,
                 usable: true,
                 allowance_ms: allowance,
-                gated: std::mem::take(&mut gated),
+                gated: gated_now,
+                inflight_bytes: Some(inflight),
+                sent_bps: Some(sent_bps),
             });
             if now - fps_changed >= 2.0 {
-                let rate = f64::from(c.target_bps());
-                let next = next_fps_level(fps, max_fps, 10, rate, pixels, 0.05);
+                let next = next_fps_level(fps, max_fps, 10, c.fps_basis_bps(), pixels, 0.05);
                 if next != fps {
                     fps = next;
                     fps_changed = now;
@@ -686,7 +1008,7 @@ mod tests {
             last_control = now;
             frames.retain(|f| f.acked > now - 1.0);
         }
-        Run { trace }
+        Run { trace, rebaselined }
     }
 
     fn report(name: &str, run: &Run, capacity: f64, from: f64, to: f64) {
@@ -726,6 +1048,42 @@ mod tests {
         );
         assert!(run.p95_delay(from, to) < 60.0, "{name}: queue too deep");
         assert!(run.swing(from, to) < 0.3, "{name}: sawtooth");
+        assert!(
+            run.rebaselined.is_empty(),
+            "{name}: a queue was taken for path latency: {:?}",
+            run.rebaselined
+        );
+    }
+
+    /// A relayed 5 Mbit path whose round trip and screen activity change over time.
+    fn relayed(rtt_ms: &dyn Fn(f64) -> f64, idle: &dyn Fn(f64) -> bool, secs: f64) -> Run {
+        simulate_path(Path {
+            capacity: &|_| 5e6,
+            rtt_ms,
+            jitter_ms: 0.0,
+            idle,
+            rtt_window_s: 30.0,
+            ceiling_bps: 25_000_000,
+            initial_bps: 8_000_000,
+            secs,
+        })
+    }
+
+    /// From `from` on the rate stays near capacity and the frame rate where the busy link had it.
+    fn assert_unharmed(name: &str, run: &Run, from: f64, to: f64) {
+        let fps = run.window(from - 5.0, from - 4.0)[0].3;
+        let w = run.window(from, to);
+        let low = w.iter().map(|s| s.1).fold(f64::MAX, f64::min);
+        let min_fps = w.iter().map(|s| s.3).min().unwrap();
+        eprintln!(
+            "{name}: lowest rate {:.2} Mbit ({:.0}% of capacity), lowest fps {min_fps} (was {fps}), rebaselined {:?}",
+            low / 1e6,
+            low / 5e6 * 100.0,
+            run.rebaselined
+        );
+        report(name, run, 5e6, from, to);
+        assert!(low >= 0.7 * 5e6, "{name}: rate fell to {low}");
+        assert!(min_fps >= fps, "{name}: fps fell to {min_fps} from {fps}");
     }
 
     #[test]
@@ -803,5 +1161,39 @@ mod tests {
         report("6 -> 30 Mbit, climbing", &run, 30e6, 29.0, 52.0);
         assert!(reach < 20.0, "took {reach} s");
         assert_converged("6 -> 30 Mbit", &run, 30e6, 60.0, 90.0);
+    }
+
+    #[test]
+    fn an_idle_screen_keeps_the_rate_on_a_relayed_link() {
+        let run = relayed(&|_| 30.0, &|t| t >= 20.0, 60.0);
+        assert_unharmed("idle screen, 5 Mbit relayed", &run, 20.0, 60.0);
+        assert!(run.rebaselined.is_empty(), "{:?}", run.rebaselined);
+    }
+
+    #[test]
+    fn a_relay_rtt_step_is_rebaselined_not_cut() {
+        let run = relayed(&|t| if t < 30.0 { 30.0 } else { 117.0 }, &|_| false, 70.0);
+        let (at, ms) = *run.rebaselined.first().expect("never rebaselined");
+        assert!(
+            at - 30.0 <= 3.0,
+            "rebaselined {ms} ms after {} s",
+            at - 30.0
+        );
+        // The base already held some serialization time, so less than the 87 ms step reads as delay.
+        assert!((50.0..=87.0).contains(&ms), "folded {ms} ms");
+        assert_unharmed("busy screen, RTT 30 -> 117 ms", &run, 33.0, 70.0);
+        assert!(run.p95_delay(33.0, 70.0) < 60.0, "queue left standing");
+    }
+
+    #[test]
+    fn an_idle_screen_survives_a_relay_rtt_step() {
+        let run = relayed(
+            &|t| if t < 30.0 { 30.0 } else { 117.0 },
+            &|t| t >= 20.0,
+            70.0,
+        );
+        let (at, _) = *run.rebaselined.first().expect("never rebaselined");
+        assert!(at - 30.0 <= 3.0, "rebaselined after {} s", at - 30.0);
+        assert_unharmed("idle screen, RTT 30 -> 117 ms", &run, 20.0, 70.0);
     }
 }

@@ -381,9 +381,21 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   again without a sawtooth. Growth is capped at twice
                           #   the recent delivered rate (an idle screen proves
                           #   nothing), and captures held back by the unacked-byte
-                          #   budget count as a full link. --bitrate is only the
-                          #   ceiling; no per-network tuning is needed.
-                          #   Frame rate: when the bitrate leaves fewer than
+                          #   budget count as a full link. A sender well under
+                          #   its target is the screen's doing: its cuts come off
+                          #   the target, not the little it delivered, and a delay
+                          #   it has too few unacked bytes to cause is not cut on.
+                          #   Cuts stay above 70% of the remembered capacity for
+                          #   3 s unless loss or a busy link delivering half of
+                          #   it says otherwise. A delay that stands flat for
+                          #   ~2 s while the unacked bytes or the cut rate rule
+                          #   out a queue is path latency (a relay change): the
+                          #   min RTT is re-baselined to it at once and the
+                          #   capacity from before the episode restored.
+                          #   --bitrate is only the ceiling; no per-network
+                          #   tuning is needed.
+                          #   Frame rate: when the bitrate (or, off congestion,
+                          #   92% of the remembered capacity) leaves fewer than
                           #   MACRDP_ADAPTIVE_MIN_BPP (default 0.02) bits per pixel
                           #   per frame, the capture rate steps down (60 -> 30 ->
                           #   20 -> 15 -> 10, floored at MACRDP_ADAPTIVE_FLOOR_FPS)
