@@ -1333,8 +1333,9 @@ fn split_strips(x: u16, y: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
 mod macos {
     use super::*;
 
+    use crate::capture_watchdog::{CaptureWatchdog, Observation, RebuildHistory};
     use crate::damage::{Damage, Rect};
-    use crate::sck_stream::{CaptureStream, StreamParams};
+    use crate::sck_stream::{CaptureStream, StreamHealth, StreamParams};
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::AsyncSCShareableContent;
     use screencapturekit::cv::CVPixelBufferLockFlags;
@@ -1635,6 +1636,7 @@ mod macos {
     /// resizes and fallbacks; this only feeds video, and stops when dropped.
     pub struct SecondaryCapture {
         task: tokio::task::JoinHandle<()>,
+        health: StreamHealth,
     }
 
     impl Drop for SecondaryCapture {
@@ -1654,6 +1656,7 @@ mod macos {
         ) -> Result<Self> {
             let display = find_sck_display(Some(display_id)).await?;
             let stream = start_stream(&display, width, height, fps, false)?;
+            let health = stream.health();
             let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let label = format!("m{}", output + 1);
             let task = tokio::spawn(async move {
@@ -1734,7 +1737,7 @@ mod macos {
                     }
                 }
             });
-            Ok(Self { task })
+            Ok(Self { task, health })
         }
     }
 
@@ -1885,12 +1888,62 @@ mod macos {
         remode: Option<super::PrimaryRemode>,
         display_id: u32,
         fps: u32,
+        /// Every capture of the session, primary first, for the watchdog.
+        health: Vec<StreamHealth>,
+        watchdog: CaptureWatchdog,
     }
 
     impl ScreenCaptureUpdates {
         pub fn with_secondaries(mut self, secondaries: Vec<SecondaryCapture>) -> Self {
+            self.health
+                .extend(secondaries.iter().map(|s| s.health.clone()));
             self.secondaries = secondaries;
             self
+        }
+
+        /// True when a capture of this session stayed down long enough to rebuild.
+        fn capture_stalled(&mut self) -> bool {
+            let stream_down = self.health.iter().any(StreamHealth::is_down);
+            let obs = Observation {
+                stream_down,
+                // Only asked when it matters: it lists the displays.
+                displays_awake: !stream_down || !crate::virtual_display::any_display_asleep(),
+                active: !self
+                    .display_suppressed
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed)),
+            };
+            self.watchdog.observe(Instant::now(), obs)
+        }
+
+        /// A same-size reactivation, whose `updates()` rebuilds the display and captures.
+        fn rebuild_capture(&mut self) -> DisplayUpdate {
+            let (width, height) = self.desktop_size.get();
+            self.suppress_next_adopt.store(true, Ordering::Relaxed);
+            if let Some(gfx) = self.gfx.as_ref() {
+                gfx.reset_for_live_resize();
+            }
+            tracing::warn!(
+                width,
+                height,
+                display_id = self.display_id,
+                "rebuilding the capture through a reactivation"
+            );
+            DisplayUpdate::Resize(DesktopSize { width, height })
+        }
+
+        /// The next sample, waking every watchdog poll; `Err` asks for a rebuild.
+        async fn next_sample_watched(
+            &mut self,
+        ) -> std::result::Result<Option<screencapturekit::cm::CMSampleBuffer>, ()> {
+            loop {
+                match tokio::time::timeout(crate::capture_watchdog::POLL, self.stream.next()).await
+                {
+                    Ok(sample) => return Ok(sample),
+                    Err(_) if self.capture_stalled() => return Err(()),
+                    Err(_) => {}
+                }
+            }
         }
 
         /// Re-modes the display for a live resize and opens the capture that
@@ -2140,6 +2193,7 @@ mod macos {
                 flag.store(false, Ordering::Relaxed);
             }
 
+            let health = vec![stream.health()];
             Ok(Self {
                 stream,
                 secondaries: Vec::new(),
@@ -2174,6 +2228,8 @@ mod macos {
                 damage: Damage::default(),
                 last_damage: Damage::Full,
                 remode,
+                health,
+                watchdog: CaptureWatchdog::new(RebuildHistory::global()),
                 display_id,
                 fps,
             })
@@ -2329,6 +2385,10 @@ mod macos {
                     })));
                 }
 
+                if self.capture_stalled() {
+                    return Ok(Some(self.rebuild_capture()));
+                }
+
                 if self.ship_held_frame() {
                     continue;
                 }
@@ -2447,9 +2507,10 @@ mod macos {
                         }
                     }
                 } else {
-                    match self.stream.next().await {
-                        Some(sample) => sample,
-                        None => return Ok(None),
+                    match self.next_sample_watched().await {
+                        Ok(Some(sample)) => sample,
+                        Ok(None) => return Ok(None),
+                        Err(()) => return Ok(Some(self.rebuild_capture())),
                     }
                 };
 

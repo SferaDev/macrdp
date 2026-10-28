@@ -83,6 +83,8 @@ struct Shared {
     stopping: Mutex<bool>,
     /// Arrival time of the sample last taken from the queue.
     taken_arrival_ns: AtomicU64,
+    /// When SCK stopped the stream, until a restart succeeds; kept if it never does.
+    down_since: Mutex<Option<Instant>>,
 }
 
 impl Shared {
@@ -140,6 +142,11 @@ impl SCStreamDelegateTrait for Delegate {
             return;
         }
         tracing::warn!(display_id = shared.display_id.load(Ordering::Relaxed), %error, "SCK stopped the capture; restarting it once the display is back");
+        shared
+            .down_since
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
         let weak = self.0.clone();
         let spawned = std::thread::Builder::new()
             .name("sck-restart".into())
@@ -216,6 +223,7 @@ fn restart(weak: Weak<Shared>) {
             Ok(stream) => {
                 let old = shared.stream.lock().unwrap().replace(stream);
                 drop(old);
+                *shared.down_since.lock().unwrap() = None;
                 tracing::info!(
                     display_id = shared.display_id.load(Ordering::Relaxed),
                     after_ms = started.elapsed().as_millis() as u64,
@@ -249,6 +257,7 @@ impl CaptureStream {
             stream: Mutex::new(None),
             stopping: Mutex::new(false),
             taken_arrival_ns: AtomicU64::new(0),
+            down_since: Mutex::new(None),
         });
         let stream = open(&shared, display)?;
         *shared.stream.lock().unwrap() = Some(stream);
@@ -271,11 +280,30 @@ impl CaptureStream {
         self.shared.taken_arrival_ns.load(Ordering::Relaxed)
     }
 
+    /// A handle that reports whether this capture is down, for the watchdog.
+    pub fn health(&self) -> StreamHealth {
+        StreamHealth(Arc::downgrade(&self.shared))
+    }
+
     pub fn stop_capture(&self) -> Result<(), SCError> {
         *self.shared.stopping.lock().unwrap() = true;
         match self.shared.stream.lock().unwrap().as_ref() {
             Some(s) => s.stop_capture(),
             None => Ok(()),
+        }
+    }
+}
+
+/// Whether a capture is down: SCK stopped it and no restart has succeeded, or
+/// the capture is gone while its session still runs.
+#[derive(Clone)]
+pub struct StreamHealth(Weak<Shared>);
+
+impl StreamHealth {
+    pub fn is_down(&self) -> bool {
+        match self.0.upgrade() {
+            None => true,
+            Some(s) => !*s.stopping.lock().unwrap() && s.down_since.lock().unwrap().is_some(),
         }
     }
 }

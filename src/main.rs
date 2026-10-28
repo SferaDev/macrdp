@@ -18,6 +18,7 @@ mod aux_coder;
 mod avc444;
 mod camera;
 mod capture;
+mod capture_watchdog;
 mod clipboard;
 mod clipboard_image;
 mod clipboard_rich;
