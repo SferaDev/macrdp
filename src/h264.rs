@@ -207,27 +207,28 @@ fn queue_delay_fold(sample_ms: f64, bucket_min_ms: f64, prev_bucket_min_ms: f64)
     (cur, (sample_ms - base).max(0.0))
 }
 
-/// The controller's effective congestion sample for one interval: the latest
+/// The controller's effective congestion sample for one interval: the windowed
 /// ack-derived queue delay, floored by the **no-ack fallback** — when frames
 /// are outstanding and we're actively shipping but acks have gone quiet, the
-/// time since the last ack is itself a lower bound on the standing delay.
+/// oldest unacked frame's wait past the base RTT is itself a lower bound on the
+/// standing delay.
 /// Without this, TOTAL saturation goes dark: a fully choked pipe delivers so
 /// few frames that acks stop entirely → no RTT samples → `queue_delay_ms`
 /// freezes at its last (healthy) value and the controller reads a drowning
 /// link as clean (observed live on a shaped 500 Kbit pipe 2026-07-04: ack lag
-/// grew 275→4746 while the sampled delay stayed 0.0). On a healthy link acks
-/// arrive continuously, so `since_ack_ms` is just the tiny inter-ack gap and
-/// the max() is a no-op; with nothing outstanding (static screen) or shipping
+/// grew 275→4746 while the sampled delay stayed 0.0). On a healthy link the
+/// oldest frame is younger than the base RTT, so `waiting_ms` is 0 and the
+/// max() is a no-op; with nothing outstanding (static screen) or shipping
 /// stopped (suppressed), the fallback is skipped so idle never reads as
 /// congestion. Pure, unit-tested.
 fn effective_queue_delay(
     queue_delay_ms: f64,
-    since_ack_ms: f64,
+    waiting_ms: f64,
     outstanding: bool,
     actively_shipping: bool,
 ) -> f64 {
     if outstanding && actively_shipping {
-        queue_delay_ms.max(since_ack_ms)
+        queue_delay_ms.max(waiting_ms)
     } else {
         queue_delay_ms
     }
@@ -382,7 +383,7 @@ struct ConnectionContext {
     rtt_min_prev_ms: f64,
     rtt_bucket_started: Instant,
     /// Latest ack's queue delay: `sample_rtt − windowed_min_rtt`, in ms. THE
-    /// adaptive controller's congestion signal (EWMA'd per control interval).
+    /// adaptive controller's congestion signal (via `delay_window`'s windowed minimum).
     /// Time-based, not frame-count: frames-in-flight scales with RTT × fps, so
     /// the old `shipped − acked` count read a long-but-CLEAN pipe (VPN /
     /// ZeroTier at ~240 ms RTT ⇒ ~14 frames in flight at 60 fps) as permanent
@@ -421,8 +422,8 @@ struct ConnectionContext {
     idr_backed_off: bool,
     /// The delay-targeted controller that owns `adaptive_target_bps`.
     rate: crate::rate_control::RateController,
-    /// Smallest queue-delay sample since the last control step, so one late ack does not read as a queue.
-    delay_interval_min: f64,
+    /// Recent per-ack queue delays; their windowed minimum is the controller's signal, so jitter does not read as a queue.
+    delay_window: crate::rate_control::DelayWindow,
     /// `acked_bytes` at the last control step; the difference over the interval is the delivery rate.
     rate_acked_mark: u64,
     /// `ShipLog::shipped_bytes` at the last control step, for the send rate.
@@ -452,12 +453,8 @@ struct ConnectionContext {
     /// signal is ignored (the connect-time startup backlog isn't congestion).
     /// `None` until the first ack. See [`Gfx::adaptive_bitrate_step`].
     adaptive_warmup_until: Option<Instant>,
-    /// EWMA of the queue-delay signal, in ms (only updated while acks are
-    /// usable, so the connect-time backlog never enters it). Fed to
-    /// [`congested_hysteresis`]. See [`ConnectionContext::queue_delay_ms`].
-    adaptive_delay_ewma: f64,
-    /// Hysteresis state: whether the controller is currently in a congestion episode
-    /// (enters when the EWMA lag clears the high mark, exits below the low mark).
+    /// Whether the controller holds a confirmed congestion episode (see
+    /// [`crate::rate_control::RateController::congested`]) or saw loss this interval.
     adaptive_congested: bool,
     /// P2b: when the last capture was let through under the frame-rate floor (the
     /// fps cap that engages once bitrate is at the floor and the link is still
@@ -1196,39 +1193,6 @@ fn retransmit_is_lossy(retransmit_delta: u64, tolerance: u64) -> bool {
     retransmit_delta > tolerance
 }
 
-/// Pure congestion decision with EWMA smoothing + hysteresis. `ewma_lag` is the
-/// exponentially-smoothed frame-ack lag (shipped − acked); the caller smooths the raw
-/// per-interval lag so a single spike doesn't trip a back-off (raw TCP ack-lag bursts
-/// 0↔40 even at moderate loss, which a naive threshold turns into visible bitrate
-/// pumping). **Hysteresis:** enter congestion when `ewma_lag` crosses `high`, then stay
-/// congested until it falls below `low` (`low < high`) — so the bitrate doesn't
-/// flip-flop while the signal straddles one threshold. `retransmit_lossy` (UDP — the
-/// caller has already applied the per-interval retransmit *tolerance*, so this is
-/// "loss above the wireless background", not "any retransmit") forces congested
-/// immediately (a definite loss, no smoothing). With acks unusable (suspended / not yet
-/// seen / cold-start warmup), the lag is uninferable so only the retransmit signal
-/// counts. Unit-tested. See [`Gfx::adaptive_bitrate_step`].
-fn congested_hysteresis(
-    ewma_lag: f64,
-    high: f64,
-    low: f64,
-    retransmit_lossy: bool,
-    acks_usable: bool,
-    currently_congested: bool,
-) -> bool {
-    if retransmit_lossy {
-        return true;
-    }
-    if !acks_usable {
-        return false;
-    }
-    if currently_congested {
-        ewma_lag > low // stay congested until the smoothed lag drops below the low mark
-    } else {
-        ewma_lag > high // only enter once the smoothed lag clears the high mark
-    }
-}
-
 /// The VideoToolbox bitrate that gives each frame `target_bps / fps_level` bits: its
 /// rate control counts frames at `max_fps`, so fewer frames would otherwise mean fewer bits.
 fn encoder_bitrate(target_bps: u32, max_fps: u32, fps_level: u32) -> u32 {
@@ -1430,12 +1394,6 @@ pub struct Gfx {
     /// the controller let a relayed link sit at 160 ms before reacting;
     /// `MACRDP_ADAPTIVE_QUEUE_HIGH_MS` overrides.
     adaptive_queue_high_ms: f64,
-    /// EWMA weight on each new queue-delay sample in (0,1]: `ewma = α·sample +
-    /// (1−α)·ewma`, applied to each interval's minimum sample. Lower = more
-    /// smoothing (slower reaction). Default 0.5;
-    /// `MACRDP_ADAPTIVE_EWMA_ALPHA` overrides. The hysteresis exit threshold is
-    /// half the entry threshold.
-    adaptive_ewma_alpha: f64,
     /// Retransmit tolerance (per control interval) for the UDP loss signal. The
     /// reliable tunnel retransmits on *any* packet loss, and a wireless link (WiFi)
     /// has near-continuous low-level loss, so treating a single retransmit as
@@ -1592,10 +1550,6 @@ impl Gfx {
         let adaptive_queue_low_ms = env_f64("MACRDP_ADAPTIVE_QUEUE_LOW_MS")
             .filter(|&n| n > 0.0 && n < adaptive_queue_high_ms)
             .unwrap_or(adaptive_queue_high_ms * 0.6);
-        // EWMA smoothing weight for the queue-delay signal (clamped to (0,1]); default 0.5.
-        let adaptive_ewma_alpha = env_f64("MACRDP_ADAPTIVE_EWMA_ALPHA")
-            .filter(|&a| a > 0.0 && a <= 1.0)
-            .unwrap_or(0.5);
         // 0.02 keeps 30 fps for a 3024x1898 desktop on a ~6 Mbit relayed path; a keystroke waits at most one frame.
         let adaptive_min_bpp = env_f64("MACRDP_ADAPTIVE_MIN_BPP")
             .filter(|&n| n >= 0.0)
@@ -1746,7 +1700,6 @@ impl Gfx {
                 interval_ms = adaptive_interval.as_millis() as u64,
                 queue_low_ms = adaptive_queue_low_ms,
                 queue_high_ms = adaptive_queue_high_ms,
-                ewma_alpha = adaptive_ewma_alpha,
                 min_bpp = adaptive_min_bpp,
                 idr_share = adaptive_idr_share,
                 normal_keyframe_frames,
@@ -1787,7 +1740,6 @@ impl Gfx {
             adaptive_floor_fps,
             adaptive_idr_share,
             adaptive_queue_high_ms,
-            adaptive_ewma_alpha,
             adaptive_retx_tolerance,
             stretched_keyframe_frames,
             congestion_retransmits,
@@ -2520,8 +2472,8 @@ impl Gfx {
                 target_bps = ctx.adaptive_target_bps,
                 "EGFX left the UDP tunnel; restoring bitrate + normal keyframe for the TCP path"
             );
-            // Stale UDP-side smoothing state doesn't apply to the fresh TCP path.
-            ctx.adaptive_delay_ewma = 0.0;
+            // Stale UDP-side samples don't apply to the fresh TCP path.
+            ctx.delay_window = crate::rate_control::DelayWindow::default();
             ctx.adaptive_congested = false;
         }
         ctx.adaptive_on_udp = on_udp;
@@ -2547,9 +2499,9 @@ impl Gfx {
         // congestion (frames-in-flight = RTT × fps, so a clean 240 ms VPN link
         // at 60 fps sat permanently over the frame threshold → the controller
         // crater-climb oscillated between floor and ceiling; diagnosed live
-        // under a shaped 240 ms/2 Mbit link 2026-07-04). The interval minimum
-        // drops jitter and single late acks; a queue that stands lifts every
-        // sample, so it still shows.
+        // under a shaped 240 ms/2 Mbit link 2026-07-04). The minimum over a
+        // window of several frames drops relay jitter and late acks; a queue
+        // that stands lifts every sample, so it still shows.
         let ack_lag = ctx
             .last_shipped_frame_id
             .load(Ordering::Relaxed)
@@ -2561,23 +2513,44 @@ impl Gfx {
         // drowning link as clean (observed live on a shaped 500 Kbit pipe:
         // ack lag grew into the thousands, sampled delay pinned 0.0, ZERO acks
         // the whole session). While frames are outstanding and we're actively
-        // shipping, the time since the last REAL ack (or since connect, if
-        // there's never been one) is a lower bound on the standing delay; on a
-        // healthy link it's just the tiny inter-ack gap.
+        // shipping, the oldest unacked frame's wait past the base RTT (its age
+        // alone before any RTT sample) is a lower bound on the standing delay.
+        // Time since the last ack is not: on a sparse static screen it counts
+        // the idle gap before the newest frame, which on a jittery relay read
+        // as a 50-150 ms queue and cut a 13 Mbit path to 1 Mbit.
         let outstanding = ack_lag > 0;
         let actively_shipping =
             now.saturating_duration_since(ctx.last_ship_at) < Duration::from_secs(1);
-        let interval_min = std::mem::replace(&mut ctx.delay_interval_min, f64::INFINITY);
-        let mut sample_ms = effective_queue_delay(
-            if interval_min.is_finite() {
-                interval_min
+        // Acks this interval carry their own samples; the bound is for acks that have gone quiet.
+        let acks_quiet = now.saturating_duration_since(ctx.last_ack_advance_at) >= dt;
+        let base_ms = ctx.rtt_min_cur_ms.min(ctx.rtt_min_prev_ms);
+        let waiting_ms = {
+            let oldest = ctx.last_acked_frame_id.load(Ordering::Relaxed) + 1;
+            let slot = ctx.ship_times.lock().unwrap().slot(oldest);
+            if slot.id == oldest {
+                let own_ms =
+                    slot.bytes as f64 * 8.0 / ctx.rate.serialization_bps().max(1.0) * 1000.0;
+                let age_ms = now.saturating_duration_since(slot.at).as_secs_f64() * 1000.0;
+                (age_ms - if base_ms.is_finite() { base_ms } else { 0.0 } - own_ms).max(0.0)
             } else {
-                ctx.queue_delay_ms
-            },
-            now.saturating_duration_since(ctx.last_ack_advance_at)
-                .as_secs_f64()
-                * 1000.0,
-            outstanding,
+                0.0
+            }
+        };
+        let since_connect = ctx.epoch.elapsed();
+        let windowed_ms = ctx.delay_window.min_ms(since_connect).unwrap_or(0.0);
+        let mut sample_ms = effective_queue_delay(
+            windowed_ms,
+            waiting_ms,
+            outstanding && acks_quiet,
+            actively_shipping,
+        );
+        // The path-latency detector reads this interval alone, so a relay step shows without the window's lag.
+        let mut interval_ms = effective_queue_delay(
+            ctx.delay_window
+                .min_since(since_connect.saturating_sub(dt))
+                .unwrap_or(windowed_ms),
+            waiting_ms,
+            outstanding && acks_quiet,
             actively_shipping,
         );
         // Distress makes the signal usable even when acks aren't: shipping into
@@ -2607,7 +2580,7 @@ impl Gfx {
             .then(|| {
                 ctx.rate.observe_path(crate::rate_control::ShiftInput {
                     dt,
-                    delay_ms: sample_ms,
+                    delay_ms: interval_ms,
                     delivered_bps,
                     sent_bps,
                     inflight_bytes,
@@ -2615,15 +2588,15 @@ impl Gfx {
                 })
             })
             .flatten();
-        let base_ms = ctx.rtt_min_cur_ms.min(ctx.rtt_min_prev_ms);
         if let Some(shift_ms) = shift.filter(|_| base_ms.is_finite()) {
             // The path itself got slower (a relay change): the new round trip is the base, not a queue.
             ctx.rtt_min_cur_ms = base_ms + shift_ms;
             ctx.rtt_min_prev_ms = base_ms + shift_ms;
             ctx.rtt_bucket_started = now;
             ctx.queue_delay_ms = (ctx.queue_delay_ms - shift_ms).max(0.0);
-            ctx.adaptive_delay_ewma = (ctx.adaptive_delay_ewma - shift_ms).max(0.0);
+            ctx.delay_window.rebase(shift_ms);
             sample_ms = (sample_ms - shift_ms).max(0.0);
+            interval_ms = (interval_ms - shift_ms).max(0.0);
             info!(
                 shift_ms,
                 base_rtt_ms = base_ms + shift_ms,
@@ -2631,13 +2604,7 @@ impl Gfx {
                 "EGFX standing delay is path latency; re-baselined the min RTT"
             );
         }
-        // Only fold real samples into the EWMA — during warmup (and idle
-        // no-ack periods) the delay is startup backlog / silence, not
-        // congestion, and must not pre-load the average.
-        if signal_usable {
-            ctx.adaptive_delay_ewma = self.adaptive_ewma_alpha * sample_ms
-                + (1.0 - self.adaptive_ewma_alpha) * ctx.adaptive_delay_ewma;
-        }
+        let jitter_ms = ctx.delay_window.jitter_ms();
         let keyframe = ctx.ship_times.lock().unwrap().keyframe;
         let allowance_ms = keyframe.map_or(0.0, |(bytes, at)| {
             crate::rate_control::idr_allowance_ms(
@@ -2651,7 +2618,8 @@ impl Gfx {
         // adjusted-line below only logs on a change; Hold periods were opaque).
         trace!(
             queue_ms = sample_ms,
-            ewma_queue_ms = ctx.adaptive_delay_ewma,
+            interval_queue_ms = interval_ms,
+            jitter_ms,
             delivered_bps,
             allowance_ms,
             gated,
@@ -2665,27 +2633,21 @@ impl Gfx {
         );
         let verdict = ctx.rate.step(crate::rate_control::RateInput {
             dt,
-            delay_ms: ctx.adaptive_delay_ewma,
+            delay_ms: sample_ms,
             delivered_bps,
             loss: retransmit_lossy,
             usable: signal_usable,
             allowance_ms,
             gated,
-            inflight_bytes,
             sent_bps,
+            jitter_ms,
         });
         let new_target = ctx.rate.target_bps();
         let low = self.adaptive_queue_low_ms;
-        let congested = congested_hysteresis(
-            ctx.adaptive_delay_ewma,
-            self.adaptive_queue_high_ms + allowance_ms,
-            low,
-            retransmit_lossy,
-            signal_usable,
-            ctx.adaptive_congested,
-        );
+        // The keyframe backoff and frame-rate floor follow the cuts' own evidence, so jitter alone never trips them.
+        let congested = retransmit_lossy || ctx.rate.congested();
         ctx.adaptive_congested = congested;
-        let calm_now = signal_usable && !congested && ctx.adaptive_delay_ewma <= low;
+        let calm_now = signal_usable && !congested && sample_ms <= low;
         ctx.calm_since = calm_now.then(|| ctx.calm_since.unwrap_or(now));
         let calm = ctx
             .calm_since
@@ -2704,7 +2666,7 @@ impl Gfx {
             debug!(
                 transport = if on_udp { "udp" } else { "tcp" },
                 queue_ms = sample_ms,
-                ewma_queue_ms = ctx.adaptive_delay_ewma,
+                jitter_ms,
                 delivered_bps,
                 capacity_bps = ctx.rate.capacity_bps(),
                 slow_start = ctx.rate.in_slow_start(),
@@ -3982,7 +3944,7 @@ impl GfxServerFactory for Gfx {
             adaptive_last_retransmits: self.congestion_retransmits.load(Ordering::Relaxed),
             idr_backed_off: false,
             rate,
-            delay_interval_min: f64::INFINITY,
+            delay_window: crate::rate_control::DelayWindow::default(),
             rate_acked_mark: 0,
             rate_shipped_mark: 0,
             inflight_gated: false,
@@ -3995,7 +3957,6 @@ impl GfxServerFactory for Gfx {
             encoder_bps_applied: 0,
             adaptive_on_udp: self.egfx_on_udp.load(Ordering::Relaxed),
             adaptive_warmup_until: None,
-            adaptive_delay_ewma: 0.0,
             adaptive_congested: false,
             last_floor_fps_pass: Instant::now(),
             qoe: QoeEvidence::default(),
@@ -4235,7 +4196,8 @@ impl GraphicsPipelineHandler for GfxHandler {
                         queue_delay_fold(sample_ms, ctx.rtt_min_cur_ms, ctx.rtt_min_prev_ms);
                     ctx.rtt_min_cur_ms = cur_min;
                     ctx.queue_delay_ms = (delay - own_ms).max(0.0);
-                    ctx.delay_interval_min = ctx.delay_interval_min.min(ctx.queue_delay_ms);
+                    ctx.delay_window
+                        .push(ctx.epoch.elapsed(), ctx.queue_delay_ms);
                 }
             }
         }
@@ -4815,51 +4777,6 @@ mod tests {
                                             // tolerance 0 restores the old "any retransmit = loss" behaviour.
         assert!(!retransmit_is_lossy(0, 0));
         assert!(retransmit_is_lossy(1, 0));
-    }
-
-    // congested_hysteresis(ewma_lag, high, low, retransmit_lossy, acks_usable, currently)
-    #[test]
-    fn hysteresis_enters_only_above_high() {
-        // Not yet congested: enter only once the smoothed lag clears the HIGH mark.
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // below high
-        assert!(!congested_hysteresis(12.0, 12.0, 6.0, false, true, false)); // exactly at
-        assert!(congested_hysteresis(13.0, 12.0, 6.0, false, true, false)); // above high
-    }
-
-    #[test]
-    fn hysteresis_stays_until_below_low() {
-        // Already congested: stay through the (low, high] band, exit at or below low.
-        assert!(congested_hysteresis(9.0, 12.0, 6.0, false, true, true)); // in the band → stay
-        assert!(congested_hysteresis(7.0, 12.0, 6.0, false, true, true)); // just above low → stay
-        assert!(!congested_hysteresis(6.0, 12.0, 6.0, false, true, true)); // at low → exit
-        assert!(!congested_hysteresis(5.0, 12.0, 6.0, false, true, true)); // below low → exit
-    }
-
-    #[test]
-    fn hysteresis_retransmit_forces_congested() {
-        // Loss above the tolerance is a definite loss → congested regardless of lag/acks.
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, true, false));
-        assert!(congested_hysteresis(0.0, 12.0, 6.0, true, false, false)); // even acks-unusable
-    }
-
-    #[test]
-    fn hysteresis_ignores_lag_when_acks_unusable() {
-        // Acks suspended / cold-start: lag uninferable → not congested (no retransmit),
-        // and a stale-high EWMA can't keep an episode latched.
-        assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, false
-        ));
-        assert!(!congested_hysteresis(
-            10_000.0, 12.0, 6.0, false, false, true
-        ));
-    }
-
-    #[test]
-    fn hysteresis_transport_specific_high() {
-        // Same smoothed lag enters congestion at the UDP high (8) but not the TCP high
-        // (12) — TCP's send buffer adds baseline depth, so it needs a higher mark.
-        assert!(congested_hysteresis(10.0, 8.0, 4.0, false, true, false)); // UDP
-        assert!(!congested_hysteresis(10.0, 12.0, 6.0, false, true, false)); // TCP
     }
 
     // rate_action(ewma_lag, high, retransmit_lossy, acks_usable, congested)
@@ -5833,10 +5750,10 @@ mod tests {
 
     #[test]
     fn no_ack_fallback_floors_the_sample_when_acks_go_quiet() {
-        // Total saturation: acks silent 3 s while shipping with frames
-        // outstanding → the fallback dominates the stale sampled delay.
+        // Total saturation: the oldest frame waited 3 s past the base RTT while
+        // shipping → the fallback dominates the stale sampled delay.
         assert_eq!(effective_queue_delay(4.0, 3000.0, true, true), 3000.0);
-        // Healthy link: since-last-ack is the tiny inter-ack gap → no-op.
+        // A short wait only floors the sample.
         assert_eq!(effective_queue_delay(4.0, 16.0, true, true), 16.0);
         assert_eq!(effective_queue_delay(40.0, 16.0, true, true), 40.0);
         // Nothing outstanding (all acked, e.g. static screen): idle silence is
