@@ -183,7 +183,7 @@ fn watch_wake(wake: bool) {
     crate::connect_timeline::mark(crate::connect_timeline::Step::Awake);
     tracing::info!(waited_ms, "woke the displays for a connecting client");
     #[cfg(target_os = "macos")]
-    crate::sck_stream::warm_up();
+    crate::sck_stream::warm_up("connect wake");
 }
 
 /// Called once a client authenticates, ahead of its capture: holds the displays

@@ -667,6 +667,17 @@ monitor only.
 ```
 MACRDP_REMEMBER_VD_MODE=1  # 0/off: always start at --width/--height
 ```
+
+SCK display cache (env, settable through `config.env` as `SCK_DISPLAY_CACHE`). Every SCK
+listing caches the `SCDisplay`s it saw, and a background thread lists SCK at startup and
+again within a second of the displays waking or changing. A capture start then builds its
+filter from the cached display when CoreGraphics still reports that id online at the same
+point size, skipping the listing that blocks for seconds after a display wake. If the capture
+fails to start from the cached display, it lists SCK as before. The connect timeline's
+`sck=` field says which path the primary capture took: `cached`, `listed` or `relisted`.
+```
+MACRDP_SCK_DISPLAY_CACHE=1  # 0/off: list SCK on every capture start
+```
 Trace stages, per monitor `mN` (`m0` = primary): `sck_age` (host clock now minus
 the SCK sample's presentation time, at dequeue, when positive), `sck_lead` (the same
 when the sample arrives ahead of its presentation time, as SCK delivers it early),

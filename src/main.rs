@@ -59,6 +59,8 @@ mod rdpdr;
 mod reaper;
 #[cfg(target_os = "macos")]
 mod runloop_thread;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod sck_display_cache;
 mod sck_stream;
 mod scroll;
 mod shield;
@@ -2606,6 +2608,7 @@ fn args_from_config(path: &Path) -> Result<Args> {
         ("VD_REFRESH_HZ", "MACRDP_VD_REFRESH_HZ"),
         ("REMEMBER_VD_MODE", "MACRDP_REMEMBER_VD_MODE"),
         ("SCK_PACED", "MACRDP_SCK_PACED"),
+        ("SCK_DISPLAY_CACHE", "MACRDP_SCK_DISPLAY_CACHE"),
         (
             "BLANK_RECOVERY_MIN_RENDER_REPORTS",
             "MACRDP_BLANK_RECOVERY_MIN_RENDER_REPORTS",
@@ -3847,6 +3850,8 @@ async fn async_main() -> Result<()> {
         domain: None,
     }));
 
+    #[cfg(target_os = "macos")]
+    sck_display_cache::start_watcher();
     info!(
         addr = %args.bind,
         user = %username,

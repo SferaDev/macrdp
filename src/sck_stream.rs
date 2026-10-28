@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -206,6 +206,7 @@ fn restart(weak: Weak<Shared>) {
             continue;
         };
         let displays = content.displays();
+        crate::sck_display_cache::remember(&displays);
         let old = shared.display_id.load(Ordering::Relaxed);
         let ids: Vec<u32> = displays.iter().map(|d| d.display_id()).collect();
         let size = (
@@ -243,14 +244,25 @@ fn restart(weak: Weak<Shared>) {
     }
 }
 
-/// Lists SCK's shareable content once, so its post-wake catch-up starts before the capture asks.
-pub fn warm_up() {
+/// Lists SCK's shareable content once, so its post-wake catch-up starts before
+/// the capture asks, and caches the displays it lists. Skipped while one runs.
+pub fn warm_up(reason: &'static str) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let started = Instant::now();
-    let displays = SCShareableContent::get().map(|c| c.displays().len());
+    let displays = SCShareableContent::get().map(|c| {
+        let displays = c.displays();
+        crate::sck_display_cache::remember(&displays);
+        displays.iter().map(|d| d.display_id()).collect::<Vec<_>>()
+    });
+    RUNNING.store(false, Ordering::Release);
     tracing::info!(
+        reason,
         list_ms = started.elapsed().as_millis() as u64,
         ?displays,
-        "SCK warm-up after a display wake"
+        "SCK warm-up"
     );
 }
 

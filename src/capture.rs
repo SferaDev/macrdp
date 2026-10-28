@@ -1351,6 +1351,7 @@ mod macos {
 
     use crate::capture_watchdog::{CaptureWatchdog, Observation, RebuildHistory};
     use crate::damage::{Damage, Rect};
+    use crate::sck_display_cache::Path as SckPath;
     use crate::sck_stream::{CaptureStream, StreamHealth, StreamParams};
     use anyhow::{anyhow, Context};
     use screencapturekit::async_api::AsyncSCShareableContent;
@@ -1415,9 +1416,67 @@ mod macos {
         }
     }
 
+    /// A display to capture, with how long finding it took and how it was found.
+    struct FoundDisplay {
+        display: screencapturekit::shareable_content::SCDisplay,
+        waited: Duration,
+        path: SckPath,
+    }
+
+    /// Finds `target` in the SCK display cache, else as [`list_sck_display`] does.
+    async fn find_sck_display(target: Option<u32>) -> Result<FoundDisplay> {
+        let started = Instant::now();
+        if let Some(cached) = target
+            .map(crate::virtual_display::current_id)
+            .and_then(crate::sck_display_cache::lookup)
+        {
+            tracing::info!(
+                display_id = cached.display_id(),
+                "SCK display from the cache"
+            );
+            return Ok(FoundDisplay {
+                display: cached,
+                waited: started.elapsed(),
+                path: SckPath::Cached,
+            });
+        }
+        let (display, waited) = list_sck_display(target).await?;
+        Ok(FoundDisplay {
+            display,
+            waited,
+            path: SckPath::Listed,
+        })
+    }
+
+    /// Starts a capture of `found`; if a cached display fails, lists SCK and retries once.
+    async fn start_found(
+        found: &mut FoundDisplay,
+        target: Option<u32>,
+        width: u16,
+        height: u16,
+        fps: u32,
+        preserve_aspect: bool,
+    ) -> Result<CaptureStream> {
+        match start_stream(&found.display, width, height, fps, preserve_aspect) {
+            Err(e) if found.path == SckPath::Cached => {
+                let id = found.display.display_id();
+                tracing::warn!(display_id = id, error = ?e, "capture from the cached SCK display failed; listing SCK");
+                crate::sck_display_cache::forget(id);
+                let (display, waited) = list_sck_display(target).await?;
+                *found = FoundDisplay {
+                    display,
+                    waited: found.waited + waited,
+                    path: SckPath::Relisted,
+                };
+                start_stream(&found.display, width, height, fps, preserve_aspect)
+            }
+            started => started,
+        }
+    }
+
     /// Finds `target` (or the first display) in SCK's list, polling while SCK lags.
     /// Also returns how long the lookup took.
-    async fn find_sck_display(
+    async fn list_sck_display(
         target: Option<u32>,
     ) -> Result<(screencapturekit::shareable_content::SCDisplay, Duration)> {
         let started = Instant::now();
@@ -1429,6 +1488,7 @@ mod macos {
                 .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
             let first_list_ms = *first_list.get_or_insert(started.elapsed().as_millis() as u64);
             let displays = content.displays();
+            crate::sck_display_cache::remember(&displays);
             let Some(target) = target else {
                 let d = displays.first().cloned().context("no displays available")?;
                 return Ok((d, started.elapsed()));
@@ -1680,8 +1740,9 @@ mod macos {
             fps: u32,
             gfx: crate::h264::Gfx,
         ) -> Result<Self> {
-            let (display, _) = find_sck_display(Some(display_id)).await?;
-            let stream = start_stream(&display, width, height, fps, false)?;
+            let mut found = find_sck_display(Some(display_id)).await?;
+            let stream =
+                start_found(&mut found, Some(display_id), width, height, fps, false).await?;
             let health = stream.health();
             let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
             let label = format!("m{}", output + 1);
@@ -1996,8 +2057,8 @@ mod macos {
                 return;
             };
             let stream = async {
-                let (display, _) = find_sck_display(Some(display_id)).await?;
-                start_stream(&display, width, height, fps, false)
+                let mut found = find_sck_display(Some(display_id)).await?;
+                start_found(&mut found, Some(display_id), width, height, fps, false).await
             };
             let stream = match stream.await {
                 Ok(stream) => stream,
@@ -2144,9 +2205,8 @@ mod macos {
             suppress_next_adopt: Arc<AtomicBool>,
             remode: Option<super::PrimaryRemode>,
         ) -> Result<Self> {
-            let (display, sck_wait) = find_sck_display(target_display_id).await?;
-            crate::connect_timeline::sck_wait(sck_wait);
-            let display = &display;
+            let mut found = find_sck_display(target_display_id).await?;
+            let display = &found.display;
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
             let native_h = u16::try_from(display.height()).context("display height > u16")?;
@@ -2196,11 +2256,18 @@ mod macos {
             }
 
             let display_id = display.display_id();
-            let (stream, held_frame) =
-                match take_prepared_stream(display_id, (width, height)).filter(|_| !letterbox) {
-                    Some(prepared) => (prepared.stream, prepared.first_frame),
-                    None => (start_stream(display, width, height, fps, letterbox)?, None),
-                };
+            let (stream, held_frame) = match take_prepared_stream(display_id, (width, height))
+                .filter(|_| !letterbox)
+            {
+                Some(prepared) => (prepared.stream, prepared.first_frame),
+                None => {
+                    let stream =
+                        start_found(&mut found, target_display_id, width, height, fps, letterbox)
+                            .await?;
+                    (stream, None)
+                }
+            };
+            crate::connect_timeline::sck_lookup(found.waited, found.path.as_str());
 
             // Cursor scale = session framebuffer px ÷ display backing px.
             // SkyLight hands the cursor back at the display's backing pixels;
