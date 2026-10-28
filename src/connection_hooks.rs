@@ -19,7 +19,13 @@ impl SessionHooks {
 
 impl ConnectionHandler for SessionHooks {
     fn on_accept(&mut self, peer: SocketAddr) -> bool {
-        self.inner.as_mut().is_none_or(|h| h.on_accept(peer))
+        let accepted = self.inner.as_mut().is_none_or(|h| h.on_accept(peer));
+        if accepted {
+            crate::connect_timeline::accepted();
+            crate::video_first::connection_accepted();
+            crate::display_awake::client_connecting(peer.ip());
+        }
+        accepted
     }
 
     fn on_disconnected(
@@ -40,6 +46,10 @@ impl ConnectionHandler for SessionHooks {
     }
 
     fn on_authenticated(&mut self, success: bool, reason: Option<&str>) {
+        if success {
+            crate::connect_timeline::mark(crate::connect_timeline::Step::Auth);
+            crate::display_awake::client_authenticated();
+        }
         if let Some(h) = self.inner.as_mut() {
             h.on_authenticated(success, reason);
         }

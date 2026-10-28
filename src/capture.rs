@@ -503,12 +503,13 @@ pub async fn primary_display_size() -> Result<Option<(u16, u16)>> {
     }
 }
 
-/// Backoff while SCK trails a display (re-)registration; `None` gives up after ~3.5 s.
-pub(crate) fn sck_retry_delay(attempt: u32) -> Option<Duration> {
-    const DELAYS_MS: [u64; 6] = [100, 200, 400, 800, 1000, 1000];
-    DELAYS_MS
-        .get(attempt as usize)
-        .map(|&ms| Duration::from_millis(ms))
+/// How long a capture start waits for SCK to list its display.
+const SCK_LOOKUP_TIMEOUT: Duration = Duration::from_millis(3500);
+const SCK_LOOKUP_POLL: Duration = Duration::from_millis(50);
+
+/// The pause before the next SCK lookup, `None` once the lookup has run out of time.
+pub(crate) fn sck_retry_delay(waited: Duration) -> Option<Duration> {
+    (waited + SCK_LOOKUP_POLL <= SCK_LOOKUP_TIMEOUT).then_some(SCK_LOOKUP_POLL)
 }
 
 /// SCK listed no display with the wanted id, even after retrying.
@@ -827,6 +828,8 @@ impl CaptureDisplay {
         }
         match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
             Ok(()) => {
+                crate::connect_timeline::mark(crate::connect_timeline::Step::Remode);
+                crate::vd_mode_state::remember(u32::from(vd_w), u32::from(vd_h), scale);
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
@@ -1145,6 +1148,8 @@ impl CaptureDisplay {
                 secondaries = secondaries.len(),
                 "session captures started"
             );
+            crate::connect_timeline::mark(crate::connect_timeline::Step::CaptureStarted);
+            crate::video_first::video_started();
             Box::new(primary?.with_secondaries(secondaries))
         };
         #[cfg(not(target_os = "macos"))]
@@ -1301,6 +1306,7 @@ impl PrimaryRemode {
             tracing::warn!(error = ?e, "re-moding the virtual display ahead of a live resize failed");
             return None;
         }
+        crate::vd_mode_state::remember(u32::from(width), u32::from(height), scale);
         tracing::info!(
             width,
             height,
@@ -1395,6 +1401,10 @@ mod macos {
     /// channel that isn't ready yet.
     const EGFX_READY_GRACE: Duration = Duration::from_secs(10);
 
+    /// How long the first frame waits for EGFX before going out as a legacy
+    /// bitmap, which at session size is megabytes ahead of the H.264 frame.
+    const LEGACY_FIRST_FRAME_GRACE: Duration = Duration::from_secs(1);
+
     /// How long a live resize waits for the resized display's first frame.
     const RESIZE_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -1437,15 +1447,19 @@ mod macos {
         }
     }
 
-    /// Finds `target` (or the first display) in SCK's list, retrying while SCK lags.
+    /// Finds `target` (or the first display) in SCK's list, polling while SCK lags.
+    /// Also returns how long the lookup took.
     async fn find_sck_display(
         target: Option<u32>,
-    ) -> Result<screencapturekit::shareable_content::SCDisplay> {
+    ) -> Result<(screencapturekit::shareable_content::SCDisplay, Duration)> {
+        let started = Instant::now();
         let mut attempt = 0;
+        let mut first_list = None;
         loop {
             let content = AsyncSCShareableContent::get()
                 .await
                 .map_err(|e| anyhow!("AsyncSCShareableContent::get failed (likely Screen Recording permission denied): {e:?}"))?;
+            let first_list_ms = *first_list.get_or_insert(started.elapsed().as_millis() as u64);
             let displays = content.displays();
             let Some(target) = target else {
                 // Mirror mode: follow the main display, as input does.
@@ -1461,25 +1475,26 @@ mod macos {
                         "multiple displays: mirroring the main display"
                     );
                 }
-                return Ok(displays[index].clone());
+                return Ok((displays[index].clone(), started.elapsed()));
             };
             let id = crate::virtual_display::current_id(target);
             if let Some(d) = displays.iter().find(|d| d.display_id() == id) {
-                if attempt > 0 {
-                    tracing::info!(
-                        display_id = id,
-                        attempt,
-                        "SCK listed the display after retrying"
-                    );
-                }
-                return Ok(d.clone());
+                let waited = started.elapsed();
+                tracing::info!(
+                    display_id = id,
+                    waited_ms = waited.as_millis() as u64,
+                    first_list_ms,
+                    attempt,
+                    "SCK listed the display"
+                );
+                return Ok((d.clone(), waited));
             }
             let seen = displays
                 .iter()
                 .map(|d| format!("id={} {}x{}", d.display_id(), d.width(), d.height()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let Some(delay) = sck_retry_delay(attempt) else {
+            let Some(delay) = sck_retry_delay(started.elapsed()) else {
                 return Err(DisplayMissing { id, seen }.into());
             };
             tracing::debug!(
@@ -1709,7 +1724,7 @@ mod macos {
             fps: u32,
             gfx: crate::h264::Gfx,
         ) -> Result<Self> {
-            let display = find_sck_display(Some(display_id)).await?;
+            let (display, _) = find_sck_display(Some(display_id)).await?;
             let stream = start_stream(&display, width, height, fps, false)?;
             let health = stream.health();
             let retry = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
@@ -1927,6 +1942,9 @@ mod macos {
         /// change.
         held_frame: Option<CVPixelBuffer>,
         hold_until: Instant,
+        /// Size of the held first frame while it waits out [`LEGACY_FIRST_FRAME_GRACE`].
+        legacy_pending: Option<(u16, u16)>,
+        legacy_after: Instant,
         /// The frame EGFX dropped last (busy encoder); offered again a frame
         /// later until it is encoded. Lives in `last_frame`.
         resubmit: bool,
@@ -2026,7 +2044,7 @@ mod macos {
                 return;
             };
             let stream = async {
-                let display = find_sck_display(Some(display_id)).await?;
+                let (display, _) = find_sck_display(Some(display_id)).await?;
                 start_stream(&display, width, height, fps, false)
             };
             let stream = match stream.await {
@@ -2115,6 +2133,28 @@ mod macos {
             }
         }
 
+        /// Sends the held first frame as a legacy bitmap once EGFX missed its grace.
+        fn legacy_fallback(&mut self) {
+            if self.seeded || Instant::now() < self.legacy_after {
+                return;
+            }
+            let (Some((w, h)), Some(held)) = (self.legacy_pending.take(), self.held_frame.as_ref())
+            else {
+                return;
+            };
+            let Ok(guard) = held.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+                return;
+            };
+            for (sx, sy, sw, sh) in split_strips(0, 0, w, h) {
+                if let Some(update) =
+                    rect_update(guard.as_slice(), guard.bytes_per_row(), sx, sy, sw, sh)
+                {
+                    self.pending.push_back(update);
+                }
+            }
+            self.seeded = true;
+        }
+
         /// Ships the held frame once EGFX takes it. Returns whether it did.
         fn ship_held_frame(&mut self) -> bool {
             let (Some(gfx), Some(held)) = (self.gfx.as_ref(), self.held_frame.as_ref()) else {
@@ -2169,7 +2209,8 @@ mod macos {
             suppress_next_adopt: Arc<AtomicBool>,
             remode: Option<super::PrimaryRemode>,
         ) -> Result<Self> {
-            let display = find_sck_display(target_display_id).await?;
+            let (display, sck_wait) = find_sck_display(target_display_id).await?;
+            crate::connect_timeline::sck_wait(sck_wait);
             let display = &display;
 
             let native_w = u16::try_from(display.width()).context("display width > u16")?;
@@ -2292,6 +2333,8 @@ mod macos {
                 suppress_next_adopt,
                 held_frame,
                 hold_until: Instant::now() + EGFX_READY_GRACE,
+                legacy_pending: None,
+                legacy_after: Instant::now() + LEGACY_FIRST_FRAME_GRACE,
                 resubmit: false,
                 last_change_at: Instant::now(),
                 aux_waiting: false,
@@ -2463,6 +2506,7 @@ mod macos {
                 if self.ship_held_frame() {
                     continue;
                 }
+                self.legacy_fallback();
 
                 // Poll cursor at loop top — preempts queued bitmap rects so
                 // pointer shape updates keep up instead of batching behind the
@@ -2823,6 +2867,10 @@ mod macos {
                         Ok(false) => {
                             if !self.first_egfx_frame_sent && Instant::now() < self.hold_until {
                                 self.held_frame = Some(pixel_buffer.clone());
+                                if !self.seeded && Instant::now() < self.legacy_after {
+                                    self.legacy_pending = Some((pb_width, pb_height));
+                                    continue;
+                                }
                             }
                         }
                         Err(e) => tracing::warn!(error = ?e, "EGFX submit_bgra failed"),
@@ -3034,13 +3082,26 @@ mod tests {
     }
 
     #[test]
-    fn sck_retry_backs_off_and_gives_up_within_seconds() {
-        let delays: Vec<_> = (0..).map_while(sck_retry_delay).collect();
-        assert!(delays.len() >= 3);
-        assert!(delays.windows(2).all(|w| w[0] <= w[1]));
-        let total: Duration = delays.iter().sum();
-        assert!(total >= Duration::from_secs(2) && total <= Duration::from_secs(5));
-        assert_eq!(sck_retry_delay(delays.len() as u32), None);
+    fn sck_lookup_polls_every_50ms_until_the_timeout() {
+        assert_eq!(sck_retry_delay(Duration::ZERO), Some(SCK_LOOKUP_POLL));
+        assert_eq!(
+            sck_retry_delay(Duration::from_millis(3000)),
+            Some(SCK_LOOKUP_POLL)
+        );
+        assert_eq!(
+            sck_retry_delay(SCK_LOOKUP_TIMEOUT - SCK_LOOKUP_POLL),
+            Some(SCK_LOOKUP_POLL)
+        );
+        assert_eq!(sck_retry_delay(SCK_LOOKUP_TIMEOUT), None);
+        // With instant lookups the schedule is a 50 ms poll that ends at the timeout.
+        let mut waited = Duration::ZERO;
+        let mut polls = 0;
+        while let Some(d) = sck_retry_delay(waited) {
+            waited += d;
+            polls += 1;
+        }
+        assert_eq!(polls, 70);
+        assert_eq!(waited, SCK_LOOKUP_TIMEOUT);
     }
 
     #[test]

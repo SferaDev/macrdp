@@ -319,6 +319,10 @@ fn boost_audio_qos() {
     }
 }
 
+/// The longest the audio capture waits for the video capture to start first.
+#[cfg(target_os = "macos")]
+const VIDEO_FIRST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn capture_loop(
@@ -337,6 +341,7 @@ async fn capture_loop(
     use screencapturekit::async_api::{AsyncSCShareableContent, AsyncSCStream};
     use screencapturekit::prelude::{SCContentFilter, SCStreamConfiguration, SCStreamOutputType};
 
+    crate::video_first::wait_for_video(VIDEO_FIRST_TIMEOUT).await;
     let content = AsyncSCShareableContent::get()
         .await
         .map_err(|e| anyhow!("SCShareableContent for audio: {e:?}"))?;
