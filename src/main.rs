@@ -707,7 +707,7 @@ struct Args {
     /// Opt-in (default OFF). Congestion-responsive H.264 bitrate, on BOTH the TCP
     /// path and the UDP tunnel (only with --enable-h264): an AIMD controller reads
     /// the standing queue delay (each frame's ship→ack round trip minus the
-    /// windowed-minimum RTT, EWMA-smoothed) plus reliable-tunnel retransmits, and
+    /// windowed-minimum RTT, minimum over ~500 ms) plus reliable-tunnel retransmits, and
     /// moves the VideoToolbox bitrate within [floor, --bitrate] — so --bitrate is a
     /// ceiling. A long but clean link (VPN/ZeroTier) keeps full quality; a thin one
     /// degrades gracefully instead of freezing. Under sustained congestion it also
@@ -715,7 +715,7 @@ struct Args {
     /// the frame rate (default 10 fps, never zero). A link whose measured RTT at
     /// connect is >= MACRDP_ADAPTIVE_SEED_RTT_MS (50) starts at ceiling/3. Tunables:
     /// MACRDP_UDP_ADAPTIVE_{FLOOR_BPS,INCREASE_BPS,DECREASE,INTERVAL_MS,RETX_TOLERANCE},
-    /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,EWMA_ALPHA,FLOOR_FPS}. macOS-only build; see
+    /// MACRDP_ADAPTIVE_{QUEUE_HIGH_MS,QUEUE_LOW_MS,FLOOR_FPS}. macOS-only build; see
     /// docs/cli.md.
     #[arg(long)]
     adaptive_bitrate: bool,

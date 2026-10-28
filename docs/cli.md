@@ -364,8 +364,9 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   Signal: the STANDING QUEUE DELAY, each frame's
                           #   ship->ack round trip minus the windowed-minimum RTT
                           #   and minus the frame's own transmission time, taken
-                          #   as the smallest sample per control interval and
-                          #   EWMA-smoothed. The controller (src/rate_control.rs)
+                          #   as the smallest sample over the last 500 ms and at
+                          #   least 8 frames, so relay jitter does not read as a
+                          #   queue. The controller (src/rate_control.rs)
                           #   keeps it between QUEUE_LOW_MS and QUEUE_HIGH_MS
                           #   (default 30..50 ms): it grows only below the low
                           #   mark while the queue is not rising, eases down in
@@ -381,13 +382,17 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   again without a sawtooth. Growth is capped at twice
                           #   the recent delivered rate (an idle screen proves
                           #   nothing), and captures held back by the unacked-byte
-                          #   budget count as a full link. A sender well under
-                          #   its target is the screen's doing: its cuts come off
-                          #   the target, not the little it delivered, and a delay
-                          #   it has too few unacked bytes to cause is not cut on.
-                          #   Cuts stay above 70% of the remembered capacity for
-                          #   3 s unless loss or a busy link delivering half of
-                          #   it says otherwise. A delay that stands flat for
+                          #   budget count as a full link. A cut needs the queue
+                          #   above the high mark for 500 ms (a queue 3x the mark
+                          #   cuts at once), and the high mark rises by twice the
+                          #   measured jitter, up to double. A sender well under
+                          #   its target (a static screen, judged over ~1 s) never
+                          #   cuts on delay; its unacked-byte budget bounds the
+                          #   queue instead. Cuts stay above 50% of the remembered
+                          #   capacity unless loss, or a busy link delivering
+                          #   under both that floor and the target, says
+                          #   otherwise. The keyframe backoff and frame-rate
+                          #   floor follow the same evidence. A delay that stands flat for
                           #   ~2 s while the unacked bytes or the cut rate rule
                           #   out a queue is path latency (a relay change): the
                           #   min RTT is re-baselined to it at once and the
@@ -435,7 +440,6 @@ MACRDP_SYSTEM_POINTERS=0  # env-only: send the arrow and a hidden cursor as
                           #   MACRDP_UDP_ADAPTIVE_RETX_TOLERANCE (2),
                           #   MACRDP_ADAPTIVE_QUEUE_HIGH_MS (default 50),
                           #   MACRDP_ADAPTIVE_QUEUE_LOW_MS (default 60% of high),
-                          #   MACRDP_ADAPTIVE_EWMA_ALPHA (default 0.5),
                           #   MACRDP_ADAPTIVE_FLOOR_FPS (10). The RETX_TOLERANCE
                           #   is the per-interval reliable-retransmit count
                           #   tolerated before treating loss as congestion, which
