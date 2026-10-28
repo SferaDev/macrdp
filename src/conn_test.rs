@@ -1080,6 +1080,74 @@ async fn a_silent_candidate_cannot_wedge_the_accept_loop() -> anyhow::Result<()>
         .await
 }
 
+/// IronRDP's client does not announce RNS_UD_CS_SUPPORT_HEARTBEAT_PDU, so a
+/// heartbeat-enabled server must leave it alone and keep the session up.
+#[tokio::test]
+async fn heartbeats_skip_a_client_that_does_not_support_them() -> anyhow::Result<()> {
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_test_server_full(
+                addr.port(),
+                1024,
+                768,
+                true,
+                None,
+                crate::bitmap_codecs(),
+                true,
+            );
+            server.set_heartbeat(Some(ironrdp_server::HeartbeatConfig {
+                period_secs: 1,
+                count1: 3,
+                count2: 3,
+            }));
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            let a = connect_with_retry(addr).await?;
+            let (_size, mut framed) = connect_client(a, 1280, 800).await?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+            loop {
+                match tokio::time::timeout_at(deadline, framed.read_pdu()).await {
+                    Err(_) => break,
+                    Ok(Ok((_action, bytes))) => {
+                        assert!(
+                            !is_heartbeat(&bytes),
+                            "heartbeat sent to a client without support"
+                        )
+                    }
+                    Ok(Err(e)) => anyhow::bail!("session closed: {e}"),
+                }
+            }
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
+}
+
+/// Is this raw server PDU a Server Heartbeat PDU (SEC_HEARTBEAT security header)?
+fn is_heartbeat(bytes: &[u8]) -> bool {
+    use ironrdp_core::decode;
+    use ironrdp_pdu::mcs::McsMessage;
+    use ironrdp_pdu::x224::X224;
+
+    let Ok(x224) = decode::<X224<McsMessage<'_>>>(bytes) else {
+        return false;
+    };
+    let McsMessage::SendDataIndication(data) = x224.0 else {
+        return false;
+    };
+    data.user_data.len() == 8 && data.user_data[..2] == [0x00, 0x40]
+}
+
 /// The listener needs a moment to bind after `run()` is spawned; retry briefly
 /// so the test isn't racy on a loaded machine.
 async fn connect_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {

@@ -200,3 +200,12 @@ context; the RETIRED ones were NOT re-applied. Server-fork div-9 (honor-size for
     Consumed by the vendored server's divergence (25). Windows App for Mac sends
     200 from a Retina panel and 100 from a standard one. Same additive
     GCC-surfacing shape as (2) and (4), so cleanly upstreamable.
+
+(6) Client earlyCapabilityFlags from GCC Client Core Data (NOT upstreamed; added
+    2026-10-28): `Acceptor` gains private `client_early_capability:
+    Option<gcc::ClientEarlyCapabilityFlags>`, captured in `BasicSettingsWaitInitial`
+    from the same `early_capability` the skip-channel-join check reads, carried
+    across a deactivation–reactivation and surfaced as a `pub` field on
+    `AcceptorResult`. Consumed by the vendored server's divergence (30): the
+    Heartbeat PDU goes only to a client that set `SUPPORT_HEART_BEAT_PDU`. Same
+    additive GCC-surfacing shape as (4) and (5), so cleanly upstreamable.

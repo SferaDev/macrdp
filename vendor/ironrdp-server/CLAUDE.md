@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(26) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(26)/(30) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2086,3 +2086,18 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     Capping unsent bytes (default 128 KiB, `MACRDP_TCP_NOTSENT_LOWAT`, 0 = off)
     keeps that backlog in userspace where writes block and the lag controls see
     it. Set at both accept sites, next to (28).
+
+(30) Server Heartbeat PDU, MS-RDPBCGR 2.2.16.1 (NOT upstreamed; added 2026-10-28).
+    `RdpServer::set_heartbeat(Option<HeartbeatConfig>)`, default `None`, so the
+    upstream path is unchanged. When set, `client_accepted` picks the MCS
+    message channel for a client whose Core Data earlyCapabilityFlags carry
+    `SUPPORT_HEART_BEAT_PDU` (acceptor divergence (6)) and `client_loop` runs a
+    `dispatch_heartbeat` arm that writes one PDU every `period_secs` through the
+    shared writer, first one at loop start. Wire format in `src/heartbeat.rs`:
+    SDin on the message channel, Basic Security Header `SEC_HEARTBEAT` (0x4000),
+    then reserved=0, period, count1, count2. The spec says MUST on the message
+    channel (FreeRDP only parses it there) and SHOULD only when nothing else was
+    sent in the interval; this sends unconditionally so a client gets a fixed
+    cadence it can time out on. macrdp sets period 2 s, count1 3, count2 3
+    (`--heartbeat-secs`, 0 = off). The IronRDP connector does not announce
+    support, so conn_test only covers the negative case.

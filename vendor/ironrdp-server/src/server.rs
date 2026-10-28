@@ -620,6 +620,10 @@ pub struct RdpServer {
     creds: Option<Credentials>,
     local_addr: Option<SocketAddr>,
     autodetect: Option<AutoDetectManager>,
+    /// (vendored, divergence (30)) Heartbeat PDU timing; `None` sends none.
+    heartbeat: Option<crate::heartbeat::HeartbeatConfig>,
+    /// (vendored, divergence (30)) Message channel of the served client when it takes heartbeats.
+    heartbeat_channel: Option<u16>,
     /// (vendored, divergence 23) Anti-ping-pong net for session preemption:
     /// the peer most recently EVICTED by a takeover, and when it last tried to
     /// come back.
@@ -1359,6 +1363,8 @@ impl RdpServer {
             creds: None,
             local_addr: None,
             autodetect: None,
+            heartbeat: None,
+            heartbeat_channel: None,
             recently_evicted: None,
             connection_handler: connection_handler.map(|h| Rc::new(RefCell::new(h))),
             display_suppressed: Arc::new(AtomicBool::new(false)),
@@ -1445,6 +1451,13 @@ impl RdpServer {
     /// called before any client connects.
     pub fn set_input_reset_handle(&mut self, handle: Arc<AtomicBool>) {
         self.input_reset_request = Some(handle);
+    }
+
+    /// (vendored, divergence (30)) Send a Server Heartbeat PDU every
+    /// `period_secs` to each client that announces heartbeat support and joins
+    /// the MCS message channel. `None` (the default) sends none.
+    pub fn set_heartbeat(&mut self, config: Option<crate::heartbeat::HeartbeatConfig>) {
+        self.heartbeat = config;
     }
 
     /// (vendored) Serve each session at the desktop size the client
@@ -2939,6 +2952,8 @@ impl RdpServer {
         let mut display_writer = writer.clone();
         let mut event_writer = writer.clone();
         let mut audio_writer = writer.clone();
+        let mut heartbeat_writer = writer.clone();
+        let heartbeat = self.heartbeat.zip(self.heartbeat_channel);
         let ev_receiver = Arc::clone(&self.ev_receiver);
         let audio_receiver = Arc::clone(&self.audio_receiver);
         // (M5c step 3b) Take this connection's inbound-tunnel receiver before `self`
@@ -3197,8 +3212,23 @@ impl RdpServer {
             std::future::pending::<Result<RunState>>().await
         };
 
+        // (vendored, divergence (30)) On the shared writer, so a stalled socket delays heartbeats too.
+        let dispatch_heartbeat = async move {
+            let Some((config, channel_id)) = heartbeat else {
+                return std::future::pending::<Result<RunState>>().await;
+            };
+            let frame = crate::heartbeat::encode_heartbeat(config.into(), user_channel_id, channel_id)?;
+            let mut ticker = tokio::time::interval(config.interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                heartbeat_writer.write_all(&frame).await?;
+            }
+        };
+
         let state = tokio::select!(
             state = read_pdus => state,
+            state = dispatch_heartbeat => state,
             state = dispatch_pdu => state,
             state = dispatch_display => state,
             state = dispatch_events => state,
@@ -3654,6 +3684,19 @@ impl RdpServer {
                     &platform,
                 );
             }
+        }
+
+        // (vendored, divergence (30)) Reactivations repeat the connect-time Core Data, so recompute each time.
+        self.heartbeat_channel = self
+            .heartbeat
+            .and(crate::heartbeat::heartbeat_channel(result.client_early_capability, result.message_channel_id));
+        if !result.reactivation {
+            debug!(
+                channel = ?self.heartbeat_channel,
+                early_capability = ?result.client_early_capability,
+                message_channel = ?result.message_channel_id,
+                "heartbeat negotiation"
+            );
         }
 
         // (vendored, divergence (25)) A reactivation repeats the connect-time
