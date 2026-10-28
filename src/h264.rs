@@ -2289,6 +2289,14 @@ impl Gfx {
             )
         };
 
+        // A gate dropped this capture: no recovery runs, and its damage waits for the next one.
+        let Some(fast_ship) = fast_ship else {
+            if let Some(ship) = priority_ship {
+                self.ship_fast_path(ship, bgra, stride, 0);
+            }
+            return Ok(OutputSubmit::Busy);
+        };
+
         // Run the armed recovery action now that ctx is released (lock order).
         // This capture is dropped either way: a remap re-arms `need_keyframe`,
         // so the NEXT capture ships as the IDR into the fresh surface, cleanly
@@ -2309,10 +2317,6 @@ impl Gfx {
         if let Some(ship) = priority_ship {
             self.ship_fast_path(ship, bgra, stride, 0);
         }
-        // A gate dropped this capture; its damage waits for the next one.
-        let Some(fast_ship) = fast_ship else {
-            return Ok(OutputSubmit::Busy);
-        };
 
         // Ahead of the encode, with ctx released (lock order); the H.264 frame
         // below still carries the same rects.
@@ -3758,8 +3762,11 @@ impl Gfx {
             };
 
             // Phase 2: lock `server_handle` ALONE (ctx already released).
-            let mut server = server_handle.lock().unwrap();
-            // Rects are taken under `server_handle`, which input-priority tiles shield under too.
+            // With input priority, rects are taken under `server_handle`, which its tiles shield under too.
+            let early = self
+                .input_priority
+                .is_some()
+                .then(|| server_handle.lock().unwrap());
             // Each frame's changed regions; `None` keeps the whole-surface
             // region the path always sent (MACRDP_EGFX_DIRTY_RECTS=0).
             // Lazy chroma also needs the rects themselves: where the client's chroma is 4:2:0 again.
@@ -3788,6 +3795,7 @@ impl Gfx {
                     crate::latency_trace::record_us(&format!("m{label}.region_px"), px);
                 }
             }
+            let mut server = early.unwrap_or_else(|| server_handle.lock().unwrap());
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
@@ -6731,5 +6739,263 @@ mod tests {
         assert!(gfx
             .priority_ship(guard.as_mut().unwrap(), &mut bypass)
             .is_none());
+    }
+
+    /// Rects one shipped EGFX event paints: tile destinations and AVC420 regions, right and bottom exclusive.
+    fn painted(event: ServerEvent) -> Vec<crate::damage::Rect> {
+        use ironrdp_core::decode;
+        use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
+        use ironrdp_egfx::pdu::{Avc420BitmapStream, Codec1Type, GfxPdu};
+
+        let ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) = event else {
+            return Vec::new();
+        };
+        let (mut out, mut message, mut total) = (Vec::new(), Vec::new(), 0usize);
+        for m in messages {
+            let bytes = m.encode_unframed_pdu().unwrap();
+            let DrdynvcServerPdu::Data(data) = decode::<DrdynvcServerPdu>(&bytes).unwrap() else {
+                continue;
+            };
+            match data {
+                DrdynvcDataPdu::DataFirst(p) => {
+                    total = p.length() as usize;
+                    message = p.data().to_vec();
+                }
+                DrdynvcDataPdu::Data(p) => {
+                    if total == 0 {
+                        message.clear();
+                    }
+                    message.extend_from_slice(p.data());
+                }
+            }
+            if total > message.len() {
+                continue;
+            }
+            total = 0;
+            assert_eq!(&message[..2], &[0xE0, 0x04]);
+            let GfxPdu::WireToSurface1(w) = decode::<GfxPdu>(&message[2..]).unwrap() else {
+                continue;
+            };
+            if w.codec_id == Codec1Type::Avc420 {
+                let stream = decode::<Avc420BitmapStream<'_>>(&w.bitmap_data).unwrap();
+                out.extend(stream.rectangles.iter().map(|r| crate::damage::Rect {
+                    left: u32::from(r.left),
+                    top: u32::from(r.top),
+                    right: u32::from(r.right),
+                    bottom: u32::from(r.bottom),
+                }));
+            } else {
+                let d = &w.destination_rectangle;
+                out.push(crate::damage::Rect {
+                    left: u32::from(d.left),
+                    top: u32::from(d.top),
+                    right: u32::from(d.right),
+                    bottom: u32::from(d.bottom),
+                });
+            }
+        }
+        out
+    }
+
+    /// The capture loop's side of `submit`: damage accumulates until a capture is encoded.
+    struct CaptureLoop {
+        gfx: Gfx,
+        rx: mpsc::UnboundedReceiver<ServerEvent>,
+        frame: Vec<u8>,
+        damage: Damage,
+    }
+
+    impl CaptureLoop {
+        const W: u16 = 128;
+        const H: u16 = 96;
+
+        /// A ready AVC420 connection with the fast path on and no periodic full frame.
+        fn start(priority: Option<crate::input_priority::Config>) -> Self {
+            use ironrdp_core::encode_vec;
+            use ironrdp_dvc::DvcProcessor as _;
+            use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, GfxPdu};
+
+            let mut gfx = Gfx::new(
+                crate::capture::SharedDesktopSize::new(Self::W, Self::H),
+                30,
+                5_000_000,
+                2.0,
+                2,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                true,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+            );
+            gfx.fast_path = Some(FastPath {
+                codec: crate::egfx_fast_path::Codec::Planar,
+                max_px: 1024,
+            });
+            gfx.input_priority = priority;
+            gfx.damage_policy = DamageTracker::new(true, None);
+            let (_, handle) = gfx.build_server_with_handle().unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            gfx.set_sender(tx);
+            {
+                let mut server = handle.lock().unwrap();
+                server.start(7).unwrap();
+                let advertise =
+                    GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[
+                        avc_ready(),
+                    ]));
+                server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+            }
+            let frame = vec![0x80u8; usize::from(Self::W) * usize::from(Self::H) * 4];
+            let mut lp = Self {
+                gfx,
+                rx,
+                frame,
+                damage: Damage::Full,
+            };
+            assert_eq!(lp.capture(&[]), OutputSubmit::Encoded);
+            lp.drain();
+            lp
+        }
+
+        fn paint(&mut self, r: crate::damage::Rect, value: u8) {
+            let stride = usize::from(Self::W) * 4;
+            for y in r.top as usize..r.bottom as usize {
+                self.frame[y * stride + r.left as usize * 4..y * stride + r.right as usize * 4]
+                    .fill(value);
+            }
+        }
+
+        /// One capture whose own changed rects are `changed`.
+        fn capture(&mut self, changed: &[crate::damage::Rect]) -> OutputSubmit {
+            self.gfx.note_capture_damage(changed);
+            self.damage.add_rects(changed.iter().copied());
+            let stride = usize::from(Self::W) * 4;
+            let status = self
+                .gfx
+                .submit_bgra_status(&self.frame, stride, false, self.damage.clone())
+                .unwrap();
+            if status == OutputSubmit::Encoded {
+                self.damage = Damage::default();
+            }
+            status
+        }
+
+        /// Waits for the encoder to ship everything, then returns the rects shipped since the last call.
+        fn drain(&mut self) -> Vec<crate::damage::Rect> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let done = {
+                    let guard = self.gfx.ctx.lock().unwrap();
+                    let ctx = guard.as_ref().unwrap();
+                    ctx.shipped.load(Ordering::Relaxed) >= ctx.submitted.load(Ordering::Relaxed)
+                };
+                if done {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the encoder never shipped");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut out = Vec::new();
+            while let Ok(event) = self.rx.try_recv() {
+                out.extend(painted(event));
+            }
+            out
+        }
+    }
+
+    fn covered(rects: &[crate::damage::Rect], r: &crate::damage::Rect) -> bool {
+        (r.top..r.bottom).all(|y| {
+            (r.left..r.right).all(|x| {
+                rects
+                    .iter()
+                    .any(|o| x >= o.left && x < o.right && y >= o.top && y < o.bottom)
+            })
+        })
+    }
+
+    const SQUARE: crate::damage::Rect = crate::damage::Rect {
+        left: 40,
+        top: 40,
+        right: 56,
+        bottom: 56,
+    };
+
+    #[test]
+    fn a_small_change_after_idle_ships_with_input_priority_off() {
+        small_change_after_idle(None);
+    }
+
+    #[test]
+    fn a_small_change_after_idle_ships_with_input_priority_on() {
+        small_change_after_idle(Some(priority_config()));
+    }
+
+    #[test]
+    fn a_small_change_on_a_busy_screen_ships_with_input_priority_off() {
+        small_change_on_a_busy_screen(None);
+    }
+
+    #[test]
+    fn a_small_change_on_a_busy_screen_ships_with_input_priority_on() {
+        small_change_on_a_busy_screen(Some(priority_config()));
+    }
+
+    fn small_change_after_idle(priority: Option<crate::input_priority::Config>) {
+        let mut lp = CaptureLoop::start(priority);
+        // Past the whole-surface frames that follow a keyframe.
+        let blip = crate::damage::Rect {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+        for i in 0..12u8 {
+            lp.paint(blip, i);
+            assert_eq!(lp.capture(&[blip]), OutputSubmit::Encoded);
+            lp.drain();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        for value in [0x00u8, 0xFF, 0x00] {
+            crate::input_priority::note_input();
+            lp.paint(SQUARE, value);
+            assert_eq!(lp.capture(&[SQUARE]), OutputSubmit::Encoded);
+            let shipped = lp.drain();
+            assert!(covered(&shipped, &SQUARE), "{shipped:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn small_change_on_a_busy_screen(priority: Option<crate::input_priority::Config>) {
+        let mut lp = CaptureLoop::start(priority);
+        let busy = crate::damage::Rect {
+            left: 96,
+            top: 0,
+            right: 128,
+            bottom: 96,
+        };
+        let mut shipped = Vec::new();
+        for i in 0..40u8 {
+            lp.paint(busy, i.wrapping_mul(37));
+            let mut changed = vec![busy];
+            if i == 20 {
+                crate::input_priority::note_input();
+                lp.paint(SQUARE, 0xFF);
+                changed.push(SQUARE);
+            }
+            lp.capture(&changed);
+            while let Ok(event) = lp.rx.try_recv() {
+                if i >= 20 {
+                    shipped.extend(painted(event));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        // The last capture may have been dropped; offering it again carries what it held.
+        while !lp.damage.is_empty() && lp.capture(&[]) != OutputSubmit::Encoded {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        shipped.extend(lp.drain());
+        assert!(covered(&shipped, &SQUARE), "{shipped:?}");
     }
 }
