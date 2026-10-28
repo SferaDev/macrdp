@@ -22,6 +22,8 @@ impl ConnectionHandler for SessionHooks {
         let accepted = self.inner.as_mut().is_none_or(|h| h.on_accept(peer));
         if accepted {
             crate::connect_timeline::accepted();
+            crate::video_first::connection_accepted();
+            crate::display_awake::client_connecting(peer.ip());
         }
         accepted
     }

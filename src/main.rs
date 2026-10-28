@@ -64,6 +64,7 @@ mod stats;
 mod switcher_hud;
 mod usb_redirect;
 mod vd_mode_state;
+mod video_first;
 mod videotoolbox;
 mod virtual_display;
 

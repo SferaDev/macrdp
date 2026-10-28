@@ -243,6 +243,17 @@ fn restart(weak: Weak<Shared>) {
     }
 }
 
+/// Lists SCK's shareable content once, so its post-wake catch-up starts before the capture asks.
+pub fn warm_up() {
+    let started = Instant::now();
+    let displays = SCShareableContent::get().map(|c| c.displays().len());
+    tracing::info!(
+        list_ms = started.elapsed().as_millis() as u64,
+        ?displays,
+        "SCK warm-up after a display wake"
+    );
+}
+
 pub struct CaptureStream {
     shared: Arc<Shared>,
 }
