@@ -390,7 +390,19 @@ mod macos {
         /// resolved on this macOS version. Caller should treat that as
         /// "this feature isn't usable here," not a fatal bug.
         pub fn new(width: u32, height: u32, refresh_hz: u32) -> Result<Self> {
-            Self::create(width, height, refresh_hz, "macrdp", std::process::id(), 1)
+            Self::new_scaled(width, height, 1, refresh_hz)
+        }
+
+        /// The primary display created straight in a `scale` mode, the way a 2x secondary is.
+        pub fn new_scaled(width: u32, height: u32, scale: u32, refresh_hz: u32) -> Result<Self> {
+            Self::create(
+                width,
+                height,
+                refresh_hz,
+                "macrdp",
+                std::process::id(),
+                scale,
+            )
         }
 
         /// Another display for a multi-monitor session, at `width`×`height`
@@ -2212,6 +2224,14 @@ mod stub {
                 "virtual display is macOS-only — this binary was built for a \
                  different target"
             ))
+        }
+        pub fn new_scaled(
+            _width: u32,
+            _height: u32,
+            _scale: u32,
+            _refresh_hz: u32,
+        ) -> Result<Self> {
+            Self::new(0, 0, 0)
         }
         pub fn display_id(&self) -> u32 {
             0

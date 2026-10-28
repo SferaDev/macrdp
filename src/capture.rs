@@ -793,6 +793,7 @@ impl CaptureDisplay {
         match vd.resize(u32::from(vd_w), u32::from(vd_h), scale) {
             Ok(()) => {
                 crate::connect_timeline::mark(crate::connect_timeline::Step::Remode);
+                crate::vd_mode_state::remember(u32::from(vd_w), u32::from(vd_h), scale);
                 self.screen_size_pts = vd.size_pts();
                 let vd_id = vd.display_id();
                 tracing::info!(
@@ -1268,6 +1269,7 @@ impl PrimaryRemode {
             tracing::warn!(error = ?e, "re-moding the virtual display ahead of a live resize failed");
             return None;
         }
+        crate::vd_mode_state::remember(u32::from(width), u32::from(height), scale);
         tracing::info!(
             width,
             height,
