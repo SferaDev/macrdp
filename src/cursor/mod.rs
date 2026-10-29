@@ -226,10 +226,8 @@ mod macos {
         }
 
         fn poll_shape(&mut self, out: &mut Vec<DisplayUpdate>) {
-            let visible = !self.system_pointers || private_api::cursor_visible();
-            let (next, image) = if !visible {
-                (Shown::Hidden, None)
-            } else if let Some(raw) = private_api::global_cursor() {
+            // An app hiding the cursor shows up as a fully transparent image, handled in pointer_for.
+            let (next, image) = if let Some(raw) = private_api::global_cursor() {
                 let hash = raw.content_hash();
                 let cached = self.last_raw.filter(|&(h, _)| h == hash).map(|(_, s)| s);
                 if cached == Some(self.shown) {

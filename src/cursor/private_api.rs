@@ -124,19 +124,6 @@ fn system_cursor_data_fn() -> Option<SLSGetSystemDefinedCursorDataFn> {
     *F.get_or_init(|| resolve("SLSGetSystemDefinedCursorData"))
 }
 
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    // Deprecated but current: it reads WindowServer's shared scoreboard, so it
-    // reports the on-screen cursor hidden or obscured by any app, not just us.
-    fn CGCursorIsVisible() -> u32;
-}
-
-/// Whether WindowServer is drawing the cursor at all. False while an app has
-/// hidden it (full-screen video) or obscured it until the mouse moves (typing).
-pub fn cursor_visible() -> bool {
-    unsafe { CGCursorIsVisible() != 0 }
-}
-
 /// A cursor exactly as SkyLight returned it: premultiplied BGRA, top-down,
 /// `row_bytes` apart, with the rect and hotspot it reported.
 pub struct RawCursor {
