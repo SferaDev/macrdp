@@ -713,6 +713,27 @@ Trace stages (with `MACRDP_LATENCY_TRACE=1`): `mN.fastpath_px`, `mN.fastpath_byt
 tiles being queued for the socket, compare with `mN.key_to_queued`) and
 `mN.fastpath_inflight_skip` (small changes that waited because a frame was in the
 encoder).
+
+EGFX input-priority tiles (off by default; `INPUT_PRIORITY`, `INPUT_PRIORITY_MAX_PX` and
+`INPUT_PRIORITY_WINDOW_MS` in config.env set the same variables, `src/input_priority.rs`).
+For a window after a key or mouse-button press, the primary monitor's changed rects that
+were quiet before the input (a cell is busy once it changed in 8 captures within the
+400 ms before it) ship at once as tiles, like the fast path but while the busy rest of
+the screen keeps its H.264 pace: past the frame-rate, frames-in-flight and ack-lag gates,
+and with the top quarter of the unacked-byte budget kept for them (H.264 frames stop
+short of it). H.264 frames captured earlier and still queued have the tile rects cut out
+of their region rects, so they never paint older pixels over the tiles. A capture whose
+post-input change is too large for tiles skips the adaptive frame-rate gates once per
+input. Off on the lossy UDP tunnel and with `MACRDP_EGFX_DIRTY_RECTS=0`:
+```
+MACRDP_INPUT_PRIORITY=1               # 1/planar, or uncompressed; unset/0 = off
+MACRDP_INPUT_PRIORITY_MAX_PX=32768    # tile pixels per capture
+MACRDP_INPUT_PRIORITY_WINDOW_MS=150   # how long after an input captures take the path
+```
+Each input's first tile logs `EGFX input-priority tile shipped` at INFO with
+`input_to_ship_us` (input event to the tiles queued for the socket); the stats endpoint
+counts `input_tiles` and `input_tile_bytes`. Trace stages: `m0.input_to_tile`,
+`m0.input_fps_bypass` and `m0.input_tile_budget_hold`.
 Lazy chroma (env only, opt-in, `src/lazy_chroma.rs`, `src/aux_coder.rs`). For a client
 that negotiates AVC444 (a V10 capability set without `AVC_DISABLED`), the primary
 monitor's motion frames ship as AVC444 LC=1 (the same H.264 frame as AVC420). Once the

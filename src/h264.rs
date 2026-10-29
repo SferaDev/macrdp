@@ -158,6 +158,12 @@ fn inflight_byte_budget(target_bps: u32, base_rtt_ms: f64, queue_ms: u32, min_by
     ((f64::from(target_bps) / 8.0 * window_s) as u64).max(min_bytes)
 }
 
+struct InflightBudget {
+    budget: u64,
+    unacked: u64,
+    base_rtt_ms: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InflightGate {
     Pass,
@@ -1285,6 +1291,9 @@ struct FastShip {
     last_shipped: Arc<AtomicU64>,
     ship_times: Arc<Mutex<ShipLog>>,
     rects: Vec<crate::damage::Rect>,
+    codec: FastPath,
+    /// Input-priority tiles: the tracker whose queued frames must stay off them, and the input they answer.
+    priority: Option<(Arc<Mutex<DamageTracker>>, u64)>,
 }
 
 /// Cloneable factory + frame-submit handle. One clone is boxed into
@@ -1457,6 +1466,9 @@ pub struct Gfx {
     /// Small changes ship as Planar/Uncompressed tiles ahead of H.264
     /// (`MACRDP_EGFX_FAST_PATH`); `None` leaves the path unchanged.
     fast_path: Option<FastPath>,
+    /// `MACRDP_INPUT_PRIORITY`: see `crate::input_priority`.
+    input_priority: Option<crate::input_priority::Config>,
+    priority: Arc<Mutex<crate::input_priority::Priority>>,
     /// `MACRDP_AVC444=lazy`: see `crate::lazy_chroma`.
     lazy_config: Option<LazyChromaConfig>,
     /// Per-interval growth factor during slow start; `MACRDP_ADAPTIVE_SLOW_START`, default 1.25, <= 1 disables.
@@ -1669,6 +1681,15 @@ impl Gfx {
         if let Some(fp) = fast_path {
             info!(codec = ?fp.codec, max_px = fp.max_px, "EGFX small-change fast path ENABLED (MACRDP_EGFX_FAST_PATH)");
         }
+        let input_priority = crate::input_priority::Config::from_env();
+        if let Some(c) = input_priority {
+            info!(
+                codec = ?c.tiles.codec,
+                max_px = c.tiles.max_px,
+                window_ms = c.window.as_millis() as u64,
+                "EGFX input-priority tiles ENABLED (MACRDP_INPUT_PRIORITY)"
+            );
+        }
         let lazy_config = LazyChromaConfig::from_env();
         if let Some(c) = lazy_config {
             info!(
@@ -1752,6 +1773,8 @@ impl Gfx {
             reactivate_request: Arc::new(AtomicU32::new(0)),
             damage_policy,
             fast_path,
+            input_priority,
+            priority: Arc::default(),
             lazy_config,
             adaptive_slow_start,
             link_memory: Arc::new(Mutex::new(None)),
@@ -1868,7 +1891,8 @@ impl Gfx {
         // `server_handle`, which is never taken while holding ctx — the ship/ack
         // lock-order invariant). The decision extracts what the action needs here.
         let mut blank_recovery: Option<(BlankAction, GfxServerHandle, u16, u16, u32)> = None;
-        let (force_keyframe, fast_ship) = {
+        let mut priority_ship: Option<FastShip> = None;
+        let (force_keyframe, fast_ship) = 'guard: {
             let mut guard = self.ctx.lock().unwrap();
             let Some(ctx) = guard.as_mut() else {
                 return Ok(OutputSubmit::NotReady); // no active connection
@@ -2122,6 +2146,11 @@ impl Gfx {
                     }
                 }
             }
+            // The user's own change goes out ahead of the gates below.
+            let mut input_bypass = false;
+            if allow_fast_path && blank_recovery.is_none() {
+                priority_ship = self.priority_ship(ctx, &mut input_bypass);
+            }
             // P2b frame-rate floor: once the adaptive controller has cut the bitrate to
             // its floor AND the link is still congested, lowering quality can't help —
             // so shed FRAMES. Cap the effective fps (drop captures arriving within
@@ -2138,32 +2167,39 @@ impl Gfx {
             if self.adaptive_enabled {
                 let at_floor = ctx.adaptive_target_bps <= self.adaptive_floor_bps;
                 let now = Instant::now();
-                if frame_drop_at_floor(
-                    at_floor,
-                    ctx.adaptive_congested,
-                    now.duration_since(ctx.last_floor_fps_pass),
-                    self.adaptive_min_fps_interval,
-                ) {
+                if !input_bypass
+                    && frame_drop_at_floor(
+                        at_floor,
+                        ctx.adaptive_congested,
+                        now.duration_since(ctx.last_floor_fps_pass),
+                        self.adaptive_min_fps_interval,
+                    )
+                {
                     trace!(
                         "EGFX at bitrate floor + congested; dropping capture (frame-rate floor)"
                     );
-                    return Ok(OutputSubmit::Busy);
+                    break 'guard (false, None);
                 }
                 if at_floor && ctx.adaptive_congested {
                     ctx.last_floor_fps_pass = now;
                     debug!("EGFX frame-rate floor active — capping fps (let a capture through)");
                 }
                 // The rate-driven frame rate: a thin link gets fewer, better frames.
-                if crate::rate_control::fps_gate_drops(
-                    now.saturating_duration_since(ctx.last_encode_at),
-                    ctx.fps_level,
-                    self.fps,
-                ) {
+                if !input_bypass
+                    && crate::rate_control::fps_gate_drops(
+                        now.saturating_duration_since(ctx.last_encode_at),
+                        ctx.fps_level,
+                        self.fps,
+                    )
+                {
                     trace!(
                         fps = ctx.fps_level,
                         "EGFX capture above the adaptive frame rate; dropping"
                     );
-                    return Ok(OutputSubmit::Busy);
+                    break 'guard (false, None);
+                }
+                if input_bypass {
+                    crate::latency_trace::record_us("m0.input_fps_bypass", 0);
                 }
             }
             // Drop-to-latest throttle: if too many frames are still in the
@@ -2183,7 +2219,7 @@ impl Gfx {
                     outstanding,
                     "EGFX pipeline full; dropping capture to latest"
                 );
-                return Ok(OutputSubmit::Busy); // still the active path; just dropped this frame
+                break 'guard (false, None); // still the active path; just dropped this frame
             }
             // Frame-ack backpressure: neither the UDP tunnel nor a client that
             // queues what it reads (FreeRDP) paces us, so without this the
@@ -2191,15 +2227,26 @@ impl Gfx {
             if self.client_backlogged(ctx) {
                 crate::latency_trace::record_us("m0.lag_drop", 0);
                 trace!("EGFX frame-ack lag high; dropping capture");
-                return Ok(OutputSubmit::Busy);
+                break 'guard (false, None);
             }
-            let fast_ship = if allow_fast_path {
+            let fast_ship = if allow_fast_path && priority_ship.is_none() {
                 ctx.surface_id
                     .and_then(|sid| self.fast_ship(ctx, sid, ctx.dims, outstanding, &damage, 0))
             } else {
                 None
             };
-            (std::mem::replace(&mut ctx.need_keyframe, false), fast_ship)
+            (
+                std::mem::replace(&mut ctx.need_keyframe, false),
+                Some(fast_ship),
+            )
+        };
+
+        // A gate dropped this capture: no recovery runs, and its damage waits for the next one.
+        let Some(fast_ship) = fast_ship else {
+            if let Some(ship) = priority_ship {
+                self.ship_fast_path(ship, bgra, stride, 0);
+            }
+            return Ok(OutputSubmit::Busy);
         };
 
         // Run the armed recovery action now that ctx is released (lock order).
@@ -2217,6 +2264,10 @@ impl Gfx {
                 warn!(error = ?e, ?action, attempt, "EGFX blank recovery failed");
             }
             return Ok(OutputSubmit::Busy);
+        }
+
+        if let Some(ship) = priority_ship {
+            self.ship_fast_path(ship, bgra, stride, 0);
         }
 
         // Ahead of the encode, with ctx released (lock order); the H.264 frame
@@ -2940,6 +2991,7 @@ impl Gfx {
                 policy
             };
             ctx.damage = Arc::new(Mutex::new(policy));
+            *self.priority.lock().unwrap() = Default::default();
             ctx.lazy = lazy.map(|_| Arc::new(Mutex::new(LazyChroma::new(width, height))));
             ctx.aux_view = None;
             let gfx = self.clone();
@@ -3183,8 +3235,45 @@ impl Gfx {
 
     /// Frame counts miss what matters on a WAN link: one IDR can be a second of queue, so bound the unacked bytes too.
     fn inflight_bytes_over_budget(&self, ctx: &mut ConnectionContext) -> bool {
-        if self.inflight_queue_ms == 0 {
+        let Some(InflightBudget {
+            budget,
+            unacked,
+            base_rtt_ms,
+        }) = self.inflight_budget(ctx)
+        else {
             return false;
+        };
+        // Input-priority tiles may use the top of the budget; frames stop short of it.
+        let budget = if self.input_priority.is_some() {
+            budget - crate::input_priority::tile_reserve(budget)
+        } else {
+            budget
+        };
+        crate::latency_trace::record_us("unacked_bytes", unacked);
+        let now = Instant::now();
+        match inflight_gate(
+            unacked,
+            budget,
+            now.saturating_duration_since(ctx.last_ack_advance_at),
+            now.saturating_duration_since(ctx.last_inflight_release),
+            inflight_stall(base_rtt_ms),
+        ) {
+            InflightGate::Pass => false,
+            InflightGate::Release => {
+                ctx.last_inflight_release = now;
+                false
+            }
+            InflightGate::Hold => {
+                ctx.inflight_gated = true;
+                true
+            }
+        }
+    }
+
+    /// The unacked-byte budget and the bytes now unacked; `None` while it is off or acks are unusable.
+    fn inflight_budget(&self, ctx: &ConnectionContext) -> Option<InflightBudget> {
+        if self.inflight_queue_ms == 0 || !ctx.egfx_acks_seen || ctx.acks_suspended {
+            return None;
         }
         let measured = ctx.rtt_min_cur_ms.min(ctx.rtt_min_prev_ms);
         let base_rtt_ms = if measured.is_finite() {
@@ -3209,25 +3298,11 @@ impl Gfx {
             .unwrap()
             .shipped_bytes
             .saturating_sub(ctx.acked_bytes);
-        crate::latency_trace::record_us("unacked_bytes", unacked);
-        let now = Instant::now();
-        match inflight_gate(
-            unacked,
+        Some(InflightBudget {
             budget,
-            now.saturating_duration_since(ctx.last_ack_advance_at),
-            now.saturating_duration_since(ctx.last_inflight_release),
-            inflight_stall(base_rtt_ms),
-        ) {
-            InflightGate::Pass => false,
-            InflightGate::Release => {
-                ctx.last_inflight_release = now;
-                false
-            }
-            InflightGate::Hold => {
-                ctx.inflight_gated = true;
-                true
-            }
-        }
+            unacked,
+            base_rtt_ms,
+        })
     }
 
     /// The fast-path send for this capture of surface `surface_id`, when the
@@ -3241,7 +3316,8 @@ impl Gfx {
         damage: &Damage,
         label: usize,
     ) -> Option<FastShip> {
-        let rects = self.fast_path?.rects(damage, width, height)?;
+        let codec = self.fast_path?;
+        let rects = codec.rects(damage, width, height)?;
         // An earlier capture still in the encoder would land after the tiles
         // and paint its older pixels over them.
         if outstanding > 0 {
@@ -3255,17 +3331,61 @@ impl Gfx {
             last_shipped: ctx.last_shipped_frame_id.clone(),
             ship_times: ctx.ship_times.clone(),
             rects,
+            codec,
+            priority: None,
+        })
+    }
+
+    /// Records one primary capture's own changed rects for input priority.
+    pub fn note_capture_damage(&self, rects: &[crate::damage::Rect]) {
+        if let Some(c) = self.input_priority {
+            self.priority.lock().unwrap().observe(rects, c.window);
+        }
+    }
+
+    /// This capture's input-priority tiles; `bypass` lets it past the frame-rate gates. Caller holds `ctx`.
+    fn priority_ship(&self, ctx: &mut ConnectionContext, bypass: &mut bool) -> Option<FastShip> {
+        let config = self.input_priority?;
+        let surface_id = ctx.surface_id?;
+        let (width, height) = ctx.dims;
+        let mut priority = self.priority.lock().unwrap();
+        let sel = priority.take(config.tiles.max_px, width, height)?;
+        *bypass = priority.bypass_fps_gate(&sel);
+        drop(priority);
+        // The lossy tunnel may reorder the tiles and older frames; without rects nothing can be shielded.
+        if sel.rects.is_empty()
+            || self.egfx_on_lossy.load(Ordering::Relaxed)
+            || !ctx.damage.lock().unwrap().enabled()
+        {
+            return None;
+        }
+        if let Some(InflightBudget {
+            budget, unacked, ..
+        }) = self.inflight_budget(ctx)
+        {
+            if unacked > budget {
+                crate::latency_trace::record_us("m0.input_tile_budget_hold", unacked);
+                return None;
+            }
+        }
+        ctx.aux_view = None;
+        Some(FastShip {
+            server_handle: ctx.server_handle.clone(),
+            surface_id,
+            epoch: ctx.epoch,
+            last_shipped: ctx.last_shipped_frame_id.clone(),
+            ship_times: ctx.ship_times.clone(),
+            rects: sel.rects,
+            codec: config.tiles,
+            priority: Some((ctx.damage.clone(), sel.input_ms)),
         })
     }
 
     /// Sends the fast-path tiles as an EGFX frame of their own. Failures only
     /// log: the H.264 frame that follows carries the change anyway.
     fn ship_fast_path(&self, ship: FastShip, bgra: &[u8], stride: usize, label: usize) {
-        let Some(fast_path) = self.fast_path else {
-            return;
-        };
         let started = Instant::now();
-        let Some(tiles) = fast_path.tiles(bgra, stride, &ship.rects) else {
+        let Some(tiles) = ship.codec.tiles(bgra, stride, &ship.rects) else {
             debug!(rects = ?ship.rects, "EGFX fast path: rect outside the frame buffer");
             return;
         };
@@ -3281,6 +3401,10 @@ impl Gfx {
             debug!("EGFX fast path: send_bitmap_tiles_frame returned None");
             return;
         };
+        // Under `server_handle`, so no older frame computes its rects in between.
+        if let Some((tracker, _)) = &ship.priority {
+            tracker.lock().unwrap().shield(&ship.rects);
+        }
         // Counted like any shipped frame: ack lag, RTT ring and stats.
         ship.last_shipped
             .store(u64::from(frame_id), Ordering::Relaxed);
@@ -3315,6 +3439,33 @@ impl Gfx {
             bytes,
             "EGFX shipped fast-path frame"
         );
+        if let Some((_, input_ms)) = ship.priority {
+            if let Some(s) = crate::stats::global() {
+                s.input_tiles.fetch_add(1, Ordering::Relaxed);
+                s.input_tile_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+            let (since_input, first) = self.priority.lock().unwrap().shipped(input_ms);
+            let input_to_ship_us = since_input.as_micros() as u64;
+            if first {
+                info!(
+                    input_to_ship_us,
+                    frame_id,
+                    rects = ship.rects.len(),
+                    bytes,
+                    "EGFX input-priority tile shipped"
+                );
+            } else {
+                debug!(
+                    input_to_ship_us,
+                    frame_id,
+                    rects = ship.rects.len(),
+                    bytes,
+                    "EGFX input-priority tile shipped"
+                );
+            }
+            crate::latency_trace::record_us("m0.input_to_tile", input_to_ship_us);
+        }
         if crate::latency_trace::enabled() {
             let px: u64 = ship
                 .rects
@@ -3563,6 +3714,21 @@ impl Gfx {
                 )
             };
 
+            // The WireToSurface1 destination stays the whole surface; only
+            // the regions narrow.
+            let surface_rect = ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+
+            // Phase 2: lock `server_handle` ALONE (ctx already released).
+            // With input priority, rects are taken under `server_handle`, which its tiles shield under too.
+            let early = self
+                .input_priority
+                .is_some()
+                .then(|| server_handle.lock().unwrap());
             // Each frame's changed regions; `None` keeps the whole-surface
             // region the path always sent (MACRDP_EGFX_DIRTY_RECTS=0).
             // Lazy chroma also needs the rects themselves: where the client's chroma is 4:2:0 again.
@@ -3591,17 +3757,7 @@ impl Gfx {
                     crate::latency_trace::record_us(&format!("m{label}.region_px"), px);
                 }
             }
-            // The WireToSurface1 destination stays the whole surface; only
-            // the regions narrow.
-            let surface_rect = ExclusiveRectangle {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
-
-            // Phase 2: lock `server_handle` ALONE (ctx already released).
-            let mut server = server_handle.lock().unwrap();
+            let mut server = early.unwrap_or_else(|| server_handle.lock().unwrap());
             let egfx_channel_id = server
                 .channel_id()
                 .ok_or_else(|| anyhow!("EGFX: channel_id not assigned"))?;
@@ -6320,5 +6476,443 @@ mod tests {
         let ctx = guard.as_ref().unwrap();
         let id = ctx.last_shipped_frame_id.load(Ordering::Relaxed);
         assert_eq!(ctx.ship_times.lock().unwrap().slot(id).id, id);
+    }
+
+    fn priority_config() -> crate::input_priority::Config {
+        crate::input_priority::Config {
+            tiles: FastPath {
+                codec: crate::egfx_fast_path::Codec::Planar,
+                max_px: 32768,
+            },
+            // Long enough that a loaded test runner never leaves the window.
+            window: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn input_tiles_ship_ahead_and_keep_older_frames_off_them() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, GfxPdu};
+
+        let mut gfx = gfx_with_context();
+        gfx.input_priority = Some(priority_config());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        gfx.set_sender(tx);
+        let stats = crate::stats::enable();
+        let tiles_before = stats.input_tiles.load(Ordering::Relaxed);
+        let (handle, tracker) = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.damage = Arc::new(Mutex::new(DamageTracker::new(true, None)));
+            (ctx.server_handle.clone(), ctx.damage.clone())
+        };
+        let sid = {
+            let mut server = handle.lock().unwrap();
+            server.start(7).unwrap();
+            let advertise =
+                GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[avc_ready()]));
+            server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+            let sid = server
+                .create_surface_with_format(64, 48, PixelFormat::XRgb)
+                .unwrap();
+            server.drain_output();
+            sid
+        };
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.surface_id = Some(sid);
+            ctx.dims = (64, 48);
+        }
+        // A whole frame captured before the input is still in the encoder.
+        tracker.lock().unwrap().submitted(0, Damage::Full);
+
+        let tile = crate::damage::Rect {
+            left: 8,
+            top: 8,
+            right: 24,
+            bottom: 24,
+        };
+        crate::input_priority::note_input();
+        gfx.note_capture_damage(&[tile]);
+        let mut bypass = false;
+        let ship = {
+            let mut guard = gfx.ctx.lock().unwrap();
+            gfx.priority_ship(guard.as_mut().unwrap(), &mut bypass)
+        }
+        .expect("a fresh small change after the input");
+        assert!(!bypass, "the tiles carry the whole change");
+        assert_eq!(ship.rects, vec![tile]);
+        let (bgra, stride) = (vec![0x40u8; 64 * 48 * 4], 64 * 4);
+        gfx.ship_fast_path(ship, &bgra, stride, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::Egfx(EgfxServerMessage::SendMessages { .. }))
+        ));
+        assert!(stats.input_tiles.load(Ordering::Relaxed) > tiles_before);
+        assert!(stats.input_tile_bytes.load(Ordering::Relaxed) > 0);
+
+        // The older frame ships after the tiles but paints everything else.
+        let now = Instant::now();
+        let mut t = tracker.lock().unwrap();
+        let older = t.regions(0, true, 64, 48, now).expect("shielded");
+        assert!(!older.iter().any(|r| r.intersects(&tile)), "{older:?}");
+        let px: u64 = older.iter().map(|r| r.area()).sum();
+        assert_eq!(px, 64 * 48 - tile.area());
+        // The tile capture's own frame repaints the rect.
+        t.submitted(1, Damage::Full);
+        assert_eq!(t.regions(1, true, 64, 48, now), None);
+        drop(t);
+        let mut guard = gfx.ctx.lock().unwrap();
+        assert!(
+            gfx.priority_ship(guard.as_mut().unwrap(), &mut bypass)
+                .is_none(),
+            "each change ships once"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_keeps_a_share_for_input_tiles() {
+        let mut gfx = gfx_with_context();
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        ctx.egfx_acks_seen = true;
+        ctx.rtt_min_cur_ms = 30.0;
+        ctx.surface_id = Some(1);
+        ctx.dims = (64, 48);
+        // 5 Mbit/s over 30 ms + 80 ms: 68 750 bytes, a quarter kept for tiles.
+        let budget =
+            inflight_byte_budget(5_000_000, 30.0, gfx.inflight_queue_ms, INFLIGHT_MIN_BYTES);
+        assert_eq!(budget, 68_750);
+        ctx.ship_times
+            .lock()
+            .unwrap()
+            .record(1, Instant::now(), 60_000);
+        assert!(
+            !gfx.inflight_bytes_over_budget(ctx),
+            "off: the whole budget is H.264's"
+        );
+        drop(guard);
+        gfx.input_priority = Some(priority_config());
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        assert!(
+            gfx.inflight_bytes_over_budget(ctx),
+            "frames stop short of the reserve"
+        );
+        drop(guard);
+
+        let tile = crate::damage::Rect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        };
+        let mut bypass = false;
+        crate::input_priority::note_input();
+        gfx.note_capture_damage(&[tile]);
+        let mut guard = gfx.ctx.lock().unwrap();
+        let ctx = guard.as_mut().unwrap();
+        assert!(
+            gfx.priority_ship(ctx, &mut bypass).is_some(),
+            "tiles use the reserve"
+        );
+
+        ctx.ship_times
+            .lock()
+            .unwrap()
+            .record(2, Instant::now(), 10_000);
+        drop(guard);
+        gfx.note_capture_damage(&[tile]);
+        let mut guard = gfx.ctx.lock().unwrap();
+        assert!(
+            gfx.priority_ship(guard.as_mut().unwrap(), &mut bypass)
+                .is_none(),
+            "not past the whole budget"
+        );
+    }
+
+    #[test]
+    fn input_tiles_stay_off_the_lossy_tunnel() {
+        let mut gfx = gfx_with_context();
+        gfx.input_priority = Some(priority_config());
+        gfx.egfx_on_lossy.store(true, Ordering::Relaxed);
+        {
+            let mut guard = gfx.ctx.lock().unwrap();
+            let ctx = guard.as_mut().unwrap();
+            ctx.surface_id = Some(1);
+            ctx.dims = (64, 48);
+        }
+        crate::input_priority::note_input();
+        gfx.note_capture_damage(&[crate::damage::Rect {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 8,
+        }]);
+        let mut bypass = false;
+        let mut guard = gfx.ctx.lock().unwrap();
+        assert!(gfx
+            .priority_ship(guard.as_mut().unwrap(), &mut bypass)
+            .is_none());
+    }
+
+    /// Rects one shipped EGFX event paints: tile destinations and AVC420 regions, right and bottom exclusive.
+    fn painted(event: ServerEvent) -> Vec<crate::damage::Rect> {
+        use ironrdp_core::decode;
+        use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
+        use ironrdp_egfx::pdu::{Avc420BitmapStream, Codec1Type, GfxPdu};
+
+        let ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) = event else {
+            return Vec::new();
+        };
+        let (mut out, mut message, mut total) = (Vec::new(), Vec::new(), 0usize);
+        for m in messages {
+            let bytes = m.encode_unframed_pdu().unwrap();
+            let DrdynvcServerPdu::Data(data) = decode::<DrdynvcServerPdu>(&bytes).unwrap() else {
+                continue;
+            };
+            match data {
+                DrdynvcDataPdu::DataFirst(p) => {
+                    total = p.length() as usize;
+                    message = p.data().to_vec();
+                }
+                DrdynvcDataPdu::Data(p) => {
+                    if total == 0 {
+                        message.clear();
+                    }
+                    message.extend_from_slice(p.data());
+                }
+            }
+            if total > message.len() {
+                continue;
+            }
+            total = 0;
+            assert_eq!(&message[..2], &[0xE0, 0x04]);
+            let GfxPdu::WireToSurface1(w) = decode::<GfxPdu>(&message[2..]).unwrap() else {
+                continue;
+            };
+            if w.codec_id == Codec1Type::Avc420 {
+                let stream = decode::<Avc420BitmapStream<'_>>(&w.bitmap_data).unwrap();
+                out.extend(stream.rectangles.iter().map(|r| crate::damage::Rect {
+                    left: u32::from(r.left),
+                    top: u32::from(r.top),
+                    right: u32::from(r.right),
+                    bottom: u32::from(r.bottom),
+                }));
+            } else {
+                let d = &w.destination_rectangle;
+                out.push(crate::damage::Rect {
+                    left: u32::from(d.left),
+                    top: u32::from(d.top),
+                    right: u32::from(d.right),
+                    bottom: u32::from(d.bottom),
+                });
+            }
+        }
+        out
+    }
+
+    /// The capture loop's side of `submit`: damage accumulates until a capture is encoded.
+    struct CaptureLoop {
+        gfx: Gfx,
+        rx: mpsc::UnboundedReceiver<ServerEvent>,
+        frame: Vec<u8>,
+        damage: Damage,
+    }
+
+    impl CaptureLoop {
+        const W: u16 = 128;
+        const H: u16 = 96;
+
+        /// A ready AVC420 connection with the fast path on and no periodic full frame.
+        fn start(priority: Option<crate::input_priority::Config>) -> Self {
+            use ironrdp_core::encode_vec;
+            use ironrdp_dvc::DvcProcessor as _;
+            use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, GfxPdu};
+
+            let mut gfx = Gfx::new(
+                crate::capture::SharedDesktopSize::new(Self::W, Self::H),
+                30,
+                5_000_000,
+                2.0,
+                2,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                true,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU32::new(0)),
+            );
+            gfx.fast_path = Some(FastPath {
+                codec: crate::egfx_fast_path::Codec::Planar,
+                max_px: 1024,
+            });
+            gfx.input_priority = priority;
+            gfx.damage_policy = DamageTracker::new(true, None);
+            let (_, handle) = gfx.build_server_with_handle().unwrap();
+            let (tx, rx) = mpsc::unbounded_channel();
+            gfx.set_sender(tx);
+            {
+                let mut server = handle.lock().unwrap();
+                server.start(7).unwrap();
+                let advertise =
+                    GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[
+                        avc_ready(),
+                    ]));
+                server.process(7, &encode_vec(&advertise).unwrap()).unwrap();
+            }
+            let frame = vec![0x80u8; usize::from(Self::W) * usize::from(Self::H) * 4];
+            let mut lp = Self {
+                gfx,
+                rx,
+                frame,
+                damage: Damage::Full,
+            };
+            assert_eq!(lp.capture(&[]), OutputSubmit::Encoded);
+            lp.drain();
+            lp
+        }
+
+        fn paint(&mut self, r: crate::damage::Rect, value: u8) {
+            let stride = usize::from(Self::W) * 4;
+            for y in r.top as usize..r.bottom as usize {
+                self.frame[y * stride + r.left as usize * 4..y * stride + r.right as usize * 4]
+                    .fill(value);
+            }
+        }
+
+        /// One capture whose own changed rects are `changed`.
+        fn capture(&mut self, changed: &[crate::damage::Rect]) -> OutputSubmit {
+            self.gfx.note_capture_damage(changed);
+            self.damage.add_rects(changed.iter().copied());
+            let stride = usize::from(Self::W) * 4;
+            let status = self
+                .gfx
+                .submit_bgra_status(&self.frame, stride, false, self.damage.clone())
+                .unwrap();
+            if status == OutputSubmit::Encoded {
+                self.damage = Damage::default();
+            }
+            status
+        }
+
+        /// Waits for the encoder to ship everything, then returns the rects shipped since the last call.
+        fn drain(&mut self) -> Vec<crate::damage::Rect> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let done = {
+                    let guard = self.gfx.ctx.lock().unwrap();
+                    let ctx = guard.as_ref().unwrap();
+                    ctx.shipped.load(Ordering::Relaxed) >= ctx.submitted.load(Ordering::Relaxed)
+                };
+                if done {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the encoder never shipped");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let mut out = Vec::new();
+            while let Ok(event) = self.rx.try_recv() {
+                out.extend(painted(event));
+            }
+            out
+        }
+    }
+
+    fn covered(rects: &[crate::damage::Rect], r: &crate::damage::Rect) -> bool {
+        (r.top..r.bottom).all(|y| {
+            (r.left..r.right).all(|x| {
+                rects
+                    .iter()
+                    .any(|o| x >= o.left && x < o.right && y >= o.top && y < o.bottom)
+            })
+        })
+    }
+
+    const SQUARE: crate::damage::Rect = crate::damage::Rect {
+        left: 40,
+        top: 40,
+        right: 56,
+        bottom: 56,
+    };
+
+    #[test]
+    fn a_small_change_after_idle_ships_with_input_priority_off() {
+        small_change_after_idle(None);
+    }
+
+    #[test]
+    fn a_small_change_after_idle_ships_with_input_priority_on() {
+        small_change_after_idle(Some(priority_config()));
+    }
+
+    #[test]
+    fn a_small_change_on_a_busy_screen_ships_with_input_priority_off() {
+        small_change_on_a_busy_screen(None);
+    }
+
+    #[test]
+    fn a_small_change_on_a_busy_screen_ships_with_input_priority_on() {
+        small_change_on_a_busy_screen(Some(priority_config()));
+    }
+
+    fn small_change_after_idle(priority: Option<crate::input_priority::Config>) {
+        let mut lp = CaptureLoop::start(priority);
+        // Past the whole-surface frames that follow a keyframe.
+        let blip = crate::damage::Rect {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+        for i in 0..12u8 {
+            lp.paint(blip, i);
+            assert_eq!(lp.capture(&[blip]), OutputSubmit::Encoded);
+            lp.drain();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        for value in [0x00u8, 0xFF, 0x00] {
+            crate::input_priority::note_input();
+            lp.paint(SQUARE, value);
+            assert_eq!(lp.capture(&[SQUARE]), OutputSubmit::Encoded);
+            let shipped = lp.drain();
+            assert!(covered(&shipped, &SQUARE), "{shipped:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn small_change_on_a_busy_screen(priority: Option<crate::input_priority::Config>) {
+        let mut lp = CaptureLoop::start(priority);
+        let busy = crate::damage::Rect {
+            left: 96,
+            top: 0,
+            right: 128,
+            bottom: 96,
+        };
+        let mut shipped = Vec::new();
+        for i in 0..40u8 {
+            lp.paint(busy, i.wrapping_mul(37));
+            let mut changed = vec![busy];
+            if i == 20 {
+                crate::input_priority::note_input();
+                lp.paint(SQUARE, 0xFF);
+                changed.push(SQUARE);
+            }
+            lp.capture(&changed);
+            while let Ok(event) = lp.rx.try_recv() {
+                if i >= 20 {
+                    shipped.extend(painted(event));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        // The last capture may have been dropped; offering it again carries what it held.
+        while !lp.damage.is_empty() && lp.capture(&[]) != OutputSubmit::Encoded {
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        shipped.extend(lp.drain());
+        assert!(covered(&shipped, &SQUARE), "{shipped:?}");
     }
 }

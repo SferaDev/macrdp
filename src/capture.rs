@@ -2591,11 +2591,14 @@ mod macos {
                         Some(Ok(changed)) => changed,
                         _ => continue,
                     };
-                    self.damage.add_rects(
-                        changed
-                            .iter()
-                            .map(|&(x, y, w, h)| Rect::from_xywh(x, y, w, h)),
-                    );
+                    let fresh: Vec<Rect> = changed
+                        .iter()
+                        .map(|&(x, y, w, h)| Rect::from_xywh(x, y, w, h))
+                        .collect();
+                    if let Some(gfx) = self.gfx.as_ref() {
+                        gfx.note_capture_damage(&fresh);
+                    }
+                    self.damage.add_rects(fresh);
                     let changed = !changed.is_empty();
                     // See the secondary capture: skip re-encoding an unchanged
                     // frame unless a dropped one waits, a keyframe is pending

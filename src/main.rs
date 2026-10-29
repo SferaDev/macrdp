@@ -43,6 +43,8 @@ mod file_promise_lazy;
 mod h264;
 mod health;
 mod input;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod input_priority;
 mod keyboard_layout;
 mod latency_trace;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -2676,6 +2678,13 @@ fn args_from_config(path: &Path) -> Result<Args> {
         // Small-change fast path (h264.rs); env-read when each EGFX encoder starts.
         ("EGFX_FAST_PATH", "MACRDP_EGFX_FAST_PATH"),
         ("EGFX_FAST_PATH_MAX_PX", "MACRDP_EGFX_FAST_PATH_MAX_PX"),
+        // Input-priority tiles (input_priority.rs); env-read when each EGFX encoder starts.
+        ("INPUT_PRIORITY", "MACRDP_INPUT_PRIORITY"),
+        ("INPUT_PRIORITY_MAX_PX", "MACRDP_INPUT_PRIORITY_MAX_PX"),
+        (
+            "INPUT_PRIORITY_WINDOW_MS",
+            "MACRDP_INPUT_PRIORITY_WINDOW_MS",
+        ),
         // Lazy AVC444 chroma (lazy_chroma.rs); env-read when each EGFX encoder starts.
         ("AVC444", "MACRDP_AVC444"),
     ] {
