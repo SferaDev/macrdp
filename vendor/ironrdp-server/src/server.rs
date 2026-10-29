@@ -535,14 +535,19 @@ pub fn notsent_lowat_bytes(env: Option<&str>) -> Option<u32> {
 #[cfg(target_os = "macos")]
 pub const TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
 
-#[cfg(target_os = "macos")]
 pub fn apply_notsent_lowat(stream: &tokio::net::TcpStream, bytes: u32) -> std::io::Result<()> {
+    use std::os::fd::AsFd as _;
+    setsockopt_notsent_lowat(stream.as_fd(), bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn setsockopt_notsent_lowat(fd: std::os::fd::BorrowedFd<'_>, bytes: u32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
-    // SAFETY: the fd is a live TCP socket owned by `stream`; `value` is a c_int option value.
+    // SAFETY: `fd` is a live TCP socket for the borrow; `value` is a c_int option value.
     let rc = unsafe {
         libc::setsockopt(
-            stream.as_raw_fd(),
+            fd.as_raw_fd(),
             libc::IPPROTO_TCP,
             TCP_NOTSENT_LOWAT,
             core::ptr::from_ref(&value).cast(),
@@ -557,8 +562,28 @@ pub fn apply_notsent_lowat(stream: &tokio::net::TcpStream, bytes: u32) -> std::i
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn apply_notsent_lowat(_stream: &tokio::net::TcpStream, _bytes: u32) -> std::io::Result<()> {
+fn setsockopt_notsent_lowat(_fd: std::os::fd::BorrowedFd<'_>, _bytes: u32) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Whether the socket reports writable; unlike write(2), poll(2) honours `TCP_NOTSENT_LOWAT` on macOS.
+#[cfg(target_os = "macos")]
+fn socket_writable(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for a live socket, zero timeout.
+    let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+    // An error or hangup also counts, so the write that follows reports it.
+    rc != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn socket_writable(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    true
 }
 
 fn set_notsent_lowat(stream: &tokio::net::TcpStream) {
@@ -568,6 +593,127 @@ fn set_notsent_lowat(stream: &tokio::net::TcpStream) {
     match apply_notsent_lowat(stream, bytes) {
         Ok(()) => debug!(bytes, "TCP_NOTSENT_LOWAT set on the RDP socket"),
         Err(error) => warn!(%error, "TCP_NOTSENT_LOWAT on the RDP socket failed"),
+    }
+}
+
+/// Moves the events through the first EGFX frame into `batch`, plus the clipboard and control events queued behind it; true when it holds a frame.
+fn next_event_batch(queued: &mut std::collections::VecDeque<ServerEvent>, batch: &mut Vec<ServerEvent>) -> bool {
+    #[cfg(feature = "egfx")]
+    let is_frame = |e: &ServerEvent| matches!(e, ServerEvent::Egfx(_));
+    #[cfg(not(feature = "egfx"))]
+    let is_frame = |_: &ServerEvent| false;
+    let Some(frame) = queued.iter().position(is_frame) else {
+        batch.extend(queued.drain(..));
+        return false;
+    };
+    batch.extend(queued.drain(..=frame));
+    // The clipboard reorder in `dispatch_server_events` and the eviction grace both assume these never wait behind video.
+    let rest = core::mem::take(queued);
+    for ev in rest {
+        if matches!(
+            ev,
+            ServerEvent::Clipboard(_)
+                | ServerEvent::ClipboardFileCopy(_)
+                | ServerEvent::Quit(_)
+                | ServerEvent::EvictedByOtherConnection
+        ) {
+            batch.push(ev);
+        } else {
+            queued.push_back(ev);
+        }
+    }
+    true
+}
+
+/// How often an EGFX write re-checks that the unsent bytes fell under the cap.
+const NOTSENT_POLL: Duration = Duration::from_millis(2);
+/// Longest an EGFX write waits for the cap before writing anyway.
+const NOTSENT_MAX_WAIT: Duration = Duration::from_millis(500);
+
+/// (vendored, divergence 35) The live connection's unsent-byte cap, which the encoder retunes to its target rate.
+///
+/// macOS write(2) ignores `TCP_NOTSENT_LOWAT` and fills the whole send buffer;
+/// only poll/kqueue honour it. `dispatch_events` therefore waits in
+/// [`Self::wait_for_room`] before each EGFX frame, so video queues in
+/// userspace and audio, input and heartbeats reach the kernel ahead of it.
+pub struct NotsentLowat {
+    max: Option<u32>,
+    socket: std::sync::Mutex<Option<std::os::fd::OwnedFd>>,
+}
+
+impl NotsentLowat {
+    /// `MACRDP_TCP_NOTSENT_LOWAT` is the largest cap, 0 turns the cap off.
+    pub fn from_env() -> Self {
+        Self::with_max(notsent_lowat_bytes(
+            std::env::var("MACRDP_TCP_NOTSENT_LOWAT").ok().as_deref(),
+        ))
+    }
+
+    pub fn with_max(max: Option<u32>) -> Self {
+        Self {
+            max,
+            socket: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn max_bytes(&self) -> Option<u32> {
+        self.max
+    }
+
+    /// Sets the cap (clamped to the max) on the live socket; `Ok(false)` when off or no socket is attached.
+    pub fn set(&self, bytes: u32) -> std::io::Result<bool> {
+        use std::os::fd::AsFd as _;
+        let Some(max) = self.max else {
+            return Ok(false);
+        };
+        let socket = self.socket.lock().unwrap();
+        let Some(fd) = socket.as_ref() else {
+            return Ok(false);
+        };
+        setsockopt_notsent_lowat(fd.as_fd(), bytes.min(max))?;
+        Ok(true)
+    }
+
+    /// Tracks `stream` until the guard drops; holds a dup so a retune can never hit a reused fd.
+    pub fn attach(self: &Arc<Self>, stream: &TcpStream) -> NotsentAttached {
+        use std::os::fd::AsFd as _;
+        match stream.as_fd().try_clone_to_owned() {
+            Ok(fd) => *self.socket.lock().unwrap() = Some(fd),
+            Err(error) => warn!(%error, "could not track the RDP socket for TCP_NOTSENT_LOWAT"),
+        }
+        NotsentAttached(Arc::clone(self))
+    }
+
+    /// Closes the dup, so the socket closes with the connection's own fd.
+    fn detach(&self) {
+        self.socket.lock().unwrap().take();
+    }
+
+    /// Whether more than the cap sits unsent on the attached socket.
+    pub fn over_cap(&self) -> bool {
+        use std::os::fd::AsFd as _;
+        self.max.is_some()
+            && self
+                .socket
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|fd| !socket_writable(fd.as_fd()))
+    }
+
+    async fn wait_for_room(&self) {
+        let started = Instant::now();
+        while self.over_cap() && started.elapsed() < NOTSENT_MAX_WAIT {
+            tokio::time::sleep(NOTSENT_POLL).await;
+        }
+    }
+}
+
+pub struct NotsentAttached(Arc<NotsentLowat>);
+
+impl Drop for NotsentAttached {
+    fn drop(&mut self) {
+        self.0.detach();
     }
 }
 
@@ -684,6 +830,8 @@ pub struct RdpServer {
     /// adaptive-bitrate seeding in `h264.rs`) hold a clone. 0 = unknown /
     /// unsupported platform; a sub-millisecond LAN RTT stores as 1.
     link_rtt_ms: Option<Arc<AtomicU32>>,
+    /// (vendored, divergence 35) The live socket's unsent-byte cap.
+    notsent: Arc<NotsentLowat>,
     /// (vendored, extends divergence 12) The cookie registered for the CURRENT
     /// connection's multitransport offer, so the post-connection reset can
     /// evict it from the registry no matter how the connection ended. Without
@@ -1366,6 +1514,7 @@ impl RdpServer {
             display_suppressed: Arc::new(AtomicBool::new(false)),
             keyboard_layout: None,
             link_rtt_ms: None,
+            notsent: Arc::new(NotsentLowat::from_env()),
             #[cfg(feature = "multitransport")]
             current_offer_cookie: None,
             auto_reconnect_cookie: None,
@@ -1517,6 +1666,11 @@ impl RdpServer {
     /// 0 = unknown. Must be called before any client connects.
     pub fn set_link_rtt_handle(&mut self, handle: Arc<AtomicU32>) {
         self.link_rtt_ms = Some(handle);
+    }
+
+    /// (vendored, divergence 35) Share the unsent-byte cap so the encoder can retune it to its target rate.
+    pub fn set_notsent_lowat_handle(&mut self, handle: Arc<NotsentLowat>) {
+        self.notsent = handle;
     }
 
     /// (vendored) Install a UDP-multitransport provider (MS-RDPEMT). When set,
@@ -2163,11 +2317,21 @@ impl RdpServer {
                 // after it (the loop below both reads and re-arms it).
                 let mut recently_evicted = self.recently_evicted.take();
 
+                let notsent = Arc::clone(&self.notsent);
                 let outcome = {
+                    let attached;
                     let mut conn: core::pin::Pin<Box<dyn Future<Output = Result<()>> + '_>> = match entry {
-                        Entry::Fresh(stream, _) => Box::pin(self.run_connection(stream)),
-                        Entry::Negotiated(candidate, _) => Box::pin(self.serve_negotiated(candidate)),
+                        Entry::Fresh(stream, _) => {
+                            attached = notsent.attach(&stream);
+                            Box::pin(self.run_connection(stream))
+                        }
+                        Entry::Negotiated(candidate, _) => {
+                            attached = notsent.attach(candidate.framed.get_inner().0.get_ref().0);
+                            Box::pin(self.serve_negotiated(candidate))
+                        }
                     };
+                    // Declared after `conn` so it drops first: the dup must not hold a cancelled socket open.
+                    let _attached = attached;
                     let mut probe: core::pin::Pin<Box<dyn Future<Output = Option<NegotiatedCandidate>>>> =
                         Box::pin(core::future::pending());
                     let mut probing = false;
@@ -2195,6 +2359,7 @@ impl RdpServer {
                             // session left; finish its negotiation and serve
                             // it next if it authenticates.
                             PreemptRace::Ended(res) => {
+                                notsent.detach();
                                 if probing {
                                     // Not a preemption (nothing was taken from
                                     // anyone) — hand it straight to the next
@@ -3162,15 +3327,24 @@ impl RdpServer {
         let this = Rc::clone(&s);
         let mut ev_receiver = ev_receiver.lock().await;
         let dispatch_events = async move {
+            let notsent = Arc::clone(&this.lock().await.notsent);
+            let mut queued = std::collections::VecDeque::new();
             let mut events = Vec::with_capacity(100);
             loop {
-                let nevents = ev_receiver.recv_many(&mut events, 100).await;
-                if nevents == 0 {
-                    debug!("No sever events.. stopping");
-                    break Ok(RunState::Disconnect);
+                if queued.is_empty() {
+                    let nevents = ev_receiver.recv_many(&mut events, 100).await;
+                    if nevents == 0 {
+                        debug!("No sever events.. stopping");
+                        break Ok(RunState::Disconnect);
+                    }
+                    queued.extend(events.drain(..));
                 }
                 while let Ok(ev) = ev_receiver.try_recv() {
-                    events.push(ev);
+                    queued.push_back(ev);
+                }
+                // (vendored, divergence 35) One video frame per batch, waiting for the unsent cap outside the `Self` lock.
+                if next_event_batch(&mut queued, &mut events) {
+                    notsent.wait_for_room().await;
                 }
                 let mut this = this.lock().await;
                 match this

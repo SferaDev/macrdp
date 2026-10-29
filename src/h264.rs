@@ -489,6 +489,8 @@ struct ConnectionContext {
     /// `on_qoe_metrics` (which only sees the context, not the owning `Gfx`) can
     /// set the [`QoeEvidence::presented_clean`] latch. Not RTT-scaled.
     min_render_reports: u64,
+    /// The unsent cap last applied to this connection's socket.
+    notsent_cap: crate::rate_control::NotsentCap,
 }
 
 impl ConnectionContext {
@@ -1465,6 +1467,8 @@ pub struct Gfx {
     link_memory: Arc<Mutex<Option<LinkMemory>>>,
     /// How long `link_memory` stays a valid seed; `MACRDP_ADAPTIVE_SEED_MEMORY_SECS`, default 900, 0 disables.
     seed_memory_ttl: Duration,
+    /// The live socket's `TCP_NOTSENT_LOWAT`, retuned to the target (vendored divergence 35).
+    notsent: Arc<ironrdp_server::NotsentLowat>,
 }
 
 impl Gfx {
@@ -1481,6 +1485,7 @@ impl Gfx {
         adaptive_bitrate: bool,
         congestion_retransmits: Arc<AtomicU64>,
         link_rtt_ms: Arc<AtomicU32>,
+        notsent: Arc<ironrdp_server::NotsentLowat>,
     ) -> Self {
         let wire_format = WireFormat::from_env();
         let (recovery_enabled, recovery_params) = recovery_config_from_env();
@@ -1756,6 +1761,7 @@ impl Gfx {
             adaptive_slow_start,
             link_memory: Arc::new(Mutex::new(None)),
             seed_memory_ttl,
+            notsent,
         }
     }
 
@@ -2237,6 +2243,7 @@ impl Gfx {
             // BEFORE borrowing the encoder, then apply them live. No-op unless
             // adaptive is enabled AND EGFX is on a UDP tunnel.
             let adaptive = self.adaptive_bitrate_step(ctx);
+            self.follow_notsent_cap(ctx);
             let Some(encoder) = ctx.encoder.as_mut() else {
                 return Ok(OutputSubmit::Busy);
             };
@@ -3181,6 +3188,35 @@ impl Gfx {
         false
     }
 
+    /// Keeps the socket's unsent video near 25 ms at the current target.
+    fn follow_notsent_cap(&self, ctx: &mut ConnectionContext) {
+        let Some(max) = self.notsent.max_bytes() else {
+            return;
+        };
+        let target_bps = if self.adaptive_enabled {
+            ctx.adaptive_target_bps
+        } else {
+            self.bitrate_bps
+        };
+        let Some(cap) = ctx.notsent_cap.retune(target_bps, max) else {
+            return;
+        };
+        match self.notsent.set(cap) {
+            Ok(true) => {
+                ctx.notsent_cap.applied(cap);
+                debug!(
+                    cap_bytes = cap,
+                    target_bps, "TCP_NOTSENT_LOWAT follows the target"
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                ctx.notsent_cap.applied(cap);
+                warn!(%error, cap_bytes = cap, "TCP_NOTSENT_LOWAT retune failed");
+            }
+        }
+    }
+
     /// Frame counts miss what matters on a WAN link: one IDR can be a second of queue, so bound the unacked bytes too.
     fn inflight_bytes_over_budget(&self, ctx: &mut ConnectionContext) -> bool {
         if self.inflight_queue_ms == 0 {
@@ -3965,6 +4001,7 @@ impl GfxServerFactory for Gfx {
             link_rtt_ms,
             blank_gate_logged: false,
             min_render_reports: self.blank_params.min_render_reports,
+            notsent_cap: crate::rate_control::NotsentCap::default(),
         });
         Some((
             GfxDvcBridge::with_decline_flag(handle.clone(), egfx_declined),
@@ -6017,6 +6054,7 @@ mod tests {
             true,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(ironrdp_server::NotsentLowat::from_env()),
         );
         assert!(gfx.build_server_with_handle().is_some());
         gfx

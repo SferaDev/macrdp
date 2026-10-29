@@ -3535,6 +3535,9 @@ async fn async_main() -> Result<()> {
     // 0 = unknown.
     let link_rtt_ms = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
+    // The RDP socket's unsent-byte cap; the H.264 pipeline retunes it to its target (divergence 35).
+    let notsent_lowat = std::sync::Arc::new(ironrdp_server::NotsentLowat::from_env());
+
     // EGFX/H.264 video pipeline (macOS-only; opt-in via --enable-h264). One
     // clone drives the builder's GfxServerFactory (protocol side); another
     // rides on CaptureDisplay, where the capture loop feeds it BGRA frames.
@@ -3552,6 +3555,7 @@ async fn async_main() -> Result<()> {
             args.adaptive_bitrate,
             congestion_retransmits.clone(),
             link_rtt_ms.clone(),
+            notsent_lowat.clone(),
         )
     });
 
@@ -3783,6 +3787,7 @@ async fn async_main() -> Result<()> {
     // connection (divergence 15) into this cell; the H.264 pipeline reads it
     // for link-aware blank-recovery gating + adaptive-bitrate seeding.
     server.set_link_rtt_handle(link_rtt_ms.clone());
+    server.set_notsent_lowat_handle(notsent_lowat);
 
     // Client-resolution auto-adopt: the vendored acceptor reads the desktop
     // size the client requests in its GCC Client Core Data and negotiates
@@ -4644,5 +4649,95 @@ mod socket_tests {
         };
         assert_eq!(rc, 0);
         assert_eq!(value, 65536);
+    }
+    #[cfg(target_os = "macos")]
+    fn read_notsent_lowat(stream: &tokio::net::TcpStream) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: reading an int socket option into a correctly sized buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                0x201,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        value
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn notsent_handle_retunes_the_attached_socket_only() {
+        use ironrdp_server::NotsentLowat;
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let (stream, _) = accepted.unwrap();
+        let _client = client.unwrap();
+        let handle = Arc::new(NotsentLowat::with_max(Some(128 * 1024)));
+        assert!(!handle.set(40_000).unwrap(), "no socket attached yet");
+        let attached = handle.attach(&stream);
+        assert!(handle.set(40_000).unwrap());
+        assert_eq!(read_notsent_lowat(&stream), 40_000);
+        assert!(handle.set(1 << 20).unwrap());
+        assert_eq!(
+            read_notsent_lowat(&stream),
+            128 * 1024,
+            "clamped to the max"
+        );
+        drop(attached);
+        assert!(!handle.set(40_000).unwrap(), "detached with the connection");
+        assert_eq!(read_notsent_lowat(&stream), 128 * 1024);
+
+        let off = Arc::new(NotsentLowat::with_max(None));
+        let _attached = off.attach(&stream);
+        assert!(!off.set(40_000).unwrap());
+        assert!(!off.over_cap());
+    }
+
+    /// write(2) fills the send buffer past the cap; only poll sees it, which is what EGFX writes wait on.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn over_cap_follows_unsent_bytes_that_write_ignores() {
+        use ironrdp_server::NotsentLowat;
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let (stream, _) = accepted.unwrap();
+        let mut client = client.unwrap();
+        let handle = Arc::new(NotsentLowat::with_max(Some(128 * 1024)));
+        let _attached = handle.attach(&stream);
+        let cap = 16 * 1024;
+        assert!(handle.set(cap).unwrap());
+        assert!(!handle.over_cap());
+        let chunk = vec![0u8; 64 * 1024];
+        let mut written = 0;
+        while let Ok(n) = stream.try_write(&chunk) {
+            written += n;
+        }
+        assert!(
+            written > 4 * cap as usize,
+            "write accepted only {written} bytes"
+        );
+        assert!(handle.over_cap());
+        let mut sink = vec![0u8; 64 * 1024];
+        let mut read = 0;
+        while read < written {
+            read += client.read(&mut sink).await.unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while handle.over_cap() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!handle.over_cap(), "drained socket still over the cap");
     }
 }

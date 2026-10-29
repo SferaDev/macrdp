@@ -657,9 +657,78 @@ pub fn idr_allowance_ms(
     }
 }
 
+/// Video the kernel may hold unsent ahead of a new update, as time at the target rate.
+const NOTSENT_MS: f64 = 25.0;
+/// The unsent cap never goes below this, so a slow link still fills a segment train.
+pub const NOTSENT_MIN_BYTES: u32 = 16 * 1024;
+/// A new cap is applied only once it moves this far from the last one.
+const NOTSENT_RETUNE: f64 = 0.2;
+
+/// `TCP_NOTSENT_LOWAT` for `target_bps`: about 25 ms of video, within 16 KiB and `max_bytes`.
+pub fn notsent_cap_bytes(target_bps: u32, max_bytes: u32) -> u32 {
+    let bytes = (f64::from(target_bps) / 8.0 * NOTSENT_MS / 1000.0) as u32;
+    bytes.clamp(NOTSENT_MIN_BYTES.min(max_bytes), max_bytes)
+}
+
+/// The unsent cap last applied to the connection's socket.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NotsentCap {
+    applied: Option<u32>,
+}
+
+impl NotsentCap {
+    /// The cap to apply for `target_bps`, or `None` while it is within 20% of the applied one.
+    pub fn retune(&self, target_bps: u32, max_bytes: u32) -> Option<u32> {
+        let cap = notsent_cap_bytes(target_bps, max_bytes);
+        self.applied
+            .is_none_or(|a| f64::from(cap.abs_diff(a)) > f64::from(a) * NOTSENT_RETUNE)
+            .then_some(cap)
+    }
+
+    pub fn applied(&mut self, cap: u32) {
+        self.applied = Some(cap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notsent_cap_is_25_ms_of_the_target_within_its_clamps() {
+        let max = 128 * 1024;
+        // 3 Mbit/s: 9 375 bytes of video, raised to the 16 KiB floor (44 ms).
+        assert_eq!(notsent_cap_bytes(3_000_000, max), NOTSENT_MIN_BYTES);
+        assert_eq!(notsent_cap_bytes(13_000_000, max), 40_625);
+        assert_eq!(notsent_cap_bytes(30_000_000, max), 93_750);
+        assert_eq!(notsent_cap_bytes(100_000_000, max), max);
+        // An override below the floor wins over the floor.
+        assert_eq!(notsent_cap_bytes(30_000_000, 8 * 1024), 8 * 1024);
+        assert_eq!(notsent_cap_bytes(0, max), NOTSENT_MIN_BYTES);
+    }
+
+    #[test]
+    fn notsent_cap_retunes_only_on_a_20_percent_move() {
+        let max = 128 * 1024;
+        let mut cap = NotsentCap::default();
+        assert_eq!(
+            cap.retune(13_000_000, max),
+            Some(40_625),
+            "first target always applies"
+        );
+        cap.applied(40_625);
+        assert_eq!(cap.retune(15_000_000, max), None, "+15%");
+        assert_eq!(cap.retune(11_000_000, max), None, "-15%");
+        assert_eq!(cap.retune(16_000_000, max), Some(50_000), "+23%");
+        assert_eq!(cap.retune(10_000_000, max), Some(31_250), "-23%");
+        // An unapplied retune leaves the reference where it was.
+        assert_eq!(cap.retune(15_000_000, max), None);
+        // Both ends of the floor clamp to the same cap: nothing to retune.
+        cap.applied(NOTSENT_MIN_BYTES);
+        assert_eq!(cap.retune(2_000_000, max), None);
+        assert_eq!(cap.retune(5_000_000, max), None);
+        assert_eq!(cap.retune(8_000_000, max), Some(25_000));
+    }
 
     fn cfg(ceiling_bps: u32) -> RateConfig {
         RateConfig {

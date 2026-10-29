@@ -642,7 +642,7 @@ Latency tracing and encoder mode (env, **settable through `config.env`** as
 ```
 MACRDP_LATENCY_TRACE=1   # log per-stage p50/p95/max (µs) every 5 s, target macrdp::latency
 MACRDP_VT_LOW_LATENCY=1  # VideoToolbox low-latency rate control (encoder spec)
-MACRDP_TCP_NOTSENT_LOWAT=131072  # bytes the kernel may hold unsent on the RDP socket (0 = OS default, unbounded autotuning)
+MACRDP_TCP_NOTSENT_LOWAT=131072  # most bytes the kernel may hold unsent on the RDP socket; H.264 lowers it to ~25 ms of its target, 16 KiB floor (0 = OS default, unbounded autotuning)
 ```
 
 EGFX send window (env, settable through `config.env` without the `MACRDP_` prefix). A frame

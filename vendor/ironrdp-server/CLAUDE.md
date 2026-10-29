@@ -3,7 +3,7 @@
 Local fork of ironrdp-server 0.10.0, pulled in via `[patch.crates-io]` in
 `Cargo.toml`. The audio-lag control in the dedicated `dispatch_audio` task
 (carved out of `dispatch_server_events`) is the live divergence. Keep this
-vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(29)/(30)/(31)/(32)/(33)/(34) below are upstreamed
+vendor dir until (2)/(3)/(4)/(5)/(6)/(8)/(9)/(10)/(11)/(12)/(13)/(14)/(15)/(16)/(18)/(19)/(20)/(21)/(22)/(23)/(25)/(29)/(30)/(31)/(32)/(33)/(34)/(35) below are upstreamed
 AND released — #1276 landing is NOT sufficient. ((7) was HARVESTED at the a5d1c682 pin bump — see (7).)
 **(23) is now UPSTREAMED — Devolutions/IronRDP#1476 MERGED 2026-09-08 (`5198cde0`) — so it drops at the
 next pin bump; it is still listed above because the code is still IN this fork until that bump. Read (23)'s
@@ -2124,3 +2124,21 @@ de-vendor note before doing it: upstream defaults to `ConnectionPolicy::Queue` a
     EGFX handshake) run while the capture starts. Synchronous work inside an
     `updates()` implementation still blocks the whole loop, so keep long waits
     out of it (macrdp moves its display wake wait to `spawn_blocking`).
+
+(35) `NotsentLowat`: the unsent cap follows the encoder (NOT upstreamed; added
+    2026-10-29). Extends (32). macOS write(2) ignores `TCP_NOTSENT_LOWAT` and
+    fills the whole send buffer (128 KiB and autotuned up); only poll/kqueue
+    honour it, and tokio keeps writing while its cached readiness holds, so
+    (32) alone left the backlog in the kernel. `RdpServer` now owns an
+    `Arc<NotsentLowat>` (from `MACRDP_TCP_NOTSENT_LOWAT`, which is the max;
+    `set_notsent_lowat_handle` shares one): the accept loop attaches a dup of
+    the live socket for the connection's lifetime (both entry kinds, detached
+    before the connection future drops), and `set` retunes the option from
+    any thread. `dispatch_events` now hands `dispatch_server_events` one EGFX
+    frame per batch (clipboard, `Quit` and eviction events queued behind it
+    are hoisted into that batch, keeping the clipboard reorder and the
+    eviction grace intact) and, before a batch with a frame, waits outside
+    the `Self` lock (2 ms polls, at most 500 ms) until poll(2) reports the
+    socket writable. Video then waits in userspace while audio, heartbeats
+    and fast-path writes go straight to the kernel. macrdp's H.264 pipeline
+    sets the cap to ~25 ms of its target rate.

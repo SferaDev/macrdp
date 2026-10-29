@@ -66,8 +66,9 @@ pub use rdpeusb::{
     UsbHandle, UsbPipe,
 };
 pub use server::{
-    ConnectionHandler, Credentials, DEFAULT_NOTSENT_LOWAT, PostConnectionAction, RdpServer, RdpServerOptions,
-    RdpServerSecurity, ServerEvent, ServerEventSender, apply_notsent_lowat, notsent_lowat_bytes, tcp_srtt_ms,
+    ConnectionHandler, Credentials, DEFAULT_NOTSENT_LOWAT, NotsentLowat, PostConnectionAction, RdpServer,
+    RdpServerOptions, RdpServerSecurity, ServerEvent, ServerEventSender, apply_notsent_lowat, notsent_lowat_bytes,
+    tcp_srtt_ms,
 };
 pub use sound::{AudioWave, RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 
