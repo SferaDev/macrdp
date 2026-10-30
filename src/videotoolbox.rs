@@ -480,11 +480,13 @@ mod ffi {
         }
         let guard = SessionGuard { session };
 
-        // Real-time low-latency profile. Disable frame reordering so
-        // every emitted frame is immediately decodable in order — RDP
-        // does not tolerate B-frames or reorder delay.
+        // Low-latency profile. Disable frame reordering so every emitted
+        // frame is immediately decodable in order — RDP does not tolerate
+        // B-frames or reorder delay. RealTime stays false: true lets VT pace a
+        // steady stream of frames, delaying each and starving the in-flight
+        // throttle so it skips captures.
         unsafe {
-            set_bool(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)?;
+            set_bool(session, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse)?;
             set_bool(
                 session,
                 kVTCompressionPropertyKey_AllowFrameReordering,
