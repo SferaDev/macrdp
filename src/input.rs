@@ -1738,7 +1738,7 @@ mod macos {
                     button,
                     pressed,
                 } => {
-                    self.move_rel(x, y);
+                    self.move_rel(x, y, desktop_w, desktop_h);
                     self.mouse_button(button, pressed);
                 }
                 MouseEvent::VerticalScroll { value } => self.scroll(i32::from(value), 0),
@@ -1746,7 +1746,7 @@ mod macos {
                 // horizontal scroll delta is positive to the left.
                 MouseEvent::HorizontalScroll { value } => self.scroll(0, -i32::from(value)),
                 MouseEvent::Scroll { x, y } => self.scroll(y, x),
-                MouseEvent::RelMove { x, y } => self.move_rel(x, y),
+                MouseEvent::RelMove { x, y } => self.move_rel(x, y, desktop_w, desktop_h),
                 _ => trace!(?event, "mouse event not implemented"),
             }
         }
@@ -1785,10 +1785,13 @@ mod macos {
         /// dropped entirely (`trace!` no-op), which — on a client that relies
         /// on it for some or all pointer motion — left the cursor unable to
         /// reach the screen edge at all.
-        fn move_rel(&mut self, dx: i32, dy: i32) {
+        fn move_rel(&mut self, dx: i32, dy: i32, desktop_w: u16, desktop_h: u16) {
             let (ox, oy, sw, sh) = self.target_bounds();
-            let sx = (self.last_x + f64::from(dx)).clamp(ox, ox + sw - 1.0);
-            let sy = (self.last_y + f64::from(dy)).clamp(oy, oy + sh - 1.0);
+            // Deltas are session pixels and the target is points, as in `move_to`.
+            let sx = (self.last_x + f64::from(dx) * sw / f64::from(desktop_w.max(1)))
+                .clamp(ox, ox + sw - 1.0);
+            let sy = (self.last_y + f64::from(dy) * sh / f64::from(desktop_h.max(1)))
+                .clamp(oy, oy + sh - 1.0);
             self.post_move(sx, sy);
         }
 

@@ -329,6 +329,13 @@ pub trait RdpServerDisplay: Send {
         self.size().await
     }
 
+    /// (macrdp divergence 33) The desktop scale factor in percent from the client's Core
+    /// Data. Called once per served connection, before `request_initial_size`,
+    /// and not on reactivations.
+    fn set_client_desktop_scale_factor(&mut self, desktop_scale_factor: Option<u32>) {
+        let _ = desktop_scale_factor;
+    }
+
     /// Return a display updates receiver
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>>;
 

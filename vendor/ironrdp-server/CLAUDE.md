@@ -62,6 +62,7 @@ clashing names were renamed for this (11): `RdpdrDriveServerFactory`,
 | (30) | An auto-reconnect cookie that fails verification falls back to a normal logon instead of denying the connection | `client_accepted`, the `is_auto_reconnect` check | — |
 | (31) | A zero-payload fast-path update (`HiddenPointer`, `DefaultPointer`) goes out as one empty frame instead of nothing, **harvested early** from upstream #2274 (merged 2026-10-29, after this pin) | `encoder/fast_path.rs` `UpdateFragmenter::encode_next` | — |
 | (32) | The serving path's pre-finalize phase (X.224, TLS, CredSSP) is bounded by `SERVE_NEGOTIATION_TIMEOUT` (60 s), so an unauthenticated peer that goes silent can't hold the serving connection | `run_connection_inner`, around `negotiate_and_authenticate` | — |
+| (33) | The client's desktop scale factor reaches the display once per served connection, before `request_initial_size`; skipped on reactivations | `client_accepted`, after `on_connection_info` | `RdpServerDisplay::set_client_desktop_scale_factor` (defaulted no-op) |
 
 Notes on the port:
 - **(26)** Ported from main (#222) on 2026-10-27. Upstream's per-PDU lock-wait
@@ -106,6 +107,13 @@ Notes on the port:
   accept-to-auth) and a cellular CredSSP took 12.5 s. Upstream master has the same
   gap. Test: `conn_test::a_silent_peer_cannot_hold_the_serving_connection` (paused
   clock; fails without the bound, and with a 30 s one). Upstream candidate.
+
+- **(33)** Added 2026-10-20 on the old fork as (29), renumbered when ported to this
+  vendoring. Reactivations are skipped because a live MS-RDPEDISP monitor layout
+  carries its own scale that may have superseded the connect-time one (a Windows App
+  window moved from a Retina panel to a standard monitor). macrdp uses it to pick a
+  HiDPI virtual display for Retina clients; a display that doesn't implement it keeps
+  upstream's behaviour. Pairs with the acceptor's divergence (6).
 
 - **(2)** `discard_stale_session_events` (upstream, before serving a preemption winner)
   now also drains the audio channel, so the evicted session's queued waves don't play

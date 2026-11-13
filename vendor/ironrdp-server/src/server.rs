@@ -4665,6 +4665,15 @@ impl RdpServer {
             });
         }
 
+        // (macrdp divergence 33) A reactivation repeats the connect-time Core Data, which a live
+        // monitor layout may have superseded since.
+        if !result.reactivation {
+            self.display
+                .lock()
+                .await
+                .set_client_desktop_scale_factor(result.desktop_scale_factor);
+        }
+
         // (macrdp divergence 26) Replay what `client_loop` read ahead, but only into the same connection.
         let mut backlog = core::mem::take(&mut self.macrdp.read_ahead);
         if !result.reactivation {

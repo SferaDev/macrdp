@@ -2,7 +2,7 @@
 
 Local fork of ironrdp-acceptor 0.10.0, **re-vendored 2026-10-01 from upstream
 Devolutions/IronRDP@e258f6a0** (the pin-bump rev). `src/` is upstream verbatim except
-`connection.rs`, which carries the two divergences below (every insertion is marked
+`connection.rs`, which carries the three divergences below (every insertion is marked
 `(macrdp divergence N)`). Earlier vendorings: @a5d1c682 (2026-08-05), @879ffed
 (2026-06-12). Has a standalone `[patch.crates-io]` (core/pdu/svc/connector/async →
 e258f6a0) for isolated builds, ignored in the macrdp workspace (the root `[patch]`
@@ -56,6 +56,15 @@ Both divergences were mutation-checked.
     `macrdp_lossy_request_needs_the_offer_to_include_lossy`. Mutation: hard-coding the
     request back to `UdpFecR` fails the first. Upstream candidate: a natural extension
     of #1951.
+
+(6) **Desktop scale factor from the GCC Client Core Data** (NOT upstreamed; added
+    2026-10-20, ported to this vendoring 2026-11-13). `Acceptor` captures
+    `optional_data.desktop_scale_factor` in `BasicSettingsWaitInitial` next to the
+    fingerprint fields (4), carries it across deactivation–reactivation and surfaces it
+    as `pub desktop_scale_factor: Option<u32>` on `AcceptorResult`. Consumed by the
+    vendored server's divergence (33). Windows App for Mac sends 200 from a Retina panel
+    and 100 from a standard one. Same additive shape as #1397, so cleanly upstreamable.
+    Not yet covered by a `macrdp_*` test in the scratch harness.
 
 ## Retired
 

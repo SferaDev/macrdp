@@ -44,6 +44,8 @@ pub struct Acceptor {
     client_name: String,
     client_version: u32,
     client_build: u32,
+    // (macrdp divergence 6) Desktop scale factor in percent from the Client Core Data.
+    desktop_scale_factor: Option<u32>,
     /// The client's MultiTransportChannelData block flags (MS-RDPBCGR
     /// 2.2.1.3.8), when it sent one. `None` when the client did not send the
     /// block at all, distinct from `Some(empty())` (block present, no flags
@@ -190,6 +192,9 @@ pub struct AcceptorResult {
     pub client_version: u32,
     /// (macrdp divergence 4) Client build number from the GCC Client Core Data (`clientBuild`).
     pub client_build: u32,
+    /// (macrdp divergence 6) Desktop scale factor in percent from the optional part of the
+    /// GCC Client Core Data (for example 200 on a Retina Mac client). `None` when absent.
+    pub desktop_scale_factor: Option<u32>,
     /// Early capability flags announced by the client in its GCC Client Core
     /// Data (section 2.2.1.3.2, `earlyCapabilityFlags`).
     ///
@@ -247,6 +252,7 @@ impl Acceptor {
             client_name: String::new(),
             client_version: 0,
             client_build: 0,
+            desktop_scale_factor: None,
             multitransport_flags: None,
             early_capability_flags: gcc::ClientEarlyCapabilityFlags::empty(),
             server_capabilities: capabilities,
@@ -497,6 +503,7 @@ impl Acceptor {
             client_name: consumed.client_name,
             client_version: consumed.client_version,
             client_build: consumed.client_build,
+            desktop_scale_factor: consumed.desktop_scale_factor,
             multitransport_flags: consumed.multitransport_flags,
             early_capability_flags: consumed.early_capability_flags,
             server_capabilities: consumed.server_capabilities,
@@ -606,6 +613,7 @@ impl Acceptor {
                 client_name: self.client_name.clone(),
                 client_version: self.client_version,
                 client_build: self.client_build,
+                desktop_scale_factor: self.desktop_scale_factor,
                 multitransport_flags: self
                     .multitransport_flags
                     .unwrap_or_else(gcc::MultiTransportFlags::empty),
@@ -921,6 +929,8 @@ impl Sequence for Acceptor {
                 self.client_name.clone_from(&gcc_blocks.core.client_name);
                 self.client_version = gcc_blocks.core.version.0;
                 self.client_build = gcc_blocks.core.client_build;
+                // (macrdp divergence 6)
+                self.desktop_scale_factor = gcc_blocks.core.optional_data.desktop_scale_factor;
                 self.multitransport_flags = gcc_blocks.multi_transport_channel.as_ref().map(|m| m.flags);
 
                 // Adopt the client's requested desktop size (from its Client
